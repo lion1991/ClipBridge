@@ -61,6 +61,13 @@ targets:
         # empty plist on every regenerate, dropping our TrollStore keys.
         CODE_SIGN_ENTITLEMENTS: ClipBridge.entitlements
     dependencies:
+      # The xcframework wraps a STATIC archive (libclipbridge_core.a). Linker
+      # pulls its symbols into the app binary at build time. Setting embed:
+      # true would copy the .a file into the Frameworks/ directory of the
+      # final .app bundle, which iOS LaunchServices then rejects on install
+      # ("Unable to register" / TrollStore error 181) because the file isn't
+      # a valid .framework or .dylib. embed: false skips the copy step;
+      # everything still gets linked correctly.
       - framework: ../../build/ios/ClipbridgeCore.xcframework
-        embed: true
+        embed: false
         codeSign: false
