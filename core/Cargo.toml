@@ -1,0 +1,27 @@
+[package]
+name = "clipbridge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "clipbridge_core"
+
+[dependencies]
+uniffi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chacha20poly1305 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+url = "2"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "clipbridge-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clipbridge-core = { path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { version = "0.7", features = ["ws"] }
+tokio-stream = "0.1"
+dashmap = "6"
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+clipbridge-core = { path = "../core" }
