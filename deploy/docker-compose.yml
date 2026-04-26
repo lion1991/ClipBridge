@@ -1,0 +1,37 @@
+# Generic cloud-VM deployment for the ClipBridge relay.
+#
+# Works on any host with Docker + docker compose installed (Ubuntu, Debian,
+# AlmaLinux, Tencent / Aliyun lightweight, Hetzner, OCI, etc.). Image is
+# pulled from GHCR — no local build needed.
+#
+# Quick start on a fresh VM:
+#   ssh user@your-vm
+#   curl -fsSL https://get.docker.com | sudo sh   # if Docker not installed
+#   sudo usermod -aG docker $USER && newgrp docker
+#   git clone https://github.com/lion1991/ClipBridge.git
+#   cd ClipBridge/deploy
+#   docker compose up -d
+#
+# Open firewall:
+#   sudo ufw allow 8787/tcp                       # Debian/Ubuntu
+#   sudo firewall-cmd --add-port=8787/tcp --permanent && sudo firewall-cmd --reload
+#   # 腾讯云/阿里云：在控制台安全组放行 8787 入站
+#
+# Then pair both clients with:
+#   ws://<your-vm-public-ip>:8787
+#
+# Update later:
+#   ./update.sh
+
+services:
+  clipbridge-relay:
+    image: ghcr.io/lion1991/clipbridge-relay:latest
+    container_name: clipbridge-relay
+    restart: unless-stopped
+    environment:
+      RUST_LOG: "info"
+      CLIPBRIDGE_BIND: "0.0.0.0:8787"
+    ports:
+      # Exposed publicly. Override host-side port (left of colon) if 8787
+      # collides with something else on the box.
+      - "8787:8787"
