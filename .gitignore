@@ -36,6 +36,10 @@ clients/android/captures/
 clients/android/app/src/main/jniLibs/
 clients/android/app/src/main/java/uniffi/
 
+# Windows / Tauri
+clients/windows/target/
+clients/windows/gen/
+
 # JetBrains
 .idea/
 

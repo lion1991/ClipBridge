@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClipBridge</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main>
+      <div id="status-pill" class="pill pill-neutral">
+        <span class="dot"></span>
+        <span id="status-label">等待启动</span>
+      </div>
+
+      <section class="card">
+        <h2>配对二维码</h2>
+        <div id="qr-frame" class="qr-frame">
+          <div id="qr-empty" class="qr-empty">
+            <div class="qr-icon">⊞</div>
+            <div>尚未生成</div>
+          </div>
+          <div id="qr-host" class="qr-host hidden"></div>
+        </div>
+        <p id="qr-hint" class="hint">点击下方按钮生成新二维码</p>
+        <div class="actions">
+          <button id="btn-generate" class="primary">生成新配对</button>
+        </div>
+      </section>
+
+      <details class="card">
+        <summary>高级选项</summary>
+        <p class="hint">
+          粘贴另一台设备的配对 JSON,或查看、复制当前配对内容。
+        </p>
+        <textarea id="config-text" spellcheck="false" placeholder="{ ... }"></textarea>
+        <div id="error" class="error hidden"></div>
+        <div class="actions">
+          <button id="btn-copy">复制 JSON</button>
+          <button id="btn-save" class="primary">保存配对</button>
+          <span class="spacer"></span>
+          <button id="btn-reset" class="danger">重置配对</button>
+        </div>
+      </details>
+
+      <div class="footer">
+        默认中继 · <code id="default-relay">clip.wrlog.cn</code>
+      </div>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

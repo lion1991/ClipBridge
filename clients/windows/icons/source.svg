@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Source icon for ClipBridge Windows. Render with `cargo tauri icon icons/source.svg`
+     to produce all PNG/ICO sizes Tauri's bundle config expects. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="1024" height="1024" rx="200" fill="url(#bg)"/>
+  <!-- Stylised clipboard / link glyph: outer rounded rectangle + inner clip + arrow loop -->
+  <g fill="none" stroke="white" stroke-width="40" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Outer board -->
+    <rect x="280" y="240" width="464" height="608" rx="48"/>
+    <!-- Clip header -->
+    <rect x="384" y="180" width="256" height="120" rx="32" fill="white" stroke="none"/>
+    <!-- Two horizontal "lines" representing text/clipboard contents -->
+    <line x1="360" y1="440" x2="664" y2="440"/>
+    <line x1="360" y1="540" x2="600" y2="540"/>
+    <!-- Sync arrow loop in lower section -->
+    <path d="M 380 700 Q 512 620 644 700"/>
+    <polyline points="624 660 644 700 604 720"/>
+  </g>
+</svg>

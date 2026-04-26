@@ -1,0 +1,55 @@
+[package]
+name = "clipbridge-windows"
+version = "0.1.0"
+edition = "2021"
+description = "ClipBridge — Windows tray client"
+license = "MIT"
+
+# Tauri convention: separate workspace so the frontend tooling and Tauri's
+# bundle configuration don't have to bend around our parent Cargo workspace.
+[workspace]
+
+[[bin]]
+name = "clipbridge-windows"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# UI / runtime
+tauri = { version = "2", features = ["tray-icon", "image-png", "image-ico"] }
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Shared sync core
+clipbridge-core = { path = "../../core" }
+
+# Clipboard read/write — cross-platform but we only build on Windows here.
+arboard = "3"
+
+# QR generation for the pairing window.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+# Async glue + state.
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
+
+# Persistent pairing config.
+directories = "5"
+
+# Used by pairing.rs.
+base64 = "0.22"
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = true
