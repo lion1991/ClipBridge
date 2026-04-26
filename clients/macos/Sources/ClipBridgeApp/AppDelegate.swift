@@ -1,5 +1,6 @@
 import AppKit
 import ClipbridgeCore
+import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
@@ -18,15 +19,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Status: not paired", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "状态:未配对", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
-        // NSMenuItem dispatches via the responder chain, but a status-bar menu
-        // doesn't connect to AppDelegate by default — without an explicit
-        // target, clicks silently no-op.
-        menu.addItem(makeItem("Show pairing config…", #selector(showPairing), key: "p"))
-        menu.addItem(makeItem("Reset pairing", #selector(resetPairing), key: ""))
+        menu.addItem(makeItem("打开配对窗口…", #selector(showPairing), key: "p"))
+        menu.addItem(makeItem("重置配对", #selector(resetPairing), key: ""))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(makeItem("Quit ClipBridge", #selector(quit), key: "q"))
+        menu.addItem(makeItem("退出 ClipBridge", #selector(quit), key: "q"))
         statusItem.menu = menu
 
         if let config = PairingStore.load() {
@@ -44,38 +42,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showPairing() {
         if pairingWindow == nil {
             let win = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 760, height: 460),
+                contentRect: NSRect(x: 0, y: 0, width: 460, height: 600),
                 styleMask: [.titled, .closable, .resizable],
                 backing: .buffered,
                 defer: false
             )
-            win.title = "ClipBridge Pairing"
-            // NSWindow defaults to releasing itself on close, which would leave
-            // pairingWindow as a dangling reference the next time the menu item
-            // fires. Hide instead of release so we can reopen.
+            win.title = "ClipBridge"
             win.isReleasedWhenClosed = false
             win.center()
             pairingWindow = win
         }
         guard let win = pairingWindow else { return }
 
-        let view = PairingView(
+        let view = PairingScreen(
             existing: PairingStore.load(),
             onSave: { [weak self] config in
                 PairingStore.save(config)
                 self?.startCoordinator(with: config)
-                self?.pairingWindow?.orderOut(nil)
+            },
+            onReset: { [weak self] in
+                self?.coordinator?.stop()
+                self?.coordinator = nil
+                PairingStore.clear()
+                self?.applyStatus(.notPaired)
             }
         )
-        win.contentView = view
+        win.contentViewController = NSHostingController(rootView: view)
         NSApp.activate(ignoringOtherApps: true)
         win.makeKeyAndOrderFront(nil)
-    }
-
-    private func makeItem(_ title: String, _ selector: Selector, key: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: selector, keyEquivalent: key)
-        item.target = self
-        return item
     }
 
     @objc private func resetPairing() {
@@ -101,15 +95,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func applyStatus(_ status: BridgeStatus) {
-        statusItem.menu?.item(at: 0)?.title = "Status: \(label(for: status))"
+        statusItem.menu?.item(at: 0)?.title = "状态:\(label(for: status))"
         guard let button = statusItem.button else { return }
         let image = NSImage(
             systemSymbolName: "doc.on.clipboard",
             accessibilityDescription: "ClipBridge"
         )
-        // Template images get tinted black/white by the system based on the
-        // current appearance. We only treat .connected that way; for other
-        // states we want an explicit color, so isTemplate is turned off.
         switch status {
         case .connected:
             image?.isTemplate = true
@@ -129,11 +120,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func label(for status: BridgeStatus) -> String {
         switch status {
-        case .notPaired: return "not paired"
-        case .connecting: return "connecting…"
-        case .connected: return "connected"
-        case .disconnected: return "disconnected"
-        case .error(let message): return "error: \(message)"
+        case .notPaired: return "未配对"
+        case .connecting: return "连接中…"
+        case .connected: return "已连接"
+        case .disconnected: return "已断开"
+        case .error(let message): return "错误:\(message)"
         }
+    }
+
+    private func makeItem(_ title: String, _ selector: Selector, key: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: key)
+        item.target = self
+        return item
     }
 }

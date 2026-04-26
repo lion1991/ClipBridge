@@ -44,7 +44,7 @@ final class BridgeCoordinator {
 
     func start() {
         guard let key = config.keyData else {
-            onStateChange(.error("invalid key"))
+            onStateChange(.error("密钥无效"))
             return
         }
         let listener = Listener(coordinator: self)
@@ -58,7 +58,7 @@ final class BridgeCoordinator {
                 listener: listener
             )
         } catch {
-            onStateChange(.error("client error: \(error)"))
+            onStateChange(.error("客户端错误:\(error)"))
             return
         }
         startPolling()
@@ -102,7 +102,7 @@ final class BridgeCoordinator {
         do {
             try client?.sendClip(payload: payload)
         } catch {
-            onStateChange(.error("send failed: \(error)"))
+            onStateChange(.error("发送失败:\(error)"))
         }
     }
 
