@@ -5,7 +5,7 @@
 use std::{
     sync::{Arc, Mutex},
     thread::JoinHandle,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use clipbridge_core::{
@@ -28,13 +28,18 @@ pub enum UiState {
     Error { message: String },
 }
 
+/// Window during which a clipboard change matching the most recent remote
+/// write is treated as our own echo and skipped. Long enough that the OS
+/// `WM_CLIPBOARDUPDATE` (or 500 ms poll tick) fires while we still know it's
+/// an echo; short enough that the user can re-copy the same text on purpose.
+const ECHO_WINDOW: Duration = Duration::from_secs(10);
+
 pub struct Bridge {
     client: Option<Arc<Client>>,
     listener: Option<Arc<BridgeListener>>,
     poller: Option<JoinHandle<()>>,
     poll_stop: Arc<Mutex<bool>>,
-    last_sent: Arc<Mutex<Option<String>>>,
-    last_received: Arc<Mutex<Option<String>>>,
+    expected_echo: Arc<Mutex<Option<(String, Instant)>>>,
     state_tx: mpsc::UnboundedSender<UiState>,
 
     // Native clipboard listener (Windows only). Held here so its Drop
@@ -50,8 +55,7 @@ impl Bridge {
             listener: None,
             poller: None,
             poll_stop: Arc::new(Mutex::new(false)),
-            last_sent: Arc::new(Mutex::new(None)),
-            last_received: Arc::new(Mutex::new(None)),
+            expected_echo: Arc::new(Mutex::new(None)),
             state_tx,
             #[cfg(windows)]
             native_listener: None,
@@ -65,7 +69,7 @@ impl Bridge {
 
         let listener = Arc::new(BridgeListener {
             state_tx: self.state_tx.clone(),
-            last_received: self.last_received.clone(),
+            expected_echo: self.expected_echo.clone(),
         });
 
         let client = Client::new(
@@ -112,13 +116,12 @@ impl Bridge {
     fn spawn_clipboard_handler(&mut self) {
         #[cfg(windows)]
         {
-            let last_sent = self.last_sent.clone();
-            let last_received = self.last_received.clone();
+            let expected_echo = self.expected_echo.clone();
             let client = self.client.clone();
             let device_name = device_name();
 
             match ClipboardListener::start(move || {
-                handle_clipboard_change(&client, &last_sent, &last_received, &device_name);
+                handle_clipboard_change(&client, &expected_echo, &device_name);
             }) {
                 Ok(l) => {
                     self.native_listener = Some(l);
@@ -136,8 +139,7 @@ impl Bridge {
 
     fn spawn_poller(&mut self) {
         let stop_flag = self.poll_stop.clone();
-        let last_sent = self.last_sent.clone();
-        let last_received = self.last_received.clone();
+        let expected_echo = self.expected_echo.clone();
         let client = self.client.clone();
         let device_name = device_name();
 
@@ -152,7 +154,7 @@ impl Bridge {
                     if let Some(text) = read_clipboard_text() {
                         if !text.is_empty() && Some(&text) != last_seen.as_ref() {
                             last_seen = Some(text.clone());
-                            try_publish(&client, &last_sent, &last_received, &device_name, text);
+                            try_publish(&client, &expected_echo, &device_name, text);
                         }
                     }
                     std::thread::sleep(Duration::from_millis(500));
@@ -166,31 +168,32 @@ impl Bridge {
 /// Called from `WM_CLIPBOARDUPDATE` (or, in fallback, from the poller).
 fn handle_clipboard_change(
     client: &Option<Arc<Client>>,
-    last_sent: &Arc<Mutex<Option<String>>>,
-    last_received: &Arc<Mutex<Option<String>>>,
+    expected_echo: &Arc<Mutex<Option<(String, Instant)>>>,
     device_name: &str,
 ) {
     let Some(text) = read_clipboard_text() else { return };
     if text.is_empty() {
         return;
     }
-    try_publish(client, last_sent, last_received, device_name, text);
+    try_publish(client, expected_echo, device_name, text);
 }
 
 fn try_publish(
     client: &Option<Arc<Client>>,
-    last_sent: &Arc<Mutex<Option<String>>>,
-    last_received: &Arc<Mutex<Option<String>>>,
+    expected_echo: &Arc<Mutex<Option<(String, Instant)>>>,
     device_name: &str,
     text: String,
 ) {
-    let received = last_received.lock().ok().and_then(|g| g.clone());
-    let sent = last_sent.lock().ok().and_then(|g| g.clone());
-    if Some(&text) == received.as_ref() || Some(&text) == sent.as_ref() {
-        return;
-    }
-    if let Ok(mut g) = last_sent.lock() {
-        *g = Some(text.clone());
+    // If this change matches the most recent remote write (within the echo
+    // window), it's our own `arboard` set firing the listener — skip without
+    // republishing. Outside the window, treat it as a real user copy so they
+    // can re-share the same text on purpose.
+    if let Ok(e) = expected_echo.lock() {
+        if let Some((s, t)) = e.as_ref() {
+            if s == &text && t.elapsed() < ECHO_WINDOW {
+                return;
+            }
+        }
     }
 
     let now = SystemTime::now()
@@ -226,7 +229,7 @@ fn device_name() -> String {
 
 struct BridgeListener {
     state_tx: mpsc::UnboundedSender<UiState>,
-    last_received: Arc<Mutex<Option<String>>>,
+    expected_echo: Arc<Mutex<Option<(String, Instant)>>>,
 }
 
 impl ClipListener for BridgeListener {
@@ -234,8 +237,11 @@ impl ClipListener for BridgeListener {
         if payload.kind != ClipKind::Text {
             return;
         }
-        if let Ok(mut g) = self.last_received.lock() {
-            *g = Some(payload.content.clone());
+        // Mark this content as "expected echo" *before* writing so the
+        // WM_CLIPBOARDUPDATE callback (which fires after `set_text`) can
+        // recognise its own write and skip republishing.
+        if let Ok(mut g) = self.expected_echo.lock() {
+            *g = Some((payload.content.clone(), Instant::now()));
         }
         if let Ok(mut clipboard) = arboard::Clipboard::new() {
             let _ = clipboard.set_text(&payload.content);

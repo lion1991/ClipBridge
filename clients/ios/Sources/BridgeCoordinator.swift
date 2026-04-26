@@ -26,9 +26,10 @@ final class BridgeCoordinator: ObservableObject {
     private var client: Client?
     private var listener: Listener?
     private var pollTimer: Timer?
+    // `handleIncoming` updates `lastChangeCount` after writing remote clips
+    // so the poll tick skips them. We deliberately don't compare strings —
+    // doing so would also block the user from re-copying the same text.
     private var lastChangeCount: Int = UIPasteboard.general.changeCount
-    private var lastSentText: String?
-    private var lastReceivedText: String?
 
     private var audioPlayer: AVAudioPlayer?
 
@@ -117,9 +118,6 @@ final class BridgeCoordinator: ObservableObject {
         lastChangeCount = pb.changeCount
 
         guard let text = pb.string, !text.isEmpty else { return }
-        if text == lastReceivedText { return }
-        if text == lastSentText { return }
-        lastSentText = text
 
         let payload = ClipPayload(
             kind: .text,
@@ -137,8 +135,9 @@ final class BridgeCoordinator: ObservableObject {
     fileprivate func handleIncoming(payload: ClipPayload) {
         DispatchQueue.main.async {
             guard payload.kind == .text else { return }
-            self.lastReceivedText = payload.content
             UIPasteboard.general.string = payload.content
+            // Capture the post-write changeCount so the next poll tick treats
+            // our own write as a no-op instead of re-publishing it.
             self.lastChangeCount = UIPasteboard.general.changeCount
         }
     }

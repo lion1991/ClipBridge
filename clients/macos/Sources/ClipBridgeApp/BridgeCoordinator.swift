@@ -4,8 +4,10 @@ import ClipbridgeCore
 /// Owns the Rust `Client`, the pasteboard polling timer, and the bridge between
 /// AppKit clipboard events and the Rust core.
 ///
-/// Feedback-loop avoidance: we remember the last clip we *received* from the
-/// network and skip publishing it back when the local pasteboard polls match it.
+/// Feedback-loop avoidance: `handleIncoming` updates `lastChangeCount` after
+/// writing the remote clip to the pasteboard, so the next poll tick sees the
+/// same `changeCount` and skips. We deliberately do *not* compare strings —
+/// that would also block the user from re-copying the same text on purpose.
 enum BridgeStatus {
     case notPaired
     case connecting
@@ -22,8 +24,6 @@ final class BridgeCoordinator {
     private var pollTimer: Timer?
 
     private var lastChangeCount: Int = NSPasteboard.general.changeCount
-    private var lastSentText: String?
-    private var lastReceivedText: String?
 
     private static let deviceId: String = {
         let key = "com.clipbridge.device_id"
@@ -87,11 +87,6 @@ final class BridgeCoordinator {
         lastChangeCount = pb.changeCount
 
         guard let text = pb.string(forType: .string), !text.isEmpty else { return }
-        // Skip if this is exactly what we just wrote from a remote clip.
-        if text == lastReceivedText { return }
-        // Skip if it's the same text we already published.
-        if text == lastSentText { return }
-        lastSentText = text
 
         let payload = ClipPayload(
             kind: .text,
@@ -110,9 +105,10 @@ final class BridgeCoordinator {
         DispatchQueue.main.async {
             guard payload.kind == .text else { return }
             let pb = NSPasteboard.general
-            self.lastReceivedText = payload.content
             pb.clearContents()
             pb.setString(payload.content, forType: .string)
+            // Capture the post-write changeCount so the next poll tick treats
+            // our own write as a no-op instead of re-publishing it.
             self.lastChangeCount = pb.changeCount
         }
     }

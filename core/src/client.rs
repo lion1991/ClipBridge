@@ -220,6 +220,15 @@ async fn session(
     ws.send(Message::Text(serde_json::to_string(&join)?.into()))
         .await?;
 
+    // Pull whatever is still in the relay's recent-cache so devices that
+    // joined late or just reconnected after a network blip don't miss the
+    // last few clips. The relay caches up to 3 clips for 5 minutes.
+    let fetch = ClientMessage::FetchRecent {
+        group_id: group_id.to_string(),
+    };
+    ws.send(Message::Text(serde_json::to_string(&fetch)?.into()))
+        .await?;
+
     listener.on_state(ConnectionState::Connected);
 
     // Heartbeat: ping every 30s, force-reconnect if no inbound frame for 60s.
@@ -280,7 +289,7 @@ async fn session(
                 match frame {
                     Message::Text(t) => {
                         let parsed: ServerMessage = serde_json::from_str(&t)?;
-                        handle_server(parsed, key, listener);
+                        handle_server(parsed, key, device_id, listener);
                     }
                     Message::Ping(p) => {
                         ws.send(Message::Pong(p)).await?;
@@ -293,7 +302,12 @@ async fn session(
     }
 }
 
-fn handle_server(msg: ServerMessage, key: &[u8; KEY_LEN], listener: &Arc<dyn ClipListener>) {
+fn handle_server(
+    msg: ServerMessage,
+    key: &[u8; KEY_LEN],
+    device_id: &str,
+    listener: &Arc<dyn ClipListener>,
+) {
     match msg {
         ServerMessage::Joined { .. } => {}
         ServerMessage::Clip {
@@ -306,7 +320,14 @@ fn handle_server(msg: ServerMessage, key: &[u8; KEY_LEN], listener: &Arc<dyn Cli
             }
         }
         ServerMessage::Recent { clips } => {
+            // Skip clips this device originally published — replaying them
+            // would just re-write our own content to the local clipboard.
+            // Cache is oldest-first, so iterating in order means the newest
+            // clip wins on the OS clipboard.
             for c in clips {
+                if c.sender_device_id == device_id {
+                    continue;
+                }
                 if let Ok(plain) = decrypt(key, &c.nonce, &c.ciphertext) {
                     if let Ok(payload) = serde_json::from_slice::<ClipPayload>(&plain) {
                         listener.on_clip(payload);

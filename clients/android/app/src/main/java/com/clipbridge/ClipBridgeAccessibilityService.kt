@@ -39,8 +39,9 @@ import uniffi.clipbridge_core.ConnectionState
  *     publish it when a "copied" toast fires. Works without Shizuku but misses
  *     copies that don't go through the long-press toolbar.
  *
- * Both paths funnel into `publish()` which dedupes by `lastSent` /
- * `lastReceived`, so they happily coexist.
+ * Both paths funnel into `publish()`, which suppresses echoes of remote
+ * writes (within `ECHO_WINDOW_MS`) and collapses near-simultaneous fires
+ * from the two sources (within `SOURCE_DEDUPE_MS`), so they coexist.
  */
 class ClipBridgeAccessibilityService : AccessibilityService() {
 
@@ -49,8 +50,16 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private var clipListener: ClipboardManager.OnPrimaryClipChangedListener? = null
     private var prefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
 
-    private var lastSent: String? = null
-    private var lastReceived: String? = null
+    // Most recent content we wrote to the clipboard from a remote clip.
+    // Any local change that matches this within ECHO_WINDOW_MS is treated as
+    // our own write and not republished. Outside the window the user can
+    // re-share the same text on purpose.
+    @Volatile private var expectedEcho: String? = null
+    @Volatile private var expectedEchoAt: Long = 0L
+    // Short window to dedupe the multiple sources (clipboard listener,
+    // Shizuku poller, copy toast) all firing for the same user copy.
+    @Volatile private var lastPublished: String? = null
+    @Volatile private var lastPublishedAt: Long = 0L
     private var lastSelection: String? = null
     private var lastSelectionAt: Long = 0L
 
@@ -91,6 +100,10 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             Log.i(TAG, "shizuku poller starting, initial state=${ShizukuBridge.state()}")
             var lastLoggedState: ShizukuBridge.State? = null
             var tickCount = 0
+            // Poll-local change detection: only act when the read text differs
+            // from what we saw last tick. Cross-source dedupe with the clipboard
+            // listener and copy toast happens inside `publish()`.
+            var lastPolledText: String? = null
             while (isActive) {
                 val state = ShizukuBridge.state()
                 if (state != lastLoggedState) {
@@ -102,12 +115,11 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
                     if (++tickCount % 10 == 0) {
                         Log.d(TAG, "shizuku tick $tickCount: text len=${text?.length ?: -1}")
                     }
-                    if (!text.isNullOrEmpty()) {
+                    if (!text.isNullOrEmpty() && text != lastPolledText) {
+                        lastPolledText = text
                         withContext(Dispatchers.Main) {
-                            if (text != lastReceived && text != lastSent) {
-                                Log.i(TAG, "shizuku read NEW: ${text.length} chars")
-                                publish(text)
-                            }
+                            Log.i(TAG, "shizuku read NEW: ${text.length} chars")
+                            publish(text)
                         }
                     }
                 }
@@ -226,15 +238,20 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     }
 
     private fun publish(text: String) {
-        if (text == lastReceived) {
-            Log.i(TAG, "skip: matches lastReceived")
+        val now = System.currentTimeMillis()
+        // Echo of a recent remote write — skip without consuming, so other
+        // sources (poller, toast) firing for the same change all skip too.
+        if (text == expectedEcho && now - expectedEchoAt < ECHO_WINDOW_MS) {
+            Log.i(TAG, "skip: matches expectedEcho")
             return
         }
-        if (text == lastSent) {
-            Log.i(TAG, "skip: matches lastSent")
+        // Multiple sources can fire for one user copy; collapse them.
+        if (text == lastPublished && now - lastPublishedAt < SOURCE_DEDUPE_MS) {
+            Log.i(TAG, "skip: duplicate within ${SOURCE_DEDUPE_MS}ms")
             return
         }
-        lastSent = text
+        lastPublished = text
+        lastPublishedAt = now
         val payload = ClipPayload(
             kind = ClipKind.TEXT,
             content = text,
@@ -297,13 +314,21 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private fun handleRemoteClip(payload: ClipPayload) {
         if (payload.kind != ClipKind.TEXT) return
         Log.i(TAG, "remote clip received (${payload.content.length} chars)")
-        lastReceived = payload.content
+        // Mark as expected echo *before* writing so the resulting
+        // OnPrimaryClipChangedListener / Shizuku tick recognises it.
+        expectedEcho = payload.content
+        expectedEchoAt = System.currentTimeMillis()
         clipboard?.setPrimaryClip(ClipData.newPlainText("ClipBridge", payload.content))
     }
 
     companion object {
         private const val TAG = "ClipBridge"
         private const val POLL_INTERVAL_MS = 2_000L
+        // See `expectedEcho` doc above the field.
+        private const val ECHO_WINDOW_MS = 10_000L
+        // Long enough to cover one Shizuku poll interval after a listener fire,
+        // short enough that an intentional re-copy of the same text still goes.
+        private const val SOURCE_DEDUPE_MS = 3_000L
 
         // In-process state for the UI to observe. AS and Activity share the
         // same process (no android:process attribute on either component) so
