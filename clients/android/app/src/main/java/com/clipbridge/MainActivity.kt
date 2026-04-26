@@ -7,27 +7,51 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
-import android.view.accessibility.AccessibilityManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AdminPanelSettings
+import androidx.compose.material.icons.filled.BatteryChargingFull
+import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -35,8 +59,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -87,12 +116,12 @@ private fun PairingScreen(
         mutableStateOf(existing?.let { json.encodeToString(PairingConfig.serializer(), it) } ?: "")
     }
     var error by remember { mutableStateOf<String?>(null) }
+    var advancedOpen by remember { mutableStateOf(false) }
     var asEnabled by remember { mutableStateOf(isAccessibilityEnabled(context)) }
     var batteryOptDisabled by remember { mutableStateOf(isBatteryOptimizationDisabled(context)) }
     var shizukuState by remember { mutableStateOf(ShizukuBridge.state()) }
+    val isPaired = existing != null
 
-    // Re-check status flags every time we come back from a system Settings
-    // activity (accessibility, battery optimization, etc).
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
         val observer = LifecycleEventObserver { _, event ->
@@ -105,7 +134,6 @@ private fun PairingScreen(
         lifecycle.addObserver(observer)
         onDispose { lifecycle.removeObserver(observer) }
     }
-
     DisposableEffect(Unit) {
         val l = ShizukuBridge.StateListener { s -> shizukuState = s }
         ShizukuBridge.addStateListener(l)
@@ -115,48 +143,29 @@ private fun PairingScreen(
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         val contents = result?.contents ?: return@rememberLauncherForActivityResult
         configText = contents
+        error = null
+        runCatching {
+            val cfg = json.decodeFromString(PairingConfig.serializer(), contents)
+            require(cfg.keyBytes()?.size == 32) { "key must be 32 bytes" }
+            onSave(cfg)
+        }.onFailure { error = "Invalid config: ${it.message}" }
     }
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("ClipBridge pairing") }) },
+        topBar = {
+            TopAppBar(title = { Text("ClipBridge", style = MaterialTheme.typography.titleLarge) })
+        },
     ) { padding ->
         Column(
             modifier = Modifier
                 .padding(padding)
-                .padding(16.dp)
-                .fillMaxSize(),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            ShizukuBanner(
-                state = shizukuState,
-                onRequest = { ShizukuBridge.requestPermission(SHIZUKU_REQUEST_CODE) },
-                onRefresh = { shizukuState = ShizukuBridge.state() },
-            )
-
-            AccessibilityBanner(
-                enabled = asEnabled,
-                preferShizuku = shizukuState == ShizukuBridge.State.READY,
-                onOpenSettings = {
-                    context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                },
-                onRefresh = { asEnabled = isAccessibilityEnabled(context) },
-            )
-
-            BatteryOptBanner(
-                disabled = batteryOptDisabled,
-                onRequest = { requestIgnoreBatteryOptimizations(context) },
-                onRefresh = { batteryOptDisabled = isBatteryOptimizationDisabled(context) },
-            )
-
-            Text(
-                "Scan the QR shown on your Mac, or paste the JSON below.\n" +
-                        "Default relay: $DEFAULT_RELAY_URL",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-
-            Button(
-                onClick = {
+            ScanHero(
+                paired = isPaired,
+                onScan = {
                     scanLauncher.launch(
                         ScanOptions()
                             .setOrientationLocked(false)
@@ -165,146 +174,323 @@ private fun PairingScreen(
                             .setPrompt("Aim at the QR shown by the Mac"),
                     )
                 },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Scan QR from Mac")
+            )
+
+            StatusSection(
+                shizukuState = shizukuState,
+                asEnabled = asEnabled,
+                batteryOptDisabled = batteryOptDisabled,
+                onShizukuTap = {
+                    when (shizukuState) {
+                        ShizukuBridge.State.NOT_AUTHORIZED ->
+                            ShizukuBridge.requestPermission(SHIZUKU_REQUEST_CODE)
+                        else -> { /* refresh by lifecycle resume */ }
+                    }
+                },
+                onAccessibilityTap = {
+                    context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                },
+                onBatteryTap = {
+                    if (!batteryOptDisabled) requestIgnoreBatteryOptimizations(context)
+                },
+            )
+
+            AdvancedToggle(open = advancedOpen, onToggle = { advancedOpen = !advancedOpen })
+            AnimatedVisibility(visible = advancedOpen) {
+                AdvancedPanel(
+                    configText = configText,
+                    error = error,
+                    onConfigChange = { configText = it; error = null },
+                    onGenerate = {
+                        val cfg = PairingConfig.makeNew()
+                        configText = json.encodeToString(PairingConfig.serializer(), cfg)
+                    },
+                    onSave = {
+                        error = null
+                        runCatching {
+                            val cfg = json.decodeFromString(
+                                PairingConfig.serializer(),
+                                configText,
+                            )
+                            require(cfg.keyBytes()?.size == 32) { "key must be 32 bytes" }
+                            onSave(cfg)
+                        }.onFailure { error = "Invalid config: ${it.message}" }
+                    },
+                    onReset = {
+                        onClear()
+                        configText = ""
+                        error = null
+                    },
+                )
             }
-            Button(onClick = {
-                val cfg = PairingConfig.makeNew()
-                configText = json.encodeToString(PairingConfig.serializer(), cfg)
-            }) {
-                Text("Generate new pairing (this device)")
+
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Default relay · ${DEFAULT_RELAY_URL.removePrefix("wss://")}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ScanHero(paired: Boolean, onScan: () -> Unit) {
+    val container = if (paired) {
+        MaterialTheme.colorScheme.secondaryContainer
+    } else {
+        MaterialTheme.colorScheme.primaryContainer
+    }
+    val onContainer = if (paired) {
+        MaterialTheme.colorScheme.onSecondaryContainer
+    } else {
+        MaterialTheme.colorScheme.onPrimaryContainer
+    }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onScan() },
+        colors = CardDefaults.cardColors(containerColor = container, contentColor = onContainer),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        shape = RoundedCornerShape(20.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(20.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(56.dp)
+                    .clip(CircleShape)
+                    .background(onContainer.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = if (paired) Icons.Filled.CheckCircle else Icons.Filled.QrCodeScanner,
+                    contentDescription = null,
+                    modifier = Modifier.size(28.dp),
+                )
+            }
+            Spacer(Modifier.width(16.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = if (paired) "Re-pair with Mac" else "Scan QR from Mac",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                Text(
+                    text = if (paired) {
+                        "Currently paired. Tap to scan a new QR."
+                    } else {
+                        "Generate a QR on your Mac, then tap here."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = onContainer.copy(alpha = 0.75f),
+                )
+            }
+            Icon(Icons.Filled.ChevronRight, contentDescription = null)
+        }
+    }
+}
+
+@Composable
+private fun StatusSection(
+    shizukuState: ShizukuBridge.State,
+    asEnabled: Boolean,
+    batteryOptDisabled: Boolean,
+    onShizukuTap: () -> Unit,
+    onAccessibilityTap: () -> Unit,
+    onBatteryTap: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        shape = RoundedCornerShape(20.dp),
+    ) {
+        Column(modifier = Modifier.padding(vertical = 4.dp)) {
+            StatusRow(
+                icon = Icons.Filled.AdminPanelSettings,
+                title = "Shizuku",
+                subtitle = when (shizukuState) {
+                    ShizukuBridge.State.READY -> "Privileged clipboard reads enabled"
+                    ShizukuBridge.State.NOT_AUTHORIZED -> "Tap to grant permission"
+                    ShizukuBridge.State.UNAVAILABLE -> "Service not running on device"
+                },
+                state = when (shizukuState) {
+                    ShizukuBridge.State.READY -> RowState.OK
+                    ShizukuBridge.State.NOT_AUTHORIZED -> RowState.WARN
+                    ShizukuBridge.State.UNAVAILABLE -> RowState.NEUTRAL
+                },
+                onClick = onShizukuTap,
+            )
+            Divider()
+            StatusRow(
+                icon = Icons.Filled.Visibility,
+                title = "Accessibility",
+                subtitle = when {
+                    asEnabled -> "Capture toolbar copies"
+                    shizukuState == ShizukuBridge.State.READY -> "Optional — Shizuku covers it"
+                    else -> "Tap to enable in Settings"
+                },
+                state = when {
+                    asEnabled -> RowState.OK
+                    shizukuState == ShizukuBridge.State.READY -> RowState.NEUTRAL
+                    else -> RowState.WARN
+                },
+                onClick = onAccessibilityTap,
+            )
+            Divider()
+            StatusRow(
+                icon = Icons.Filled.BatteryChargingFull,
+                title = "Battery",
+                subtitle = if (batteryOptDisabled) {
+                    "Unrestricted — survives idle"
+                } else {
+                    "Tap to disable optimization"
+                },
+                state = if (batteryOptDisabled) RowState.OK else RowState.WARN,
+                onClick = onBatteryTap,
+            )
+        }
+    }
+}
+
+private enum class RowState { OK, WARN, NEUTRAL }
+
+@Composable
+private fun StatusRow(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    state: RowState,
+    onClick: () -> Unit,
+) {
+    val (badgeColor, badgeIcon) = when (state) {
+        RowState.OK -> MaterialTheme.colorScheme.primary to Icons.Filled.CheckCircle
+        RowState.WARN -> MaterialTheme.colorScheme.error to Icons.Filled.Warning
+        RowState.NEUTRAL -> MaterialTheme.colorScheme.outline to Icons.Filled.Bolt
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(22.dp),
+        )
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleSmall)
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Icon(
+            imageVector = badgeIcon,
+            contentDescription = null,
+            tint = badgeColor,
+            modifier = Modifier.size(20.dp),
+        )
+    }
+}
+
+@Composable
+private fun Divider() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(1.dp)
+            .padding(start = 52.dp)
+            .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
+    )
+}
+
+@Composable
+private fun AdvancedToggle(open: Boolean, onToggle: () -> Unit) {
+    TextButton(
+        onClick = onToggle,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Text(
+            "Advanced",
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.weight(1f),
+        )
+        Icon(
+            imageVector = if (open) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+            contentDescription = null,
+        )
+    }
+}
+
+@Composable
+private fun AdvancedPanel(
+    configText: String,
+    error: String?,
+    onConfigChange: (String) -> Unit,
+    onGenerate: () -> Unit,
+    onSave: () -> Unit,
+    onReset: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        shape = RoundedCornerShape(20.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                "Generate a QR on this device or paste a config from another device.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedButton(onClick = onGenerate, modifier = Modifier.fillMaxWidth()) {
+                Text("Generate new pairing")
             }
             OutlinedTextField(
                 value = configText,
-                onValueChange = { configText = it },
-                label = { Text("Pairing JSON (auto-filled by scan)") },
-                modifier = Modifier.fillMaxWidth().height(220.dp),
+                onValueChange = onConfigChange,
+                label = { Text("Pairing JSON") },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(180.dp),
+                textStyle = MaterialTheme.typography.bodySmall,
             )
-            error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            Spacer(Modifier.height(8.dp))
-            Button(onClick = {
-                error = null
-                runCatching {
-                    val cfg: PairingConfig = json.decodeFromString(
-                        PairingConfig.serializer(),
-                        configText,
-                    )
-                    require(cfg.keyBytes()?.size == 32) { "key must be 32 bytes" }
-                    onSave(cfg)
-                }.onFailure { error = "Invalid config: ${it.message}" }
-            }) {
+            error?.let {
+                Text(
+                    it,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Button(
+                onClick = onSave,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = configText.isNotBlank(),
+            ) {
                 Text("Save & start syncing")
             }
-            Button(onClick = {
-                onClear()
-                configText = ""
-            }) {
+            TextButton(
+                onClick = onReset,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.textButtonColors(
+                    contentColor = MaterialTheme.colorScheme.error,
+                ),
+            ) {
                 Text("Reset pairing")
-            }
-        }
-    }
-}
-
-@Composable
-private fun ShizukuBanner(
-    state: ShizukuBridge.State,
-    onRequest: () -> Unit,
-    onRefresh: () -> Unit,
-) {
-    val (containerColor, contentColor) = when (state) {
-        ShizukuBridge.State.READY ->
-            MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
-        ShizukuBridge.State.NOT_AUTHORIZED ->
-            MaterialTheme.colorScheme.tertiaryContainer to MaterialTheme.colorScheme.onTertiaryContainer
-        ShizukuBridge.State.UNAVAILABLE ->
-            MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
-    }
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = containerColor, contentColor = contentColor),
-    ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Text(
-                text = when (state) {
-                    ShizukuBridge.State.READY -> "Shizuku: ready ✓"
-                    ShizukuBridge.State.NOT_AUTHORIZED -> "Shizuku: needs permission"
-                    ShizukuBridge.State.UNAVAILABLE -> "Shizuku: not available"
-                },
-                style = MaterialTheme.typography.titleSmall,
-            )
-            Text(
-                text = when (state) {
-                    ShizukuBridge.State.READY ->
-                        "Reading clipboard via the privileged binder — covers external keyboards, programmatic copies, and more."
-                    ShizukuBridge.State.NOT_AUTHORIZED ->
-                        "Tap to grant ClipBridge permission. With it, accessibility-event tricks become a fallback only."
-                    ShizukuBridge.State.UNAVAILABLE ->
-                        "Install the Shizuku app and start its service (ADB or wireless ADB), then refresh. Optional — accessibility still works without it."
-                },
-                style = MaterialTheme.typography.bodySmall,
-            )
-            if (state == ShizukuBridge.State.NOT_AUTHORIZED) {
-                Button(onClick = onRequest, modifier = Modifier.fillMaxWidth()) {
-                    Text("Grant Shizuku permission")
-                }
-            }
-            Button(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) {
-                Text("Refresh status")
-            }
-        }
-    }
-}
-
-@Composable
-private fun AccessibilityBanner(
-    enabled: Boolean,
-    preferShizuku: Boolean,
-    onOpenSettings: () -> Unit,
-    onRefresh: () -> Unit,
-) {
-    // When Shizuku is doing the heavy lifting, AS becomes optional. Tone the
-    // banner down (warning instead of error) so the user isn't pushed to
-    // enable both.
-    val (containerColor, contentColor) = when {
-        enabled -> MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
-        preferShizuku -> MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
-        else -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
-    }
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = containerColor, contentColor = contentColor),
-    ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Text(
-                text = when {
-                    enabled -> "Accessibility: enabled ✓"
-                    preferShizuku -> "Accessibility: optional (Shizuku is active)"
-                    else -> "Accessibility: NOT enabled"
-                },
-                style = MaterialTheme.typography.titleSmall,
-            )
-            Text(
-                text = when {
-                    enabled -> "Used as a fallback for copy detection. Safe to leave on."
-                    preferShizuku -> "Shizuku already covers clipboard reads. Enable accessibility only if you want toast-based detection too."
-                    else -> "Tap below and enable ClipBridge under Installed services — needed when Shizuku is not available."
-                },
-                style = MaterialTheme.typography.bodySmall,
-            )
-            if (!enabled) {
-                Button(onClick = onOpenSettings, modifier = Modifier.fillMaxWidth()) {
-                    Text("Open Accessibility settings")
-                }
-            }
-            Button(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) {
-                Text("Refresh status")
             }
         }
     }
@@ -335,59 +521,8 @@ private fun requestIgnoreBatteryOptimizations(context: Context) {
         data = Uri.parse("package:${context.packageName}")
     }
     runCatching { context.startActivity(intent) }.onFailure {
-        // Some OEM ROMs (e.g. heavily-stripped Samsung variants) reject the
-        // direct intent. Fall back to the optimization list page so the user
-        // can pick ClipBridge manually.
         runCatching {
             context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-        }
-    }
-}
-
-@Composable
-private fun BatteryOptBanner(
-    disabled: Boolean,
-    onRequest: () -> Unit,
-    onRefresh: () -> Unit,
-) {
-    val (containerColor, contentColor) = if (disabled) {
-        MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
-    } else {
-        MaterialTheme.colorScheme.tertiaryContainer to MaterialTheme.colorScheme.onTertiaryContainer
-    }
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = containerColor, contentColor = contentColor),
-    ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Text(
-                text = if (disabled) {
-                    "Battery optimization: disabled ✓"
-                } else {
-                    "Battery optimization: ON (recommended to disable)"
-                },
-                style = MaterialTheme.typography.titleSmall,
-            )
-            Text(
-                text = if (disabled) {
-                    "Android won't suspend ClipBridge while idle. Sync stays alive overnight."
-                } else {
-                    "Android may suspend the connection after the screen is off for a while. " +
-                            "On Samsung you may also want Settings → Apps → ClipBridge → Battery → Unrestricted."
-                },
-                style = MaterialTheme.typography.bodySmall,
-            )
-            if (!disabled) {
-                Button(onClick = onRequest, modifier = Modifier.fillMaxWidth()) {
-                    Text("Disable battery optimization")
-                }
-            }
-            Button(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) {
-                Text("Refresh status")
-            }
         }
     }
 }
