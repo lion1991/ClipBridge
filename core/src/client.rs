@@ -188,7 +188,15 @@ async fn session(
     listener: &Arc<dyn ClipListener>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
 ) -> Result<SessionExit, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/ws", relay_url.trim_end_matches('/'));
+    // Accept any of ws:// wss:// http:// https:// — the user often pastes the
+    // browser-style URL of the relay's reverse proxy.
+    let normalized = relay_url.trim_end_matches('/');
+    let normalized = match normalized {
+        u if u.starts_with("https://") => format!("wss://{}", &u["https://".len()..]),
+        u if u.starts_with("http://") => format!("ws://{}", &u["http://".len()..]),
+        u => u.to_string(),
+    };
+    let url = format!("{normalized}/ws");
     tracing::info!(%url, "connecting");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
 

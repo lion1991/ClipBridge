@@ -83,7 +83,7 @@ private fun PairingScreen(
 ) {
     val context = LocalContext.current
     val json = remember { Json { prettyPrint = true; ignoreUnknownKeys = true } }
-    var relay by remember { mutableStateOf(existing?.relayUrl ?: "ws://10.0.2.2:8787") }
+    var relay by remember { mutableStateOf(existing?.relayUrl ?: "wss://clip.wrlog.cn") }
     var configText by remember {
         mutableStateOf(existing?.let { json.encodeToString(PairingConfig.serializer(), it) } ?: "")
     }

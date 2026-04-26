@@ -35,9 +35,9 @@ final class PairingView: NSView {
         title.font = .boldSystemFont(ofSize: 14)
         outer.addArrangedSubview(title)
 
-        let relayLabel = NSTextField(labelWithString: "Relay URL (ws://host:port)")
+        let relayLabel = NSTextField(labelWithString: "Relay URL (wss://host or ws://host:port)")
         outer.addArrangedSubview(relayLabel)
-        relayField.stringValue = existing?.relayUrl ?? "ws://127.0.0.1:8787"
+        relayField.stringValue = existing?.relayUrl ?? "wss://clip.wrlog.cn"
         relayField.translatesAutoresizingMaskIntoConstraints = false
         outer.addArrangedSubview(relayField)
         relayField.widthAnchor.constraint(equalToConstant: 700).isActive = true
@@ -130,7 +130,7 @@ final class PairingView: NSView {
 
     @objc private func generate() {
         let relay = relayField.stringValue.trimmingCharacters(in: .whitespaces)
-        let cfg = PairingConfig.makeNew(relayUrl: relay.isEmpty ? "ws://127.0.0.1:8787" : relay)
+        let cfg = PairingConfig.makeNew(relayUrl: relay.isEmpty ? "wss://clip.wrlog.cn" : relay)
         configTextView.string = (try? Self.encodeJSON(cfg)) ?? ""
         refreshQR()
     }
