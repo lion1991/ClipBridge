@@ -8,6 +8,12 @@ import kotlinx.serialization.json.Json
 import java.security.SecureRandom
 import java.util.UUID
 
+/// Default relay endpoint baked into the app. Hidden from the pairing UI so
+/// the user doesn't have to know about server URLs at all. Kept inside the
+/// JSON / QR payload for forward compatibility with future "use a different
+/// relay" advanced settings.
+const val DEFAULT_RELAY_URL = "wss://clip.wrlog.cn"
+
 /// Wire-compatible with the macOS / desktop pairing config: relay URL, group ID,
 /// and the 32-byte ChaCha20-Poly1305 key encoded as base64url (no padding).
 @Serializable
@@ -21,7 +27,7 @@ data class PairingConfig(
     }.getOrNull()
 
     companion object {
-        fun makeNew(relayUrl: String): PairingConfig {
+        fun makeNew(relayUrl: String = DEFAULT_RELAY_URL): PairingConfig {
             val key = ByteArray(32).also { SecureRandom().nextBytes(it) }
             val encoded = Base64.encodeToString(
                 key,

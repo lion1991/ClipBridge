@@ -1,5 +1,11 @@
 import Foundation
 
+/// Default relay endpoint used when generating new pairings. Hidden from the
+/// pairing UI so the user doesn't have to know about server URLs at all.
+/// (The pairing JSON / QR still carries the URL for forward compatibility,
+/// in case we ever ship a "use a different relay" advanced setting.)
+let DEFAULT_RELAY_URL = "wss://clip.wrlog.cn"
+
 /// Mirror of Rust core::group::GroupConfig — what the QR code or paste-buffer
 /// transports between devices to bootstrap a sync group.
 struct PairingConfig: Codable, Equatable {
@@ -18,7 +24,7 @@ struct PairingConfig: Codable, Equatable {
         Data(base64URLNoPad: keyBase64Url)
     }
 
-    static func makeNew(relayUrl: String) -> PairingConfig {
+    static func makeNew(relayUrl: String = DEFAULT_RELAY_URL) -> PairingConfig {
         var keyBytes = [UInt8](repeating: 0, count: 32)
         let result = SecRandomCopyBytes(kSecRandomDefault, keyBytes.count, &keyBytes)
         precondition(result == errSecSuccess, "SecRandomCopyBytes failed")

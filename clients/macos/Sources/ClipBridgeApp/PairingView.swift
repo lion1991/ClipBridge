@@ -8,7 +8,6 @@ import CoreImage.CIFilterBuiltins
 ///     it both as JSON text and as a QR for the Android app to scan.
 ///   - "Paste existing": user pastes JSON received from the other device.
 final class PairingView: NSView {
-    private let relayField = NSTextField()
     private let configTextView = NSTextView()
     private let qrImageView = NSImageView()
     private let onSave: (PairingConfig) -> Void
@@ -35,12 +34,14 @@ final class PairingView: NSView {
         title.font = .boldSystemFont(ofSize: 14)
         outer.addArrangedSubview(title)
 
-        let relayLabel = NSTextField(labelWithString: "Relay URL (wss://host or ws://host:port)")
-        outer.addArrangedSubview(relayLabel)
-        relayField.stringValue = existing?.relayUrl ?? "wss://clip.wrlog.cn"
-        relayField.translatesAutoresizingMaskIntoConstraints = false
-        outer.addArrangedSubview(relayField)
-        relayField.widthAnchor.constraint(equalToConstant: 700).isActive = true
+        let subtitle = NSTextField(labelWithString:
+            "Tap “Generate new pairing”, then scan the QR from your phone. " +
+            "The relay defaults to \(DEFAULT_RELAY_URL).")
+        subtitle.font = .systemFont(ofSize: 11)
+        subtitle.textColor = .secondaryLabelColor
+        subtitle.maximumNumberOfLines = 2
+        subtitle.lineBreakMode = .byWordWrapping
+        outer.addArrangedSubview(subtitle)
 
         let buttonRow = NSStackView()
         buttonRow.orientation = .horizontal
@@ -129,8 +130,7 @@ final class PairingView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     @objc private func generate() {
-        let relay = relayField.stringValue.trimmingCharacters(in: .whitespaces)
-        let cfg = PairingConfig.makeNew(relayUrl: relay.isEmpty ? "wss://clip.wrlog.cn" : relay)
+        let cfg = PairingConfig.makeNew()
         configTextView.string = (try? Self.encodeJSON(cfg)) ?? ""
         refreshQR()
     }

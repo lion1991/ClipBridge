@@ -83,7 +83,6 @@ private fun PairingScreen(
 ) {
     val context = LocalContext.current
     val json = remember { Json { prettyPrint = true; ignoreUnknownKeys = true } }
-    var relay by remember { mutableStateOf(existing?.relayUrl ?: "wss://clip.wrlog.cn") }
     var configText by remember {
         mutableStateOf(existing?.let { json.encodeToString(PairingConfig.serializer(), it) } ?: "")
     }
@@ -116,10 +115,6 @@ private fun PairingScreen(
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         val contents = result?.contents ?: return@rememberLauncherForActivityResult
         configText = contents
-        runCatching {
-            val cfg = json.decodeFromString(PairingConfig.serializer(), contents)
-            relay = cfg.relayUrl
-        }
     }
 
     Scaffold(
@@ -153,12 +148,13 @@ private fun PairingScreen(
                 onRefresh = { batteryOptDisabled = isBatteryOptimizationDisabled(context) },
             )
 
-            OutlinedTextField(
-                value = relay,
-                onValueChange = { relay = it },
-                label = { Text("Relay URL") },
-                modifier = Modifier.fillMaxWidth(),
+            Text(
+                "Scan the QR shown on your Mac, or paste the JSON below.\n" +
+                        "Default relay: $DEFAULT_RELAY_URL",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+
             Button(
                 onClick = {
                     scanLauncher.launch(
@@ -174,7 +170,7 @@ private fun PairingScreen(
                 Text("Scan QR from Mac")
             }
             Button(onClick = {
-                val cfg = PairingConfig.makeNew(relay)
+                val cfg = PairingConfig.makeNew()
                 configText = json.encodeToString(PairingConfig.serializer(), cfg)
             }) {
                 Text("Generate new pairing (this device)")
