@@ -1,0 +1,52 @@
+# Fly.io deployment for ClipBridge relay.
+#
+# Quick start:
+#   1. brew install flyctl
+#   2. fly auth signup     # (or fly auth login)
+#   3. fly launch --copy-config --config deploy/fly.toml --no-deploy
+#        — picks a unique app name; accept defaults; do NOT add Postgres/Redis.
+#   4. fly deploy --config deploy/fly.toml
+#   5. fly status                  # confirm machine is "started" + healthy
+#   6. fly apps open               # opens https://<app-name>.fly.dev/health
+#
+# WebSocket endpoint will be at:
+#   wss://<app-name>.fly.dev/ws
+#
+# Use that as the relay URL when generating a new pairing on the Mac.
+
+app = 'clipbridge-relay'  # change to a unique name on your account
+primary_region = 'hkg'    # hkg / sin / nrt all good for users in China
+
+[build]
+  # Pull the pre-built multi-arch image from GHCR — no docker build needed.
+  image = 'ghcr.io/lion1991/clipbridge-relay:latest'
+
+[env]
+  RUST_LOG = 'info'
+  # Fly forwards external https/wss to internal port 8787 on http (no TLS in
+  # the container; Fly's edge handles TLS termination for us).
+  CLIPBRIDGE_BIND = '0.0.0.0:8787'
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  # A relay with no clients is useless if it sleeps — keep at least one
+  # machine alive at all times. With 256MB shared CPU this is well under the
+  # free-tier resource budget.
+  auto_stop_machines = 'off'
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+  [[http_service.checks]]
+    grace_period = '10s'
+    interval = '30s'
+    method = 'GET'
+    path = '/health'
+    protocol = 'http'
+    timeout = '5s'
+
+[[vm]]
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256
