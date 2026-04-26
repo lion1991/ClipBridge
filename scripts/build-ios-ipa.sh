@@ -43,6 +43,21 @@ xcodebuild \
 APP="$DERIVED/Build/Products/Release-iphoneos/ClipBridge.app"
 [[ -d "$APP" ]] || { echo "expected $APP, build output not found" >&2; exit 1; }
 
+# 3a. Embed entitlements with ldid.
+#
+# Why: CODE_SIGNING_ALLOWED=NO skips Xcode's entitlement embedding step, so
+# the binary ships with no entitlements at all. TrollStore then signs with
+# its default minimal entitlements (just get-task-allow + identifier), and
+# our private TrollStore-only keys are LOST. Running ldid afterward bakes
+# the full entitlements plist into the LC_CODE_SIGNATURE; TrollStore's own
+# re-sign preserves them.
+echo "==> 3a/4 embedding entitlements via ldid"
+if ! command -v ldid >/dev/null 2>&1; then
+  echo "ldid not found. Install: brew install ldid" >&2
+  exit 1
+fi
+ldid "-S$ROOT/clients/ios/ClipBridge.entitlements" "$APP/ClipBridge"
+
 # 4. Zip into the standard IPA layout (Payload/<App>.app/...).
 echo "==> 4/4 packaging IPA"
 STAGE="$OUT/.ipa-stage"
