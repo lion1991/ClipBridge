@@ -19,13 +19,13 @@ as the macOS and Android clients.
    support that Tauri needs to bundle MSI installers):
    https://visualstudio.microsoft.com/downloads/
 
-4. Generate the icon set from the source SVG (one-time):
-   ```powershell
-   cd clients\windows
-   cargo tauri icon icons\source.svg
+4. Icon set is checked in under `icons/`. To regenerate from the master SVG
+   (`assets/icon.svg` at the repo root) on macOS:
+   ```bash
+   ./scripts/regen-icons.sh
    ```
-   This produces `icons/32x32.png`, `128x128.png`, `128x128@2x.png`, `icon.ico`,
-   and a few platform-specific variants.
+   This refreshes every platform's icon files in one shot — Windows is part
+   of that single source of truth.
 
 ## Run / debug
 
