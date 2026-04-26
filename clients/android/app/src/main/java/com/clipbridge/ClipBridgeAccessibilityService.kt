@@ -15,6 +15,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -53,6 +56,10 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var pollerJob: Job? = null
+
+    init {
+        _stateFlow.value = UiConnState.Idle
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -137,6 +144,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         prefsListener = null
         client?.stop()
         client = null
+        _stateFlow.value = UiConnState.Idle
         return super.onUnbind(intent)
     }
 
@@ -265,6 +273,12 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
 
                     override fun onState(state: ConnectionState) {
                         Log.i(TAG, "state: $state")
+                        _stateFlow.value = when (state) {
+                            ConnectionState.Connecting -> UiConnState.Connecting
+                            ConnectionState.Connected -> UiConnState.Connected
+                            ConnectionState.Disconnected -> UiConnState.Disconnected
+                            is ConnectionState.Error -> UiConnState.Error(state.message)
+                        }
                     }
                 },
             )
@@ -290,5 +304,21 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     companion object {
         private const val TAG = "ClipBridge"
         private const val POLL_INTERVAL_MS = 2_000L
+
+        // In-process state for the UI to observe. AS and Activity share the
+        // same process (no android:process attribute on either component) so
+        // a plain MutableStateFlow is the cheapest reactive bridge.
+        private val _stateFlow = MutableStateFlow<UiConnState>(UiConnState.Idle)
+        val stateFlow: StateFlow<UiConnState> = _stateFlow.asStateFlow()
     }
+}
+
+/// What the UI displays. Distinct from `uniffi.clipbridge_core.ConnectionState`
+/// so the UI doesn't need to import the FFI types.
+sealed class UiConnState {
+    data object Idle : UiConnState()
+    data object Connecting : UiConnState()
+    data object Connected : UiConnState()
+    data object Disconnected : UiConnState()
+    data class Error(val message: String) : UiConnState()
 }

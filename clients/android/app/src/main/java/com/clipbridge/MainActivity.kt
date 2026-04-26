@@ -36,9 +36,14 @@ import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
@@ -77,6 +82,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.launch
@@ -145,6 +151,8 @@ private fun PairingScreen(
         scope.launch { snackbarHostState.showSnackbar(message) }
     }
 
+    val connState by ClipBridgeAccessibilityService.stateFlow.collectAsStateWithLifecycle()
+
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
         val observer = LifecycleEventObserver { _, event ->
@@ -196,6 +204,12 @@ private fun PairingScreen(
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            ConnectionPill(
+                state = connState,
+                paired = isPaired,
+                asEnabled = asEnabled,
+            )
+
             ScanHero(
                 paired = isPaired,
                 onScan = {
@@ -269,6 +283,64 @@ private fun PairingScreen(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+/**
+ * Compact pill above the hero card showing live connection state.
+ * Combines the AccessibilityService's connection-state flow with the local
+ * pairing / accessibility-enabled flags so the user always sees the most
+ * actionable status.
+ */
+@Composable
+private fun ConnectionPill(
+    state: UiConnState,
+    paired: Boolean,
+    asEnabled: Boolean,
+) {
+    data class Pill(
+        val label: String,
+        val icon: androidx.compose.ui.graphics.vector.ImageVector,
+        val container: Color,
+        val content: Color,
+    )
+
+    val cs = MaterialTheme.colorScheme
+    val pill = when {
+        !asEnabled -> Pill("无障碍未启用", Icons.Filled.Warning, cs.errorContainer, cs.onErrorContainer)
+        !paired -> Pill("未配对", Icons.Filled.LinkOff, cs.surfaceVariant, cs.onSurfaceVariant)
+        else -> when (state) {
+            UiConnState.Idle -> Pill("等待启动", Icons.Filled.RadioButtonUnchecked, cs.surfaceVariant, cs.onSurfaceVariant)
+            UiConnState.Connecting -> Pill("连接中…", Icons.Filled.Sync, cs.tertiaryContainer, cs.onTertiaryContainer)
+            UiConnState.Connected -> Pill("已连接 · 同步中", Icons.Filled.CheckCircle, cs.primaryContainer, cs.onPrimaryContainer)
+            UiConnState.Disconnected -> Pill("已断开,正在重连", Icons.Filled.CloudOff, cs.surfaceVariant, cs.onSurfaceVariant)
+            is UiConnState.Error -> Pill("连接出错:${state.message}", Icons.Filled.Error, cs.errorContainer, cs.onErrorContainer)
+        }
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = pill.container,
+        contentColor = pill.content,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = pill.icon,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                pill.label,
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }
