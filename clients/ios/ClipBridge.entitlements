@@ -6,8 +6,22 @@
     <key>com.apple.security.network.client</key>
     <true/>
 
-    <!-- iOS 16+ 默认每次粘贴弹"已粘贴自 ClipBridge"提示,这条把它静音。
-         TrollStore 能签上这个私有 key,普通侧载不行。 -->
+    <!-- 让 binary 以 platform-application 运行(以 mobile 用户身份,跟系统
+         自带 App 一档)。下面的 paste 私钥只有 platform-application 才会
+         被 iOS 认账,否则白写。
+         之前一度认为这条会触发 TrollStore 安装错误 181 而拿掉,后来在
+         commit 668aefd 定位到真凶是 xcframework embed,那条修掉之后这条
+         可以安全加回来。 -->
+    <key>platform-application</key>
+    <true/>
+
+    <!-- 跑出 App 容器沙盒,跟 TrollStore 别的"特权"App 一样。和上面的
+         platform-application 配套使用。 -->
+    <key>com.apple.private.security.no-container</key>
+    <true/>
+
+    <!-- iOS 16+ 默认每次跨 App 粘贴弹"已粘贴自 ClipBridge"提示,这条把
+         它静音。仅对 platform-application 生效,所以必须和上面那条配套。 -->
     <key>com.apple.UIKit.allow-paste-without-prompt</key>
     <true/>
 </dict>
