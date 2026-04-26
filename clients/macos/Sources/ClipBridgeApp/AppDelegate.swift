@@ -1,11 +1,13 @@
 import AppKit
 import ClipbridgeCore
+import ServiceManagement
 import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var coordinator: BridgeCoordinator?
     private var pairingWindow: NSWindow?
+    private var autostartItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -24,8 +26,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(makeItem("打开配对窗口…", #selector(showPairing), key: "p"))
         menu.addItem(makeItem("重置配对", #selector(resetPairing), key: ""))
         menu.addItem(NSMenuItem.separator())
+        autostartItem = makeItem("开机自启", #selector(toggleAutostart), key: "")
+        menu.addItem(autostartItem)
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(makeItem("退出 ClipBridge", #selector(quit), key: "q"))
         statusItem.menu = menu
+        refreshAutostartItem()
 
         if let config = PairingStore.load() {
             startCoordinator(with: config)
@@ -82,6 +88,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    /// Toggle Login Item registration via SMAppService (macOS 13+). The
+    /// system surfaces a confirmation in System Settings → General → Login
+    /// Items the first time we register; subsequent toggles are silent.
+    @objc private func toggleAutostart() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "无法修改开机自启设置"
+            alert.informativeText = "\(error.localizedDescription)\n\n请在 系统设置 → 通用 → 登录项 中手动开关。"
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "好")
+            alert.runModal()
+        }
+        refreshAutostartItem()
+    }
+
+    private func refreshAutostartItem() {
+        // `.requiresApproval` shows up when the user has previously denied
+        // login items for this bundle id; the checkmark is misleading there,
+        // so we surface it as a separate label.
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            autostartItem.state = .on
+            autostartItem.title = "开机自启"
+        case .requiresApproval:
+            autostartItem.state = .mixed
+            autostartItem.title = "开机自启 · 待系统批准"
+        case .notRegistered, .notFound:
+            fallthrough
+        @unknown default:
+            autostartItem.state = .off
+            autostartItem.title = "开机自启"
+        }
     }
 
     private func startCoordinator(with config: PairingConfig) {

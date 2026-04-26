@@ -115,6 +115,23 @@ details.card[open] > summary::after {
   font-size: 12px;
 }
 
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 12px;
+  font-size: 14px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.row input[type="checkbox"] {
+  margin: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
 .qr-frame {
   background: white;
   border: 1px solid var(--border);

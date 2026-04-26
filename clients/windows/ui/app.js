@@ -94,6 +94,34 @@ async function init() {
     console.warn("load pairing:", e);
   }
 
+  // Autostart toggle. Plugin commands are namespaced as
+  // `plugin:autostart|<name>` and registered with the same permissions
+  // listed in capabilities/default.json.
+  const chk = $("chk-autostart");
+  try {
+    chk.checked = await invoke("plugin:autostart|is_enabled");
+  } catch (e) {
+    console.warn("autostart status:", e);
+  }
+  chk.addEventListener("change", async () => {
+    try {
+      if (chk.checked) {
+        await invoke("plugin:autostart|enable");
+        toast("已开启开机自启");
+      } else {
+        await invoke("plugin:autostart|disable");
+        toast("已关闭开机自启");
+      }
+    } catch (e) {
+      // Restore the checkbox to whatever the OS thinks the state is, so the
+      // UI doesn't lie if the call failed (eg. permission revoked manually).
+      try {
+        chk.checked = await invoke("plugin:autostart|is_enabled");
+      } catch (_) {}
+      showError(`修改开机自启失败:${e}`);
+    }
+  });
+
   $("btn-generate").addEventListener("click", async () => {
     showError(null);
     try {
