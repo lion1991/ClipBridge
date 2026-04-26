@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -8,6 +8,18 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::crypto::{decrypt, encrypt, KEY_LEN};
 use crate::protocol::{ClientMessage, ClipPayload, ServerMessage};
+
+/// Rustls 0.23 refuses to pick a crypto provider on its own when more than
+/// one (or none) is enabled across the dependency graph. We control this
+/// explicitly: pure-Rust `ring` is enabled in Cargo.toml, and we also call
+/// `install_default()` here so the panic can't sneak back in via a future
+/// transitive dep that brings `aws-lc-rs`.
+static CRYPTO_INIT: Once = Once::new();
+fn ensure_crypto_provider() {
+    CRYPTO_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum ConnectionState {
@@ -86,6 +98,7 @@ impl Client {
         device_id: String,
         listener: Arc<dyn ClipListener>,
     ) -> Result<Arc<Self>, FfiError> {
+        ensure_crypto_provider();
         if key.len() != KEY_LEN {
             return Err(FfiError::InvalidKey {
                 got: key.len() as u32,

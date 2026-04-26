@@ -20,6 +20,12 @@ rand = "0.8"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+# Pull in rustls explicitly with `ring` so the unified feature resolution
+# enables a crypto provider (tokio-tungstenite's TLS feature alone leaves
+# rustls 0.23 with no provider, which panics on first TLS handshake with
+# "Could not automatically determine the process-level CryptoProvider").
+# Pure-Rust ring is preferred over aws-lc-rs to avoid CMake / C toolchain.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 futures-util = "0.3"
 url = "2"
 
