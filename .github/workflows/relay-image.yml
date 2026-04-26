@@ -3,13 +3,14 @@ name: Build relay image
 on:
   push:
     branches: [main]
+    # Only files that actually go into the relay binary trigger a build.
+    # Client-only changes (clients/**, scripts/**, tools/uniffi-bindgen/**,
+    # docs, deploy/**, *.md) are skipped by omission.
     paths:
       - 'core/**'
       - 'relay/**'
-      - 'tools/uniffi-bindgen/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'relay/Dockerfile'
       - '.github/workflows/relay-image.yml'
     tags: ['v*']
   workflow_dispatch:
