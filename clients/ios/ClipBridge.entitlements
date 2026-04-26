@@ -2,26 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- TrollStore 用任意私有 entitlements 给 IPA 签名,绕过 iOS 14+ 的
-         后台 pasteboard 限制 + app suspension 限制。普通侧载 (free Apple
-         ID / AltStore) 用不了这些 key,只有 TrollStore / 企业证书 / MDM
-         能签上。 -->
-    <key>com.apple.private.security.no-sandbox</key>
-    <true/>
-    <key>com.apple.private.security.no-container</key>
-    <true/>
-    <key>platform-application</key>
-    <true/>
-    <key>com.apple.private.persona-mgmt</key>
-    <true/>
-
-    <!-- 后台 socket 保活。 -->
+    <!-- 允许后台 socket。普通 App 默认就有,显式列出更稳。 -->
     <key>com.apple.security.network.client</key>
     <true/>
-    <key>com.apple.security.network.server</key>
-    <true/>
 
-    <!-- iOS 16+ 默认每次粘贴弹"已粘贴自 App"提示,这条把它静音。 -->
+    <!-- iOS 16+ 默认每次粘贴弹"已粘贴自 ClipBridge"提示,这条把它静音。
+         TrollStore 能签上这个私有 key,普通侧载不行。 -->
     <key>com.apple.UIKit.allow-paste-without-prompt</key>
     <true/>
 </dict>

@@ -41,18 +41,14 @@ targets:
         UIRequiresFullScreen: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+        # 只用 audio 后台模式 + AVAudioSession.playback 维持 WebSocket。
+        # processing/fetch 我们没在代码里用 BackgroundTasks 调度,留着只会
+        # 让 LaunchServices 多检查规则,还可能触发奇怪的注册失败。
         UIBackgroundModes:
           - audio
-          - processing
-          - fetch
-        BGTaskSchedulerPermittedIdentifiers:
-          - com.clipbridge.refresh
         # Allow plain ws:// inside trusted LANs as well as wss://.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-        # Background-audio + processing modes need real privacy-string
-        # justifications even though our use is "keep the WebSocket alive".
-        NSMicrophoneUsageDescription: "ClipBridge 不录音,后台静默音频仅用于保持剪贴板同步连接。"
         NSCameraUsageDescription: "扫描另一台设备显示的配对二维码。"
     settings:
       base:
