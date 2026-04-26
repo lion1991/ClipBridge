@@ -3,7 +3,9 @@ package com.clipbridge
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
 import androidx.activity.ComponentActivity
@@ -75,14 +77,16 @@ private fun PairingScreen(
     }
     var error by remember { mutableStateOf<String?>(null) }
     var asEnabled by remember { mutableStateOf(isAccessibilityEnabled(context)) }
+    var batteryOptDisabled by remember { mutableStateOf(isBatteryOptimizationDisabled(context)) }
 
-    // Re-check the accessibility-enabled flag every time we come back from
-    // the system Settings activity.
+    // Re-check status flags every time we come back from a system Settings
+    // activity (accessibility, battery optimization, etc).
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 asEnabled = isAccessibilityEnabled(context)
+                batteryOptDisabled = isBatteryOptimizationDisabled(context)
             }
         }
         lifecycle.addObserver(observer)
@@ -114,6 +118,12 @@ private fun PairingScreen(
                     context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                 },
                 onRefresh = { asEnabled = isAccessibilityEnabled(context) },
+            )
+
+            BatteryOptBanner(
+                disabled = batteryOptDisabled,
+                onRequest = { requestIgnoreBatteryOptimizations(context) },
+                onRefresh = { batteryOptDisabled = isBatteryOptimizationDisabled(context) },
             )
 
             OutlinedTextField(
@@ -227,4 +237,72 @@ private fun isAccessibilityEnabled(context: Context): Boolean {
     return enabled
         .split(':')
         .any { it.equals(expected, ignoreCase = true) }
+}
+
+private fun isBatteryOptimizationDisabled(context: Context): Boolean {
+    val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+    return pm.isIgnoringBatteryOptimizations(context.packageName)
+}
+
+@Suppress("BatteryLife") // we sideload — Play Store policy doesn't apply
+private fun requestIgnoreBatteryOptimizations(context: Context) {
+    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+        data = Uri.parse("package:${context.packageName}")
+    }
+    runCatching { context.startActivity(intent) }.onFailure {
+        // Some OEM ROMs (e.g. heavily-stripped Samsung variants) reject the
+        // direct intent. Fall back to the optimization list page so the user
+        // can pick ClipBridge manually.
+        runCatching {
+            context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
+    }
+}
+
+@Composable
+private fun BatteryOptBanner(
+    disabled: Boolean,
+    onRequest: () -> Unit,
+    onRefresh: () -> Unit,
+) {
+    val (containerColor, contentColor) = if (disabled) {
+        MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
+    } else {
+        MaterialTheme.colorScheme.tertiaryContainer to MaterialTheme.colorScheme.onTertiaryContainer
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = containerColor, contentColor = contentColor),
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = if (disabled) {
+                    "Battery optimization: disabled ✓"
+                } else {
+                    "Battery optimization: ON (recommended to disable)"
+                },
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Text(
+                text = if (disabled) {
+                    "Android won't suspend ClipBridge while idle. Sync stays alive overnight."
+                } else {
+                    "Android may suspend the connection after the screen is off for a while. " +
+                            "On Samsung you may also want Settings → Apps → ClipBridge → Battery → Unrestricted."
+                },
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (!disabled) {
+                Button(onClick = onRequest, modifier = Modifier.fillMaxWidth()) {
+                    Text("Disable battery optimization")
+                }
+            }
+            Button(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) {
+                Text("Refresh status")
+            }
+        }
+    }
 }
