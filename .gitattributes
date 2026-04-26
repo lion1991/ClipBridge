@@ -1,0 +1,6 @@
+# Windows-only build entry points must arrive on disk with CRLF, otherwise
+# CMD on some Windows setups chokes on LF-only line endings (especially in
+# multi-line `if (...)` blocks).
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf

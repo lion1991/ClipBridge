@@ -16,7 +16,7 @@ settings:
     ENABLE_BITCODE: "NO"
     IPHONEOS_DEPLOYMENT_TARGET: "14.0"
 
-# Symlink target — `scripts/build-ios-xcframework.sh` writes to ../../build/ios.
+# Symlink target — `scripts/build-ios-ipa.sh` writes the xcframework to ../../build/ios.
 fileGroups:
   - "../../build/ios/ClipbridgeCore.xcframework"
 
@@ -27,8 +27,11 @@ targets:
     deploymentTarget: "15.0"
     sources:
       - Sources
-      - path: Resources
-        type: folder
+      # NOT `type: folder` — that ships .xcassets raw, actool never runs, no
+      # Assets.car / CFBundleIcons land in the bundle, and TrollStore install
+      # fails with error 181 ("将应用添加至图标缓存失败"). Reference the
+      # asset catalog directly so Xcode hands it to actool.
+      - Resources/Assets.xcassets
     info:
       path: Info.plist
       properties:

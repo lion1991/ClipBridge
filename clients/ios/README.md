@@ -28,15 +28,15 @@ com.apple.UIKit.allow-paste-without-prompt  iOS 16+ 粘贴不再弹"已粘贴自
 # 一次性
 brew install xcodegen
 
-# 一键打 IPA
+# 一键打 TIPA(TrollStore IPA,扩展名让 iOS 直接路由到 TrollStore)
 ./scripts/build-ios-ipa.sh
-# 输出: build/ios/ClipBridge.ipa
+# 输出: build/ios/ClipBridge.tipa
 ```
 
 ## 安装
 
-1. 把 IPA 弄到 iOS 设备(AirDrop / iCloud Drive / "文件" App)
-2. 长按 IPA → "在 TrollStore 中打开" (或在 TrollStore 里点 + 选择)
+1. 把 TIPA 弄到 iOS 设备(AirDrop / iCloud Drive / "文件" App)
+2. 长按 TIPA → "在 TrollStore 中打开" (或在 TrollStore 里点 + 选择)
 3. TrollStore 列表出现 ClipBridge → 点"安装"
 4. 主屏幕出现图标,点开 → 扫码配对完成 → Mac 端复制立即同步到 iPhone
 
@@ -65,9 +65,11 @@ clients/ios/
 - **后台保活靠静默音频 hack**: AVAudioSession `.playback` + 0 音量 PCM 循环。
   TrollStore 私有 entitlements (no-sandbox) 通常已经够用,但加上音频路径作为
   双保险。如果将来发现 iOS 用户实际能稳定后台,可以考虑去掉。
-- **图标缺失**: Assets.xcassets 里只有占位 contents.json,没有 1024×1024
-  的 PNG。安装后会显示灰色默认图标。补一个 PNG 进 AppIcon.appiconset
-  即可。
+- **图标是临时的**: `AppIcon.appiconset/icon-1024.png` 由 `clients/windows/icons/source.svg`
+  用 rsvg-convert 渲染出来,凑合用。空的 AppIcon 会让 TrollStore 安装时
+  LaunchServices 注册失败(error 181 / "将应用添加至图标缓存失败"),所以
+  这里必须有一张 1024×1024、不带 alpha 通道的 PNG。换正式图标时记得保留
+  这两个属性。
 - **同 LAN 直连**还没做(Mac/Win 也都没做),全部走公网中继。后续如果做
   LAN bypass,iOS 上 `NSLocalNetworkUsageDescription` + Bonjour
   service 这套 entitlements TrollStore 也覆盖。
