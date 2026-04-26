@@ -16,11 +16,31 @@ if [[ ! -f "$COMPOSE_FILE" ]]; then
   exit 1
 fi
 
+# Prefer the new V2 plugin (`docker compose`), fall back to the legacy
+# standalone V1 binary (`docker-compose`).
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  cat >&2 <<'EOF'
+neither `docker compose` nor `docker-compose` is available.
+
+Install the plugin (recommended):
+  Ubuntu/Debian: sudo apt-get install -y docker-compose-plugin
+  RHEL/Alma/Rocky: sudo dnf install -y docker-compose-plugin
+  Or reinstall Docker: curl -fsSL https://get.docker.com | sudo sh
+EOF
+  exit 1
+fi
+
+echo "==> using: ${COMPOSE[*]}"
+
 echo "==> pulling latest image"
-docker compose -f "$COMPOSE_FILE" pull
+"${COMPOSE[@]}" -f "$COMPOSE_FILE" pull
 
 echo "==> recreating container if image changed"
-docker compose -f "$COMPOSE_FILE" up -d
+"${COMPOSE[@]}" -f "$COMPOSE_FILE" up -d
 
 echo "==> tail logs (Ctrl+C to detach)"
-docker compose -f "$COMPOSE_FILE" logs -f --tail 20
+"${COMPOSE[@]}" -f "$COMPOSE_FILE" logs -f --tail 20
