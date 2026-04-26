@@ -47,11 +47,21 @@ final class BridgeCoordinator: ObservableObject {
     }
 
     func applicationDidBecomeActive() {
+        // The audio session can be deactivated by iOS when we lose audio
+        // focus (incoming call, Siri, etc.). Re-arming it here guarantees we
+        // get background runtime again on the next backgrounding.
+        reactivateAudioSession()
+
         // Coming back to foreground is the perfect moment to drain pasteboard
-        // changes that may have happened while we were truly suspended. The
-        // poll timer also runs on its own, but a manual tick here means an
-        // immediate response.
+        // changes that may have happened while we were truly suspended.
         checkPasteboard()
+
+        // If the bridge is alive but missed broadcasts during a suspension
+        // (eg. iOS killed the audio session and we lost runtime), this pulls
+        // anything still in the relay's 5-min cache. Cheap belt-and-braces;
+        // the relay also sends Recent automatically on every reconnect, so
+        // the worst case here is a duplicate write to the pasteboard.
+        try? client?.fetchRecent()
     }
 
     // MARK: - Pairing lifecycle
@@ -168,7 +178,56 @@ final class BridgeCoordinator: ObservableObject {
             // Not fatal — TrollStore entitlements alone may keep us alive.
             return
         }
+        observeAudioInterruptions()
         playSilentLoop()
+    }
+
+    /// Without this, a phone call / Siri / another music app interrupts our
+    /// session, iOS pauses the silent loop, and we silently lose all
+    /// background runtime from then on. Resuming on `.ended` re-acquires it.
+    private func observeAudioInterruptions() {
+        let nc = NotificationCenter.default
+        nc.addObserver(
+            self,
+            selector: #selector(handleAudioInterruption(_:)),
+            name: AVAudioSession.interruptionNotification,
+            object: nil
+        )
+        nc.addObserver(
+            self,
+            selector: #selector(handleAudioRouteChange(_:)),
+            name: AVAudioSession.routeChangeNotification,
+            object: nil
+        )
+    }
+
+    @objc private func handleAudioInterruption(_ note: Notification) {
+        guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw)
+        else { return }
+        if type == .ended {
+            reactivateAudioSession()
+            audioPlayer?.play()
+        }
+    }
+
+    @objc private func handleAudioRouteChange(_ note: Notification) {
+        // Headphone unplug / Bluetooth disconnect can stop the player. Just
+        // kick it back to playing — `.mixWithOthers` means it never grabbed
+        // the route exclusively, so this is non-disruptive.
+        if audioPlayer?.isPlaying == false {
+            reactivateAudioSession()
+            audioPlayer?.play()
+        }
+    }
+
+    private func reactivateAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setActive(true, options: [])
+        } catch {
+            // Best-effort; nothing actionable on failure.
+        }
     }
 
     private func playSilentLoop() {
@@ -205,7 +264,11 @@ final class BridgeCoordinator: ObservableObject {
         do {
             audioPlayer = try AVAudioPlayer(contentsOf: tmpURL)
             audioPlayer?.numberOfLoops = -1
-            audioPlayer?.volume = 0
+            // iOS treats `volume == 0` as "not really playing" and may suspend
+            // us anyway. A vanishingly small non-zero value keeps the audio
+            // session genuinely active without being audible. The buffer is
+            // silent regardless, so this stays inaudible end-to-end.
+            audioPlayer?.volume = 0.0001
             audioPlayer?.play()
         } catch {
             return
