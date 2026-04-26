@@ -81,13 +81,24 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private fun startShizukuPoller() {
         pollerJob?.cancel()
         pollerJob = scope.launch {
+            Log.i(TAG, "shizuku poller starting, initial state=${ShizukuBridge.state()}")
+            var lastLoggedState: ShizukuBridge.State? = null
+            var tickCount = 0
             while (isActive) {
-                if (ShizukuBridge.state() == ShizukuBridge.State.READY) {
+                val state = ShizukuBridge.state()
+                if (state != lastLoggedState) {
+                    Log.i(TAG, "shizuku state -> $state")
+                    lastLoggedState = state
+                }
+                if (state == ShizukuBridge.State.READY) {
                     val text = ShizukuBridge.readPrimaryClipText()
+                    if (++tickCount % 10 == 0) {
+                        Log.d(TAG, "shizuku tick $tickCount: text len=${text?.length ?: -1}")
+                    }
                     if (!text.isNullOrEmpty()) {
                         withContext(Dispatchers.Main) {
                             if (text != lastReceived && text != lastSent) {
-                                Log.i(TAG, "shizuku read: ${text.length} chars")
+                                Log.i(TAG, "shizuku read NEW: ${text.length} chars")
                                 publish(text)
                             }
                         }
