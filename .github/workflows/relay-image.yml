@@ -1,0 +1,60 @@
+name: Build relay image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'core/**'
+      - 'relay/**'
+      - 'tools/uniffi-bindgen/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'relay/Dockerfile'
+      - '.github/workflows/relay-image.yml'
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/clipbridge-relay
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU enables cross-arch builds (linux/arm64 from an amd64 runner).
+      # Synology models split between Intel/AMD (amd64) and Realtek/Marvell
+      # (arm64), so we ship both.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: relay/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,30 @@
+# ClipBridge relay — Synology Container Manager deployment.
+#
+# In DSM:
+#   Container Manager → Project → Create → "Upload docker-compose.yml"
+#   (or paste this file's content), name = clipbridge-relay.
+#
+# Then expose it via DSM Reverse Proxy:
+#   Control Panel → Login Portal → Advanced → Reverse Proxy → Create
+#     Source:      Protocol HTTPS  Hostname clipbridge.<your>.synology.me  Port 443
+#     Destination: Protocol HTTP   Hostname localhost                       Port 8787
+#     Custom header → WebSocket: enable (adds Upgrade/Connection)
+#
+# Get a free TLS cert in Control Panel → Security → Certificate (Let's Encrypt
+# for the same hostname), then assign it to the reverse-proxy entry.
+#
+# Clients connect with:
+#   wss://clipbridge.<your>.synology.me/ws
+
+services:
+  clipbridge-relay:
+    image: ghcr.io/lion1991/clipbridge-relay:latest
+    container_name: clipbridge-relay
+    restart: unless-stopped
+    environment:
+      RUST_LOG: "info"
+      CLIPBRIDGE_BIND: "0.0.0.0:8787"
+    ports:
+      # Bind to loopback only — the reverse proxy fronts public traffic.
+      # If you prefer to expose directly, change to "8787:8787".
+      - "127.0.0.1:8787:8787"

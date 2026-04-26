@@ -1,0 +1,26 @@
+# Run the relay locally for testing:
+#   cd relay && docker compose up --build
+#
+# For production, the relay should sit behind a TLS-terminating reverse
+# proxy (Synology Reverse Proxy / Cloudflare Tunnel / nginx). Clients then
+# connect to wss://your.host/ws. The relay itself only speaks ws:// — TLS
+# is the proxy's job.
+
+services:
+  clipbridge-relay:
+    # Default to the published multi-arch image from GHCR. Override locally by
+    # running `docker compose up --build` to rebuild from the local Dockerfile.
+    image: ghcr.io/lion1991/clipbridge-relay:latest
+    build:
+      context: ..
+      dockerfile: relay/Dockerfile
+    container_name: clipbridge-relay
+    restart: unless-stopped
+    environment:
+      CLIPBRIDGE_BIND: "0.0.0.0:8787"
+      RUST_LOG: "info"
+    ports:
+      - "8787:8787"
+    # No healthcheck: the distroless base has no shell or curl, and the relay
+    # binary doesn't ship a self-test. Liveness can be inferred from the
+    # process being up; the reverse proxy in front will return 502 if not.
