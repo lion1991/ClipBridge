@@ -44,10 +44,17 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.serialization.json.Json
+import rikka.shizuku.Shizuku
 
 class MainActivity : ComponentActivity() {
+
+    private val shizukuPermissionListener =
+        Shizuku.OnRequestPermissionResultListener { _, _ -> /* state listener picks it up */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ShizukuBridge.register()
+        Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -59,6 +66,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
+        super.onDestroy()
     }
 }
 
@@ -78,6 +90,7 @@ private fun PairingScreen(
     var error by remember { mutableStateOf<String?>(null) }
     var asEnabled by remember { mutableStateOf(isAccessibilityEnabled(context)) }
     var batteryOptDisabled by remember { mutableStateOf(isBatteryOptimizationDisabled(context)) }
+    var shizukuState by remember { mutableStateOf(ShizukuBridge.state()) }
 
     // Re-check status flags every time we come back from a system Settings
     // activity (accessibility, battery optimization, etc).
@@ -87,10 +100,17 @@ private fun PairingScreen(
             if (event == Lifecycle.Event.ON_RESUME) {
                 asEnabled = isAccessibilityEnabled(context)
                 batteryOptDisabled = isBatteryOptimizationDisabled(context)
+                shizukuState = ShizukuBridge.state()
             }
         }
         lifecycle.addObserver(observer)
         onDispose { lifecycle.removeObserver(observer) }
+    }
+
+    DisposableEffect(Unit) {
+        val l = ShizukuBridge.StateListener { s -> shizukuState = s }
+        ShizukuBridge.addStateListener(l)
+        onDispose { ShizukuBridge.removeStateListener(l) }
     }
 
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
@@ -112,8 +132,15 @@ private fun PairingScreen(
                 .fillMaxSize(),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            ShizukuBanner(
+                state = shizukuState,
+                onRequest = { ShizukuBridge.requestPermission(SHIZUKU_REQUEST_CODE) },
+                onRefresh = { shizukuState = ShizukuBridge.state() },
+            )
+
             AccessibilityBanner(
                 enabled = asEnabled,
+                preferShizuku = shizukuState == ShizukuBridge.State.READY,
                 onOpenSettings = {
                     context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                 },
@@ -184,15 +211,18 @@ private fun PairingScreen(
 }
 
 @Composable
-private fun AccessibilityBanner(
-    enabled: Boolean,
-    onOpenSettings: () -> Unit,
+private fun ShizukuBanner(
+    state: ShizukuBridge.State,
+    onRequest: () -> Unit,
     onRefresh: () -> Unit,
 ) {
-    val (containerColor, contentColor) = if (enabled) {
-        MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
-    } else {
-        MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
+    val (containerColor, contentColor) = when (state) {
+        ShizukuBridge.State.READY ->
+            MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
+        ShizukuBridge.State.NOT_AUTHORIZED ->
+            MaterialTheme.colorScheme.tertiaryContainer to MaterialTheme.colorScheme.onTertiaryContainer
+        ShizukuBridge.State.UNAVAILABLE ->
+            MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
     }
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -203,15 +233,72 @@ private fun AccessibilityBanner(
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Text(
-                text = if (enabled) "Accessibility: enabled ✓" else "Accessibility: NOT enabled",
+                text = when (state) {
+                    ShizukuBridge.State.READY -> "Shizuku: ready ✓"
+                    ShizukuBridge.State.NOT_AUTHORIZED -> "Shizuku: needs permission"
+                    ShizukuBridge.State.UNAVAILABLE -> "Shizuku: not available"
+                },
                 style = MaterialTheme.typography.titleSmall,
             )
             Text(
-                text = if (enabled) {
-                    "ClipBridge can read your clipboard and sync it."
-                } else {
-                    "Tap the button below, then enable ClipBridge under Installed services. " +
-                            "Without this, the app cannot read what you copy on this phone."
+                text = when (state) {
+                    ShizukuBridge.State.READY ->
+                        "Reading clipboard via the privileged binder — covers external keyboards, programmatic copies, and more."
+                    ShizukuBridge.State.NOT_AUTHORIZED ->
+                        "Tap to grant ClipBridge permission. With it, accessibility-event tricks become a fallback only."
+                    ShizukuBridge.State.UNAVAILABLE ->
+                        "Install the Shizuku app and start its service (ADB or wireless ADB), then refresh. Optional — accessibility still works without it."
+                },
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (state == ShizukuBridge.State.NOT_AUTHORIZED) {
+                Button(onClick = onRequest, modifier = Modifier.fillMaxWidth()) {
+                    Text("Grant Shizuku permission")
+                }
+            }
+            Button(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) {
+                Text("Refresh status")
+            }
+        }
+    }
+}
+
+@Composable
+private fun AccessibilityBanner(
+    enabled: Boolean,
+    preferShizuku: Boolean,
+    onOpenSettings: () -> Unit,
+    onRefresh: () -> Unit,
+) {
+    // When Shizuku is doing the heavy lifting, AS becomes optional. Tone the
+    // banner down (warning instead of error) so the user isn't pushed to
+    // enable both.
+    val (containerColor, contentColor) = when {
+        enabled -> MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
+        preferShizuku -> MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
+        else -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = containerColor, contentColor = contentColor),
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = when {
+                    enabled -> "Accessibility: enabled ✓"
+                    preferShizuku -> "Accessibility: optional (Shizuku is active)"
+                    else -> "Accessibility: NOT enabled"
+                },
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Text(
+                text = when {
+                    enabled -> "Used as a fallback for copy detection. Safe to leave on."
+                    preferShizuku -> "Shizuku already covers clipboard reads. Enable accessibility only if you want toast-based detection too."
+                    else -> "Tap below and enable ClipBridge under Installed services — needed when Shizuku is not available."
                 },
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -226,6 +313,8 @@ private fun AccessibilityBanner(
         }
     }
 }
+
+private const val SHIZUKU_REQUEST_CODE = 0x5817
 
 private fun isAccessibilityEnabled(context: Context): Boolean {
     val expected = ComponentName(context, ClipBridgeAccessibilityService::class.java)

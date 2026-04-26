@@ -9,6 +9,15 @@ import android.content.SharedPreferences
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import uniffi.clipbridge_core.Client
 import uniffi.clipbridge_core.ClipKind
 import uniffi.clipbridge_core.ClipListener
@@ -16,19 +25,19 @@ import uniffi.clipbridge_core.ClipPayload
 import uniffi.clipbridge_core.ConnectionState
 
 /**
- * Detects user-initiated copies via accessibility events. Android 10+ blocks
- * `ClipboardManager.getPrimaryClip()` from background apps even with an enabled
- * accessibility service, so we instead:
+ * Two paths to picking up clipboard changes on Android 10+, where background
+ * `ClipboardManager.getPrimaryClip()` is blocked:
  *
- *   1. Track the most recently selected text from `TYPE_VIEW_SELECTED`,
- *      `TYPE_VIEW_LONG_CLICKED`, and `TYPE_VIEW_TEXT_SELECTION_CHANGED`. The
- *      text usually lives in `event.source.text` or `event.contentDescription`.
- *   2. Watch for `TYPE_NOTIFICATION_STATE_CHANGED` with a "copied" toast (from
- *      the source app or from `com.android.systemui`). When that fires, we
- *      publish the cached selection — that's our "user pressed Copy" signal.
+ *   - **Shizuku poller (preferred)**: every 2s, ask the IClipboard system
+ *     service through Shizuku's shell-uid binder for the current primary clip.
+ *     Catches every kind of copy (system menu, external keyboard, programmatic
+ *     setPrimaryClip, etc.).
+ *   - **Accessibility events (fallback)**: cache the latest text selection and
+ *     publish it when a "copied" toast fires. Works without Shizuku but misses
+ *     copies that don't go through the long-press toolbar.
  *
- * The legacy `OnPrimaryClipChangedListener` is also kept for the case where
- * ClipBridge itself is in the foreground (system grants reads then).
+ * Both paths funnel into `publish()` which dedupes by `lastSent` /
+ * `lastReceived`, so they happily coexist.
  */
 class ClipBridgeAccessibilityService : AccessibilityService() {
 
@@ -41,6 +50,9 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private var lastReceived: String? = null
     private var lastSelection: String? = null
     private var lastSelectionAt: Long = 0L
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var pollerJob: Job? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -61,7 +73,29 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         }
         prefs.registerOnSharedPreferenceChangeListener(prefsListener)
 
+        ShizukuBridge.register()
+        startShizukuPoller()
         startClient()
+    }
+
+    private fun startShizukuPoller() {
+        pollerJob?.cancel()
+        pollerJob = scope.launch {
+            while (isActive) {
+                if (ShizukuBridge.state() == ShizukuBridge.State.READY) {
+                    val text = ShizukuBridge.readPrimaryClipText()
+                    if (!text.isNullOrEmpty()) {
+                        withContext(Dispatchers.Main) {
+                            if (text != lastReceived && text != lastSent) {
+                                Log.i(TAG, "shizuku read: ${text.length} chars")
+                                publish(text)
+                            }
+                        }
+                    }
+                }
+                delay(POLL_INTERVAL_MS)
+            }
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -79,6 +113,10 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         Log.i(TAG, "accessibility service unbinding")
+        pollerJob?.cancel()
+        pollerJob = null
+        scope.cancel()
+        ShizukuBridge.unregister()
         clipListener?.let { clipboard?.removePrimaryClipChangedListener(it) }
         clipListener = null
         prefsListener?.let {
@@ -240,5 +278,6 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "ClipBridge"
+        private const val POLL_INTERVAL_MS = 2_000L
     }
 }
