@@ -146,9 +146,9 @@ private fun PairingScreen(
         error = null
         runCatching {
             val cfg = json.decodeFromString(PairingConfig.serializer(), contents)
-            require(cfg.keyBytes()?.size == 32) { "key must be 32 bytes" }
+            require(cfg.keyBytes()?.size == 32) { "密钥长度必须为 32 字节" }
             onSave(cfg)
-        }.onFailure { error = "Invalid config: ${it.message}" }
+        }.onFailure { error = "配对信息无效：${it.message}" }
     }
 
     Scaffold(
@@ -168,10 +168,11 @@ private fun PairingScreen(
                 onScan = {
                     scanLauncher.launch(
                         ScanOptions()
-                            .setOrientationLocked(false)
+                            .setCaptureActivity(PortraitCaptureActivity::class.java)
+                            .setOrientationLocked(true)
                             .setBeepEnabled(false)
                             .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                            .setPrompt("Aim at the QR shown by the Mac"),
+                            .setPrompt("对准另一台设备显示的二维码"),
                     )
                 },
             )
@@ -226,7 +227,7 @@ private fun PairingScreen(
 
             Spacer(Modifier.height(8.dp))
             Text(
-                "Default relay · ${DEFAULT_RELAY_URL.removePrefix("wss://")}",
+                "默认中继 · ${DEFAULT_RELAY_URL.removePrefix("wss://")}",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.fillMaxWidth(),
@@ -275,14 +276,14 @@ private fun ScanHero(paired: Boolean, onScan: () -> Unit) {
             Spacer(Modifier.width(16.dp))
             Column(Modifier.weight(1f)) {
                 Text(
-                    text = if (paired) "Re-pair with Mac" else "Scan QR from Mac",
+                    text = if (paired) "重新扫码配对" else "扫码配对",
                     style = MaterialTheme.typography.titleMedium,
                 )
                 Text(
                     text = if (paired) {
-                        "Currently paired. Tap to scan a new QR."
+                        "当前已配对，点击扫描新的二维码"
                     } else {
-                        "Generate a QR on your Mac, then tap here."
+                        "在另一台设备上生成二维码，点击扫描"
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = onContainer.copy(alpha = 0.75f),
@@ -313,9 +314,9 @@ private fun StatusSection(
                 icon = Icons.Filled.AdminPanelSettings,
                 title = "Shizuku",
                 subtitle = when (shizukuState) {
-                    ShizukuBridge.State.READY -> "Privileged clipboard reads enabled"
-                    ShizukuBridge.State.NOT_AUTHORIZED -> "Tap to grant permission"
-                    ShizukuBridge.State.UNAVAILABLE -> "Service not running on device"
+                    ShizukuBridge.State.READY -> "已启用高权限剪贴板读取"
+                    ShizukuBridge.State.NOT_AUTHORIZED -> "点击授予权限"
+                    ShizukuBridge.State.UNAVAILABLE -> "未检测到 Shizuku 服务"
                 },
                 state = when (shizukuState) {
                     ShizukuBridge.State.READY -> RowState.OK
@@ -327,11 +328,11 @@ private fun StatusSection(
             Divider()
             StatusRow(
                 icon = Icons.Filled.Visibility,
-                title = "Accessibility",
+                title = "无障碍服务",
                 subtitle = when {
-                    asEnabled -> "Capture toolbar copies"
-                    shizukuState == ShizukuBridge.State.READY -> "Optional — Shizuku covers it"
-                    else -> "Tap to enable in Settings"
+                    asEnabled -> "可捕获选择菜单的复制操作"
+                    shizukuState == ShizukuBridge.State.READY -> "可选 · Shizuku 已覆盖"
+                    else -> "点击进入系统设置开启"
                 },
                 state = when {
                     asEnabled -> RowState.OK
@@ -343,11 +344,11 @@ private fun StatusSection(
             Divider()
             StatusRow(
                 icon = Icons.Filled.BatteryChargingFull,
-                title = "Battery",
+                title = "电池优化",
                 subtitle = if (batteryOptDisabled) {
-                    "Unrestricted — survives idle"
+                    "已豁免 · 后台连接更稳"
                 } else {
-                    "Tap to disable optimization"
+                    "点击设为不限制后台"
                 },
                 state = if (batteryOptDisabled) RowState.OK else RowState.WARN,
                 onClick = onBatteryTap,
@@ -422,7 +423,7 @@ private fun AdvancedToggle(open: Boolean, onToggle: () -> Unit) {
         modifier = Modifier.fillMaxWidth(),
     ) {
         Text(
-            "Advanced",
+            "高级",
             style = MaterialTheme.typography.labelLarge,
             modifier = Modifier.weight(1f),
         )
@@ -453,17 +454,17 @@ private fun AdvancedPanel(
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text(
-                "Generate a QR on this device or paste a config from another device.",
+                "在本机生成二维码，或粘贴另一台设备的配对 JSON。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             OutlinedButton(onClick = onGenerate, modifier = Modifier.fillMaxWidth()) {
-                Text("Generate new pairing")
+                Text("在本机生成新配对")
             }
             OutlinedTextField(
                 value = configText,
                 onValueChange = onConfigChange,
-                label = { Text("Pairing JSON") },
+                label = { Text("配对 JSON") },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(180.dp),
@@ -481,7 +482,7 @@ private fun AdvancedPanel(
                 modifier = Modifier.fillMaxWidth(),
                 enabled = configText.isNotBlank(),
             ) {
-                Text("Save & start syncing")
+                Text("保存并开始同步")
             }
             TextButton(
                 onClick = onReset,
@@ -490,7 +491,7 @@ private fun AdvancedPanel(
                     contentColor = MaterialTheme.colorScheme.error,
                 ),
             ) {
-                Text("Reset pairing")
+                Text("重置配对")
             }
         }
     }

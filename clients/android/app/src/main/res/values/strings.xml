@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">ClipBridge</string>
-    <string name="accessibility_service_description">Lets ClipBridge read your clipboard so it can sync to your other devices. Android restricts clipboard access for background apps; this is the workaround.</string>
+    <string name="accessibility_service_description">允许 ClipBridge 读取剪贴板，以便同步到其它已配对设备。Android 限制后台应用访问剪贴板，开启无障碍是绕过这一限制的方式之一。</string>
 </resources>
