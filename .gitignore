@@ -40,6 +40,11 @@ clients/android/app/src/main/java/uniffi/
 clients/windows/target/
 clients/windows/gen/
 
+# iOS (xcodegen-generated, not source)
+clients/ios/ClipBridge.xcodeproj/
+clients/ios/Info.plist
+clients/ios/Sources/ClipbridgeCore/
+
 # JetBrains
 .idea/
 

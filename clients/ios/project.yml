@@ -1,0 +1,70 @@
+name: ClipBridge
+options:
+  bundleIdPrefix: com.clipbridge
+  deploymentTarget:
+    iOS: "15.0"
+  developmentLanguage: zh-Hans
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: ""
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    SWIFT_VERSION: "5.9"
+    ENABLE_BITCODE: "NO"
+    IPHONEOS_DEPLOYMENT_TARGET: "14.0"
+
+# Symlink target — `scripts/build-ios-xcframework.sh` writes to ../../build/ios.
+fileGroups:
+  - "../../build/ios/ClipbridgeCore.xcframework"
+
+targets:
+  ClipBridge:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - Sources
+      - path: Resources
+        type: folder
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: ClipBridge
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        UILaunchScreen:
+          UIColorName: ""
+        UIRequiresFullScreen: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIBackgroundModes:
+          - audio
+          - processing
+          - fetch
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.clipbridge.refresh
+        # Allow plain ws:// inside trusted LANs as well as wss://.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        # Background-audio + processing modes need real privacy-string
+        # justifications even though our use is "keep the WebSocket alive".
+        NSMicrophoneUsageDescription: "ClipBridge 不录音,后台静默音频仅用于保持剪贴板同步连接。"
+        NSCameraUsageDescription: "扫描另一台设备显示的配对二维码。"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.clipbridge.ios
+        TARGETED_DEVICE_FAMILY: "1,2"   # iPhone + iPad
+        SUPPORTS_MACCATALYST: "NO"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Reference the hand-written entitlements directly. The xcodegen
+        # `entitlements:` block above would overwrite the file with an
+        # empty plist on every regenerate, dropping our TrollStore keys.
+        CODE_SIGN_ENTITLEMENTS: ClipBridge.entitlements
+    dependencies:
+      - framework: ../../build/ios/ClipbridgeCore.xcframework
+        embed: true
+        codeSign: false
