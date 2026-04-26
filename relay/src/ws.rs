@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -22,10 +24,29 @@ async fn handle_socket(socket: WebSocket, hub: Hub) {
     let mut device_id: Option<String> = None;
     let mut rx: Option<tokio::sync::broadcast::Receiver<RecentClip>> = None;
 
+    // Keep idle connections from accumulating: ping every 30s, drop the
+    // socket if no inbound frame for 60s.
+    const PING_EVERY: Duration = Duration::from_secs(30);
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    let mut ping_interval = tokio::time::interval(PING_EVERY);
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ping_interval.tick().await;
+    let mut last_seen = tokio::time::Instant::now();
+
     loop {
+        let idle_deadline = last_seen + IDLE_TIMEOUT;
         tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                tracing::debug!(?device_id, "idle timeout, closing socket");
+                break;
+            }
+            _ = ping_interval.tick() => {
+                if ws_tx.send(Message::Ping(Vec::new())).await.is_err() { break; }
+            }
             // Inbound from client
             incoming = ws_rx.next() => {
+                last_seen = tokio::time::Instant::now();
                 let Some(Ok(msg)) = incoming else { break };
                 let text = match msg {
                     Message::Text(t) => t,

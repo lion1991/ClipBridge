@@ -48,6 +48,15 @@ xcodebuild -create-xcframework \
   -headers "$HEADERS" \
   -output "$OUT/ClipbridgeCore.xcframework"
 
+# Keep the SwiftPM target's source file in sync. The xcframework itself is
+# symlinked under clients/macos but the .swift glue is a real copy and would
+# otherwise drift.
+SWIFTPM_GLUE="$ROOT/clients/macos/Sources/ClipbridgeCore/clipbridge_core.swift"
+if [[ -f "$SWIFTPM_GLUE" || -d "$(dirname "$SWIFTPM_GLUE")" ]]; then
+  cp "$OUT/clipbridge_core.swift" "$SWIFTPM_GLUE"
+  echo "✓ Synced clients/macos Swift glue"
+fi
+
 echo
 echo "✓ Built $OUT/ClipbridgeCore.xcframework"
 echo "✓ Swift glue: $OUT/clipbridge_core.swift"

@@ -1125,6 +1125,9 @@ public func FfiConverterTypeConnectionState_lower(_ value: ConnectionState) -> R
 /**
  * FFI-facing error variants — flat (no nested types) so UniFFI can bridge
  * them cleanly to Swift / Kotlin enums.
+ *
+ * Field names here must not collide with `Throwable.message` on the Kotlin
+ * side, so we use `reason` for the freeform internal-error string.
  */
 public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
@@ -1133,7 +1136,7 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
     case Stopped
     case InvalidKey(got: UInt32
     )
-    case Internal(message: String
+    case Internal(reason: String
     )
 
     
@@ -1169,7 +1172,7 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             got: try FfiConverterUInt32.read(from: &buf)
             )
         case 3: return .Internal(
-            message: try FfiConverterString.read(from: &buf)
+            reason: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -1192,9 +1195,9 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             FfiConverterUInt32.write(got, into: &buf)
             
         
-        case let .Internal(message):
+        case let .Internal(reason):
             writeInt(&buf, Int32(3))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(reason, into: &buf)
             
         }
     }

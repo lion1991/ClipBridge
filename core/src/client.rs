@@ -201,8 +201,27 @@ async fn session(
 
     listener.on_state(ConnectionState::Connected);
 
+    // Heartbeat: ping every 30s, force-reconnect if no inbound frame for 60s.
+    // The latter catches NAT idle timeouts and silent network switches (Wi-Fi
+    // ↔ cellular) where TCP stays "open" but never delivers data again.
+    const PING_EVERY: Duration = Duration::from_secs(30);
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    let mut ping_interval = tokio::time::interval(PING_EVERY);
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ping_interval.tick().await; // consume the immediate first tick
+    let mut last_seen = tokio::time::Instant::now();
+
     loop {
+        let idle_deadline = last_seen + IDLE_TIMEOUT;
         tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                tracing::warn!("idle for {IDLE_TIMEOUT:?}, reconnecting");
+                return Ok(SessionExit::Reconnect);
+            }
+            _ = ping_interval.tick() => {
+                ws.send(Message::Ping(Vec::new().into())).await?;
+            }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else {
                     return Ok(SessionExit::Stop);
@@ -232,6 +251,7 @@ async fn session(
                 }
             }
             frame = ws.next() => {
+                last_seen = tokio::time::Instant::now();
                 let Some(frame) = frame else {
                     return Ok(SessionExit::Reconnect);
                 };
