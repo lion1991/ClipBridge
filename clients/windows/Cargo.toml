@@ -43,6 +43,19 @@ base64 = "0.22"
 rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
 
+# Native clipboard event listener: AddClipboardFormatListener +
+# message-only window. Avoids polling.
+# Match the windows crate version Tauri 2 pulls in transitively so we
+# don't end up with two parallel versions of windows-core (their trait
+# definitions are incompatible across major bumps).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

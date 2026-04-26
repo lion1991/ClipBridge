@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bridge;
+#[cfg(windows)]
+mod clipboard_listener;
 mod pairing;
 
 use std::sync::Mutex;
