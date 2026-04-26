@@ -8,8 +8,10 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -49,20 +51,25 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
@@ -72,6 +79,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import rikka.shizuku.Shizuku
 
@@ -82,6 +90,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Edge-to-edge: lets the app surface paint under the system status bar.
+        // Light style = dark icons on a light background so they remain visible
+        // when the TopAppBar is white.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.light(
+                Color.Transparent.toArgb(),
+                Color.Transparent.toArgb(),
+            ),
+        )
         ShizukuBridge.register()
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
         setContent {
@@ -122,6 +139,12 @@ private fun PairingScreen(
     var shizukuState by remember { mutableStateOf(ShizukuBridge.state()) }
     val isPaired = existing != null
 
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    fun toast(message: String) {
+        scope.launch { snackbarHostState.showSnackbar(message) }
+    }
+
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
         val observer = LifecycleEventObserver { _, event ->
@@ -148,13 +171,23 @@ private fun PairingScreen(
             val cfg = json.decodeFromString(PairingConfig.serializer(), contents)
             require(cfg.keyBytes()?.size == 32) { "密钥长度必须为 32 字节" }
             onSave(cfg)
-        }.onFailure { error = "配对信息无效：${it.message}" }
+            toast("已配对，开始同步")
+        }.onFailure {
+            error = "配对信息无效：${it.message}"
+            toast("配对失败：${it.message}")
+        }
     }
 
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text("ClipBridge", style = MaterialTheme.typography.titleLarge) })
+            TopAppBar(
+                title = { Text("ClipBridge", style = MaterialTheme.typography.titleLarge) },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                ),
+            )
         },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { padding ->
         Column(
             modifier = Modifier
@@ -213,14 +246,19 @@ private fun PairingScreen(
                                 PairingConfig.serializer(),
                                 configText,
                             )
-                            require(cfg.keyBytes()?.size == 32) { "key must be 32 bytes" }
+                            require(cfg.keyBytes()?.size == 32) { "密钥长度必须为 32 字节" }
                             onSave(cfg)
-                        }.onFailure { error = "Invalid config: ${it.message}" }
+                            toast("已保存，开始同步")
+                        }.onFailure {
+                            error = "配对信息无效：${it.message}"
+                            toast("保存失败：${it.message}")
+                        }
                     },
                     onReset = {
                         onClear()
                         configText = ""
                         error = null
+                        toast("已重置配对")
                     },
                 )
             }
