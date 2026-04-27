@@ -5,14 +5,15 @@ use clipbridge_core::{
     crypto, encrypt,
     protocol::{ClientMessage, ClipKind, ClipPayload, ServerMessage},
 };
-use clipbridge_relay::{app, Hub};
+use clipbridge_relay::{app, BlobStore, Hub};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
 async fn spawn_relay() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = app(Hub::new());
+    let blobs = BlobStore::new(8 * 1024 * 1024, Duration::from_secs(60), 4 * 1024 * 1024);
+    let router = app(Hub::new(), blobs);
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -85,6 +86,7 @@ async fn publish_is_received_and_decrypts() {
         content: "hello from A".into(),
         device_name: "Mac of A".into(),
         ts: 1234,
+        image: None,
     };
     let plaintext = serde_json::to_vec(&payload).unwrap();
     let (ciphertext, nonce) = encrypt(&key, &plaintext).unwrap();

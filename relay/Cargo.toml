@@ -16,6 +16,8 @@ axum = { version = "0.7", features = ["ws"] }
 tokio-stream = "0.1"
 dashmap = "6"
 futures-util = "0.3"
+bytes = "1"
+tower-http = { version = "0.6", features = ["limit"] }
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

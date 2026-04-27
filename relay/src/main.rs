@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use clipbridge_relay::{app, Hub};
+use clipbridge_relay::{app, blob_store_from_env, Hub};
 use tracing_subscriber::EnvFilter;
 
 // Single-threaded runtime: the relay is purely I/O-bound (a handful of
@@ -16,7 +16,8 @@ async fn main() {
         .init();
 
     let hub = Hub::new();
-    let router = app(hub);
+    let blobs = blob_store_from_env();
+    let router = app(hub, blobs);
 
     let addr: SocketAddr = std::env::var("CLIPBRIDGE_BIND")
         .unwrap_or_else(|_| "0.0.0.0:8787".into())

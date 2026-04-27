@@ -18,12 +18,19 @@ tracing = { workspace = true }
 chacha20poly1305 = "0.10"
 rand = "0.8"
 base64 = "0.22"
+sha2 = "0.10"
 uuid = { version = "1", features = ["v4", "serde"] }
 # Use bundled Mozilla CA roots instead of OS native ones — Android doesn't
 # expose system CA certs via rustls-native-certs, so wss:// handshakes fail
 # with "no native root CA certificates found". webpki-roots ships the same
 # CA bundle browsers use, baked into the binary, and works on every target.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Blob upload/download. Same TLS stack as tungstenite (ring + webpki-roots)
+# so we don't pull in a second crypto provider. Async-only: callers from
+# sync contexts use the per-call thread trampoline in `blob.rs` so we can
+# be invoked from inside a tokio test runtime without runtime-in-runtime
+# panics.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
 # Pull in rustls explicitly with `ring` so the unified feature resolution
 # enables a crypto provider (tokio-tungstenite's TLS feature alone leaves
 # rustls 0.23 with no provider, which panics on first TLS handshake with

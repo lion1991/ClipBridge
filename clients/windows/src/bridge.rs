@@ -205,6 +205,7 @@ fn try_publish(
         content: text,
         device_name: device_name.to_string(),
         ts: now,
+        image: None,
     };
     if let Some(c) = client.as_ref() {
         let _ = c.send_clip(payload);

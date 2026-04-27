@@ -3,9 +3,31 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
 };
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 
 pub const NONCE_LEN: usize = 12;
 pub const KEY_LEN: usize = 32;
+pub const SHA256_LEN: usize = 32;
+
+/// Hex-encoded SHA-256 of `bytes`. Used as the content-addressed key for blob
+/// storage and as a duplicate-detection signal on the receive path.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut s = String::with_capacity(SHA256_LEN * 2);
+    for b in digest {
+        s.push(hex_nibble(b >> 4));
+        s.push(hex_nibble(b & 0x0f));
+    }
+    s
+}
+
+fn hex_nibble(n: u8) -> char {
+    match n {
+        0..=9 => (b'0' + n) as char,
+        10..=15 => (b'a' + (n - 10)) as char,
+        _ => unreachable!(),
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -70,5 +92,18 @@ mod tests {
         let (mut ct, nonce) = encrypt(&key, b"abc").unwrap();
         ct[0] ^= 1;
         assert!(decrypt(&key, &nonce, &ct).is_err());
+    }
+
+    #[test]
+    fn sha256_known_vectors() {
+        // RFC 6234 / FIPS 180-4 well-known vectors
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 }

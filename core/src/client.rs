@@ -2,12 +2,14 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::crypto::{decrypt, encrypt, KEY_LEN};
-use crate::protocol::{ClientMessage, ClipPayload, ServerMessage};
+use crate::blob::{BlobClient, BlobError};
+use crate::crypto::{decrypt, encrypt, sha256_hex, KEY_LEN, NONCE_LEN};
+use crate::protocol::{ClientMessage, ClipKind, ClipPayload, ImageMeta, ServerMessage};
 
 /// Rustls 0.23 refuses to pick a crypto provider on its own when more than
 /// one (or none) is enabled across the dependency graph. We control this
@@ -45,6 +47,10 @@ pub enum ClientError {
     Encrypt(#[from] crate::crypto::CryptoError),
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("blob: {0}")]
+    Blob(#[from] crate::blob::BlobError),
+    #[error("invalid image meta: {0}")]
+    InvalidImageMeta(String),
 }
 
 /// FFI-facing error variants — flat (no nested types) so UniFFI can bridge
@@ -58,6 +64,10 @@ pub enum FfiError {
     Stopped,
     #[error("group key must be {KEY_LEN} bytes, got {got}")]
     InvalidKey { got: u32 },
+    #[error("blob not found on relay (expired or never uploaded)")]
+    BlobNotFound,
+    #[error("blob exceeds relay size limit")]
+    BlobTooLarge,
     #[error("internal: {reason}")]
     Internal { reason: String },
 }
@@ -66,6 +76,8 @@ impl From<ClientError> for FfiError {
     fn from(e: ClientError) -> Self {
         match e {
             ClientError::Stopped => FfiError::Stopped,
+            ClientError::Blob(BlobError::NotFound) => FfiError::BlobNotFound,
+            ClientError::Blob(BlobError::TooLarge) => FfiError::BlobTooLarge,
             other => FfiError::Internal {
                 reason: other.to_string(),
             },
@@ -83,6 +95,16 @@ enum Cmd {
 pub struct Client {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Shared between FFI methods (send_image / fetch_image, called on the
+    /// host's calling thread) and the worker thread (which only needs key
+    /// + group_id for WS framing). Cloning is cheap — Arc bumps a counter.
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    key: [u8; KEY_LEN],
+    group_id: String,
+    blob: BlobClient,
 }
 
 #[uniffi::export]
@@ -107,7 +129,18 @@ impl Client {
         let mut key_arr = [0u8; KEY_LEN];
         key_arr.copy_from_slice(&key);
 
+        let blob = BlobClient::new(&relay_url).map_err(|e| FfiError::Internal {
+            reason: format!("blob client: {e}"),
+        })?;
+        let shared = Arc::new(Shared {
+            key: key_arr,
+            group_id: group_id.clone(),
+            blob,
+        });
+
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
+        let worker_relay = relay_url.clone();
+        let worker_group = group_id.clone();
         let thread = std::thread::Builder::new()
             .name("clipbridge-client".into())
             .spawn(move || {
@@ -115,7 +148,14 @@ impl Client {
                     .enable_all()
                     .build()
                     .expect("build runtime");
-                rt.block_on(run(relay_url, group_id, key_arr, device_id, listener, cmd_rx));
+                rt.block_on(run(
+                    worker_relay,
+                    worker_group,
+                    key_arr,
+                    device_id,
+                    listener,
+                    cmd_rx,
+                ));
             })
             .map_err(|e| FfiError::Internal {
                 reason: format!("spawn thread: {e}"),
@@ -123,6 +163,7 @@ impl Client {
         Ok(Arc::new(Self {
             cmd_tx,
             thread: Mutex::new(Some(thread)),
+            shared,
         }))
     }
 
@@ -136,6 +177,68 @@ impl Client {
         self.cmd_tx
             .send(Cmd::FetchRecent)
             .map_err(|_| FfiError::Stopped)
+    }
+
+    /// Encrypt `image_bytes`, upload the ciphertext to the relay's blob
+    /// endpoint, then queue a `Publish` carrying the resulting `ImageMeta`.
+    /// Blocks the calling thread for the duration of the HTTP upload —
+    /// hosts should call this from a background thread / coroutine.
+    pub fn send_image(
+        &self,
+        image_bytes: Vec<u8>,
+        mime_type: String,
+        width: u32,
+        height: u32,
+        device_name: String,
+        ts: u64,
+    ) -> Result<(), FfiError> {
+        let plaintext_len = image_bytes.len() as u64;
+        let (ciphertext, nonce) = encrypt(&self.shared.key, &image_bytes).map_err(ClientError::from)?;
+        let sha = sha256_hex(&ciphertext);
+        self.shared
+            .blob
+            .upload(&self.shared.group_id, &sha, ciphertext)
+            .map_err(ClientError::from)?;
+        let meta = ImageMeta {
+            mime_type,
+            width,
+            height,
+            size_bytes: plaintext_len,
+            sha256_hex: sha,
+            nonce_b64: B64.encode(nonce),
+        };
+        let payload = ClipPayload {
+            kind: ClipKind::Image,
+            content: String::new(),
+            device_name,
+            ts,
+            image: Some(meta),
+        };
+        self.cmd_tx
+            .send(Cmd::SendClip(payload))
+            .map_err(|_| FfiError::Stopped)
+    }
+
+    /// Download the ciphertext for `meta` from the relay and decrypt it
+    /// with the group key. Blocking; safe to call from a background thread.
+    pub fn fetch_image(&self, meta: ImageMeta) -> Result<Vec<u8>, FfiError> {
+        let nonce = B64
+            .decode(meta.nonce_b64.as_bytes())
+            .map_err(|e| ClientError::InvalidImageMeta(format!("nonce_b64: {e}")))?;
+        if nonce.len() != NONCE_LEN {
+            return Err(ClientError::InvalidImageMeta(format!(
+                "nonce length {} != {NONCE_LEN}",
+                nonce.len()
+            ))
+            .into());
+        }
+        let ciphertext = self
+            .shared
+            .blob
+            .download(&self.shared.group_id, &meta.sha256_hex)
+            .map_err(ClientError::from)?;
+        let plain = decrypt(&self.shared.key, &nonce, &ciphertext).map_err(ClientError::from)?;
+        Ok(plain)
     }
 
     /// Signal the worker thread to disconnect and wait for it to finish.
