@@ -24,6 +24,14 @@ final class BridgeCoordinator: ObservableObject {
 
     @Published private(set) var status: BridgeStatus = .notPaired
     @Published private(set) var hasPairing: Bool = false
+    /// Most recent inbound clips from other devices, newest first, capped
+    /// at `recentLimit`. Lives only in memory — keyboard extension has its
+    /// own copy. We could share via App Group later if we want unified
+    /// history, but for now this just reflects what the main app saw while
+    /// it was foreground.
+    @Published private(set) var recentClips: [ClipPayload] = []
+
+    private static let recentLimit = 3
 
     private var client: Client?
     private var listener: Listener?
@@ -73,6 +81,16 @@ final class BridgeCoordinator: ObservableObject {
         PairingStore.clear()
         hasPairing = false
         status = .notPaired
+        // Old recents belong to the previous group; clear so the next
+        // pairing's first connect populates from a clean slate.
+        recentClips = []
+    }
+
+    /// Manually pull recent clips from the relay's 5-min cache. Used by
+    /// the UI's pull-to-refresh; the relay also pushes Recent automatically
+    /// on reconnect, so most of the time this is redundant.
+    func refreshRecent() {
+        try? client?.fetchRecent()
     }
 
     private func startSync(with cfg: PairingConfig) {
@@ -145,7 +163,27 @@ final class BridgeCoordinator: ObservableObject {
             // Capture the post-write changeCount so the next poll tick treats
             // our own write as a no-op instead of re-publishing it.
             self.lastChangeCount = UIPasteboard.general.changeCount
+            self.appendRecent(payload)
         }
+    }
+
+    /// Adds an incoming payload to `recentClips` if it's from another device,
+    /// dedup'd by full payload equality (relay re-broadcasts the same Recent
+    /// set on every reconnect so we'd otherwise stack duplicates), then
+    /// sorts ts-desc and trims to `recentLimit`.
+    private func appendRecent(_ payload: ClipPayload) {
+        // Filter out our own outbound clips so the user doesn't see what
+        // they just copied locally echoed back. Heuristic by deviceName —
+        // if two devices share UIDevice.current.name we'd show our own,
+        // acceptable edge case.
+        guard payload.deviceName != UIDevice.current.name else { return }
+
+        var combined = recentClips
+        if !combined.contains(payload) {
+            combined.append(payload)
+        }
+        combined.sort { $0.ts > $1.ts }
+        recentClips = Array(combined.prefix(Self.recentLimit))
     }
 
     fileprivate func handleState(_ state: ConnectionState) {

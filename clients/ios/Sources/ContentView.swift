@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @EnvironmentObject var coordinator: BridgeCoordinator
@@ -13,12 +14,22 @@ struct ContentView: View {
                         hasPairing: coordinator.hasPairing,
                         onTap: { showPairing = true }
                     )
+                    if coordinator.hasPairing {
+                        RecentClipsCard(clips: coordinator.recentClips)
+                    }
                     Spacer(minLength: 12)
                     Text("默认中继 · " + DEFAULT_RELAY_URL.replacingOccurrences(of: "wss://", with: ""))
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
                 .padding(20)
+            }
+            // Pull-to-refresh kicks `Client.fetchRecent()` so the relay
+            // pushes its 5-min cache again. Updates land via the listener
+            // → handleIncoming → recentClips. Auto-cancels when the gesture
+            // ends; we don't await anything so the spinner just blinks.
+            .refreshable {
+                coordinator.refreshRecent()
             }
             .navigationTitle("ClipBridge")
             .navigationBarTitleDisplayMode(.inline)
@@ -107,6 +118,99 @@ struct PairingCard: View {
             )
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// Latest 3 inbound clips from other devices, newest first. Tap a row to
+/// copy that clip back into the local pasteboard (handy when something
+/// newer has overwritten it).
+struct RecentClipsCard: View {
+    let clips: [ClipPayload]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("最近收到")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("下拉刷新")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 10)
+
+            if clips.isEmpty {
+                Text("暂无 — 等待其他设备复制的内容")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 14)
+            } else {
+                ForEach(Array(clips.enumerated()), id: \.element) { index, clip in
+                    RecentClipRow(clip: clip)
+                    if index < clips.count - 1 {
+                        Divider().padding(.leading, 16)
+                    }
+                }
+                .padding(.bottom, 6)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(uiColor: .secondarySystemBackground))
+        )
+    }
+}
+
+struct RecentClipRow: View {
+    let clip: ClipPayload
+
+    var body: some View {
+        Button(action: copy) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(clip.deviceName)
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(.secondary)
+                    Text("·")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Text(relativeTime(clip.ts))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer(minLength: 0)
+                    Image(systemName: "doc.on.doc")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Text(clip.content)
+                    .font(.callout)
+                    .foregroundColor(.primary)
+                    .lineLimit(3)
+                    .multilineTextAlignment(.leading)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func copy() {
+        UIPasteboard.general.string = clip.content
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    private func relativeTime(_ tsMillis: UInt64) -> String {
+        let date = Date(timeIntervalSince1970: TimeInterval(tsMillis) / 1000)
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: date, relativeTo: Date())
     }
 }
 
