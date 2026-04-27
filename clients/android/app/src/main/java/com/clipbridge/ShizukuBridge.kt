@@ -181,10 +181,12 @@ object ShizukuBridge {
                 return Clip.ImageUri(uri)
             }
         }
-        // Text path — same fallbacks as before.
-        val text = item.text?.toString()
-            ?: item.htmlText
-            ?: item.uri?.toString()
+        // Text path. Deliberately NOT falling back to item.uri.toString()
+        // anymore — that used to leak `content://media/...` URIs as plain
+        // text to other devices when an app put an image-only ClipData
+        // and we somehow missed the image branch. URIs are useless on
+        // remote devices anyway; if we can't read it as image, drop it.
+        val text = item.text?.toString() ?: item.htmlText?.toString()
         return text?.let { Clip.Text(it) }
     }
 }

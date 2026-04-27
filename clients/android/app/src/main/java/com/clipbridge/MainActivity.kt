@@ -1,9 +1,12 @@
 package com.clipbridge
 
+import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
@@ -12,6 +15,8 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -34,6 +39,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.CloudOff
@@ -143,6 +149,11 @@ private fun PairingScreen(
     var asEnabled by remember { mutableStateOf(isAccessibilityEnabled(context)) }
     var batteryOptDisabled by remember { mutableStateOf(isBatteryOptimizationDisabled(context)) }
     var shizukuState by remember { mutableStateOf(ShizukuBridge.state()) }
+    var imageReadGranted by remember { mutableStateOf(isImageReadGranted(context)) }
+
+    val imagePermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted -> imageReadGranted = granted }
     val isPaired = existing != null
 
     val snackbarHostState = remember { SnackbarHostState() }
@@ -160,6 +171,7 @@ private fun PairingScreen(
                 asEnabled = isAccessibilityEnabled(context)
                 batteryOptDisabled = isBatteryOptimizationDisabled(context)
                 shizukuState = ShizukuBridge.state()
+                imageReadGranted = isImageReadGranted(context)
             }
         }
         lifecycle.addObserver(observer)
@@ -228,6 +240,7 @@ private fun PairingScreen(
                 shizukuState = shizukuState,
                 asEnabled = asEnabled,
                 batteryOptDisabled = batteryOptDisabled,
+                imageReadGranted = imageReadGranted,
                 onShizukuTap = {
                     when (shizukuState) {
                         ShizukuBridge.State.NOT_AUTHORIZED ->
@@ -240,6 +253,11 @@ private fun PairingScreen(
                 },
                 onBatteryTap = {
                     if (!batteryOptDisabled) requestIgnoreBatteryOptimizations(context)
+                },
+                onImageReadTap = {
+                    if (!imageReadGranted) {
+                        imagePermLauncher.launch(imageReadPermissionName())
+                    }
                 },
             )
 
@@ -409,9 +427,11 @@ private fun StatusSection(
     shizukuState: ShizukuBridge.State,
     asEnabled: Boolean,
     batteryOptDisabled: Boolean,
+    imageReadGranted: Boolean,
     onShizukuTap: () -> Unit,
     onAccessibilityTap: () -> Unit,
     onBatteryTap: () -> Unit,
+    onImageReadTap: () -> Unit,
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -450,6 +470,18 @@ private fun StatusSection(
                     else -> RowState.WARN
                 },
                 onClick = onAccessibilityTap,
+            )
+            Divider()
+            StatusRow(
+                icon = Icons.Filled.PhotoLibrary,
+                title = "图片读取权限",
+                subtitle = if (imageReadGranted) {
+                    "已授权 · 复制相册图片可同步"
+                } else {
+                    "点击授予 · 否则相册复制图只能传出标题"
+                },
+                state = if (imageReadGranted) RowState.OK else RowState.WARN,
+                onClick = onImageReadTap,
             )
             Divider()
             StatusRow(
@@ -624,6 +656,21 @@ private fun isAccessibilityEnabled(context: Context): Boolean {
 private fun isBatteryOptimizationDisabled(context: Context): Boolean {
     val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
     return pm.isIgnoringBatteryOptimizations(context.packageName)
+}
+
+/// Permission name swaps at API 33: READ_MEDIA_IMAGES is the new
+/// granular replacement for READ_EXTERNAL_STORAGE on Tiramisu+.
+private fun imageReadPermissionName(): String =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        Manifest.permission.READ_MEDIA_IMAGES
+    } else {
+        Manifest.permission.READ_EXTERNAL_STORAGE
+    }
+
+private fun isImageReadGranted(context: Context): Boolean {
+    val perm = imageReadPermissionName()
+    return ContextCompat.checkSelfPermission(context, perm) ==
+        PackageManager.PERMISSION_GRANTED
 }
 
 @Suppress("BatteryLife") // we sideload — Play Store policy doesn't apply

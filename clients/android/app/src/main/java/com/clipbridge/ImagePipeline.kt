@@ -61,14 +61,25 @@ object ImagePipeline {
      * Convert a freshly-read URI from the system clipboard into an
      * `Outbound` ready to send. Re-encodes to PNG when the source isn't
      * already PNG, so receivers on Win/Android don't need a HEIC decoder.
-     * Returns null on any failure (URI inaccessible, decode failed).
+     * Returns null on any failure.
+     *
+     * Common failure: SecurityException on `openInputStream` for
+     * `content://media/...` URIs — the background accessibility service
+     * doesn't get a temporary permission grant from ClipboardManager
+     * (those only apply to foreground apps with focus), so we need
+     * READ_MEDIA_IMAGES (Android 13+) or READ_EXTERNAL_STORAGE (≤12).
+     * The MainActivity status section nudges the user to grant.
      */
     fun outboundFromUri(ctx: Context, uri: Uri): Outbound? {
         return runCatching {
             val mime = ctx.contentResolver.getType(uri) ?: "image/*"
-            val raw: ByteArray = ctx.contentResolver.openInputStream(uri)
-                ?.use { it.readBytes() }
-                ?: return@runCatching null
+            val raw: ByteArray = try {
+                ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            } catch (se: SecurityException) {
+                Log.w(TAG, "openInputStream denied for $uri: ${se.message}. " +
+                    "Grant READ_MEDIA_IMAGES in app settings.")
+                null
+            } ?: return@runCatching null
 
             // Normalize to PNG unless already PNG — keeps the wire format
             // predictable across platforms. JPEG re-encode would lose

@@ -292,6 +292,17 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     }
 
     private fun publish(text: String) {
+        // If the system clipboard currently holds an image, suppress the
+        // text publish entirely. Samsung Gallery (and similar) puts both
+        // an image URI AND a text label (e.g. "幻灯片 1，共 1165 张")
+        // on the clipboard when the user copies a photo; the accessibility
+        // copy-toast handler captures the label and would otherwise
+        // broadcast that as a meaningless text clip to other devices.
+        // The image branch handles the actual content separately.
+        clipboardHasImage()?.let { mime ->
+            Log.i(TAG, "skip text publish: clipboard is $mime, image branch will handle")
+            return
+        }
         val now = System.currentTimeMillis()
         // Echo of a recent remote write — skip without consuming, so other
         // sources (poller, toast) firing for the same change all skip too.
@@ -359,6 +370,22 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
                 Log.e(TAG, "sendImage failed", t)
             }
         }
+    }
+
+    /**
+     * Returns the first image-typed mime currently advertised by the
+     * system clipboard, or null if empty / non-image. Used by the text
+     * publish path to skip when an image clip is what the user actually
+     * intended.
+     */
+    private fun clipboardHasImage(): String? {
+        val cd = clipboard?.primaryClip ?: return null
+        val desc = cd.description
+        for (i in 0 until desc.mimeTypeCount) {
+            val mime = desc.getMimeType(i)
+            if (mime.startsWith("image/")) return mime
+        }
+        return null
     }
 
     /**
