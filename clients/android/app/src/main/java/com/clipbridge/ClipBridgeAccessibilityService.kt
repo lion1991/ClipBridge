@@ -123,7 +123,9 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         lanCountJob?.cancel()
         lanCountJob = scope.launch {
             while (isActive) {
-                _lanPeerCount.value = client?.lanPeerCount()?.toInt() ?: 0
+                val names = client?.lanPeers().orEmpty().sorted()
+                _lanPeerNames.value = names
+                _lanPeerCount.value = names.size
                 delay(2_000)
             }
         }
@@ -472,6 +474,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             return
         }
         val deviceId = PairingStore.deviceId(this)
+        val deviceName = android.os.Build.MODEL ?: "Android"
         acquireMulticastLock()
         client = try {
             Client(
@@ -479,6 +482,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
                 groupId = config.groupId,
                 key = key,
                 deviceId = deviceId,
+                deviceName = deviceName,
                 listener = object : ClipListener {
                     override fun onClip(payload: ClipPayload) {
                         handleRemoteClip(payload)
@@ -645,6 +649,12 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         // badge alongside the existing connection state.
         private val _lanPeerCount = MutableStateFlow(0)
         val lanPeerCount: StateFlow<Int> = _lanPeerCount.asStateFlow()
+
+        // Device names of currently-connected LAN peers, polled from the
+        // Rust core. UI surfaces these so the user can spot mesh asymmetry
+        // ("Android sees Mac+iPhone but Mac only sees Android").
+        private val _lanPeerNames = MutableStateFlow<List<String>>(emptyList())
+        val lanPeerNames: StateFlow<List<String>> = _lanPeerNames.asStateFlow()
 
         // Image traffic history surfaced to the UI's image transfer card.
         // Newest first, capped at HISTORY_LIMIT. Sent and received both

@@ -202,7 +202,7 @@ private fun PairingScreen(
     }
 
     val connState by ClipBridgeAccessibilityService.stateFlow.collectAsStateWithLifecycle()
-    val lanPeers by ClipBridgeAccessibilityService.lanPeerCount.collectAsStateWithLifecycle()
+    val lanPeerNames by ClipBridgeAccessibilityService.lanPeerNames.collectAsStateWithLifecycle()
 
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
@@ -298,7 +298,7 @@ private fun PairingScreen(
             BottomTab.Sync -> SyncTabContent(
                 padding = padding,
                 connState = connState,
-                lanPeers = lanPeers,
+                lanPeerNames = lanPeerNames,
                 isPaired = isPaired,
                 asEnabled = asEnabled,
                 shizukuState = shizukuState,
@@ -408,7 +408,7 @@ private enum class BottomTab { Sync, Images }
 private fun SyncTabContent(
     padding: androidx.compose.foundation.layout.PaddingValues,
     connState: UiConnState,
-    lanPeers: Int,
+    lanPeerNames: List<String>,
     isPaired: Boolean,
     asEnabled: Boolean,
     shizukuState: ShizukuBridge.State,
@@ -435,7 +435,7 @@ private fun SyncTabContent(
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        ConnectionPill(state = connState, paired = isPaired, asEnabled = asEnabled, lanPeers = lanPeers)
+        ConnectionPill(state = connState, paired = isPaired, asEnabled = asEnabled, lanPeerNames = lanPeerNames)
         ScanHero(paired = isPaired, onScan = onScan)
         StatusSection(
             shizukuState = shizukuState,
@@ -553,7 +553,7 @@ private fun ConnectionPill(
     state: UiConnState,
     paired: Boolean,
     asEnabled: Boolean,
-    lanPeers: Int,
+    lanPeerNames: List<String>,
 ) {
     data class Pill(
         val label: String,
@@ -567,7 +567,9 @@ private fun ConnectionPill(
     // — before that the user cares about why pairing/connection isn't up,
     // not which transport will be used when it does.
     val transportSuffix = if (paired && asEnabled && state is UiConnState.Connected) {
-        if (lanPeers > 0) " · 局域网 $lanPeers" else " · 仅中继"
+        if (lanPeerNames.isNotEmpty()) {
+            " · 局域网 ${lanPeerNames.size} (${lanPeerNames.joinToString(", ")})"
+        } else " · 仅中继"
     } else ""
     val pill = when {
         !asEnabled -> Pill("无障碍未启用", Icons.Filled.Warning, cs.errorContainer, cs.onErrorContainer)
