@@ -15,8 +15,7 @@ as the macOS and Android clients.
    ```
 
 3. Install Microsoft **Visual Studio Build Tools** with the
-   "Desktop development with C++" workload (provides MSVC, Windows SDK, WiX
-   support that Tauri needs to bundle MSI installers):
+   "Desktop development with C++" workload (provides MSVC + Windows SDK):
    https://visualstudio.microsoft.com/downloads/
 
 4. Icon set is checked in under `icons/`. To regenerate from the master SVG
@@ -37,21 +36,22 @@ cargo tauri dev
 Hot-reloads the frontend on save. The tray icon appears; left-click opens the
 pairing window.
 
-## Build a distributable installer
+## Build the standalone EXE
 
 ```powershell
 cargo tauri build
 ```
 
-Outputs:
+Output:
 
-- `target/release/clipbridge-windows.exe` — standalone executable
-- `target/release/bundle/msi/ClipBridge_<version>_x64_en-US.msi` — Windows
-  Installer
-- `target/release/bundle/nsis/ClipBridge_<version>_x64-setup.exe` — NSIS
-  installer (smaller, more user-friendly)
+- `target/release/clipbridge-windows.exe` — single self-contained executable.
+  Tauri's `frontendDist` bundling embeds the HTML/CSS/JS into the binary,
+  so there's nothing else to ship alongside it.
 
-Both installers are configured to support `zh-CN` and `en-US` UI.
+Bundling MSI / NSIS installers is intentionally disabled
+(`bundle.active = false` in `tauri.conf.json`); the EXE is the artifact.
+Run `scripts\build-windows-exe.cmd` for the same build plus a copy into
+`build\windows\ClipBridge.exe`.
 
 ## What it does
 
