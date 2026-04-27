@@ -35,8 +35,10 @@ arboard = "3"
 # is all we need.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
-# Save dialog for "保存图片到本地".
-tauri-plugin-dialog = "2"
+# Save dialog for "保存图片到本地". Native rfd uses Win32 IFileDialog
+# directly without going through a Tauri plugin, which avoids the
+# crashy interaction tauri-plugin-dialog had at startup on this build.
+rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
 
 # QR generation for the pairing window.
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }

@@ -16,7 +16,6 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
 };
-use tauri_plugin_dialog::{DialogExt, FilePath};
 use tokio::sync::mpsc;
 
 use crate::bridge::{Bridge, ImageHistoryEntry, UiState};
@@ -39,7 +38,6 @@ fn main() {
     let bridge = Bridge::new(state_tx, image_tx);
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_autostart::init(
                 tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -260,8 +258,14 @@ fn cmd_send_image_bytes(
 }
 
 /// Save an image from history to a user-chosen file. The frontend passes
-/// the entry id and a default file name; we open a Save dialog and write
-/// the original PNG bytes verbatim (no re-encoding).
+/// the entry id and a default file name; we open a native Win32 save
+/// dialog (via `rfd`) and write the original PNG bytes verbatim — no
+/// re-encoding, so the saved file is byte-identical to what other devices
+/// shared.
+///
+/// Marked async so we can `spawn_blocking` rfd's sync call off the Tauri
+/// async runtime — opening a modal Win32 dialog from the runtime thread
+/// would freeze the UI for the duration of the picker.
 #[tauri::command]
 async fn cmd_save_image_to_file(
     id: String,
@@ -278,21 +282,17 @@ async fn cmd_save_image_to_file(
             .ok_or_else(|| "图片字节已过期 (历史已清)".to_string())?
     };
 
-    let (tx, rx) = std::sync::mpsc::channel::<Option<FilePath>>();
-    app.dialog()
-        .file()
-        .set_title("保存图片")
-        .set_file_name(&default_name)
-        .add_filter("PNG", &["png"])
-        .save_file(move |maybe_path| {
-            let _ = tx.send(maybe_path);
-        });
-    let chosen = rx.recv().map_err(|e| format!("dialog: {e}"))?;
-    let Some(file_path) = chosen else { return Ok(None) };
-    let path = file_path
-        .as_path()
-        .ok_or_else(|| "save dialog returned non-filesystem path".to_string())?
-        .to_path_buf();
+    let chosen = tauri::async_runtime::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .set_title("保存图片")
+            .set_file_name(&default_name)
+            .add_filter("PNG", &["png"])
+            .save_file()
+    })
+    .await
+    .map_err(|e| format!("dialog task: {e}"))?;
+
+    let Some(path) = chosen else { return Ok(None) };
     std::fs::write(&path, &bytes).map_err(|e| format!("写入失败:{e}"))?;
     Ok(Some(path.display().to_string()))
 }
