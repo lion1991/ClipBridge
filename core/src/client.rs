@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::blob::{BlobClient, BlobError};
 use crate::crypto::{decrypt, encrypt, sha256_hex, KEY_LEN, NONCE_LEN};
-use crate::lan::{IncomingLanClip, LanNode};
+use crate::lan::{IncomingLanClip, LanNode, PeerRegistry};
 use crate::protocol::{ClientMessage, ClipKind, ClipPayload, ImageMeta, ServerMessage};
 
 /// Rustls 0.23 refuses to pick a crypto provider on its own when more than
@@ -112,6 +112,11 @@ struct Shared {
     /// Updated by the per-peer task in `lan.rs`; read here for the
     /// `lan_peer_count()` getter the UI polls.
     lan_peers: Arc<AtomicUsize>,
+    /// Live snapshot of connected peers' device names. Same source of
+    /// truth as `lan_peers` (count == registry.len()), kept in parallel
+    /// so the FFI getter can hand back a `Vec<String>` for the UI to
+    /// render "局域网: Mac, iPhone".
+    lan_peer_names: PeerRegistry,
 }
 
 #[uniffi::export]
@@ -119,12 +124,18 @@ impl Client {
     /// Spawn a background thread that connects to the relay, joins the group,
     /// and forwards encrypted clips. The provided `listener` is invoked for
     /// each decrypted incoming clip and on connection-state transitions.
+    ///
+    /// `device_name` is the human-readable label shown to other peers in
+    /// LAN status badges (and already what we attach to outgoing clip
+    /// payloads). Pass the same string the platform uses for clip
+    /// `device_name` so peers render us with a consistent identity.
     #[uniffi::constructor]
     pub fn new(
         relay_url: String,
         group_id: String,
         key: Vec<u8>,
         device_id: String,
+        device_name: String,
         listener: Arc<dyn ClipListener>,
     ) -> Result<Arc<Self>, FfiError> {
         ensure_crypto_provider();
@@ -140,11 +151,14 @@ impl Client {
             reason: format!("blob client: {e}"),
         })?;
         let lan_peers = Arc::new(AtomicUsize::new(0));
+        let lan_peer_names: PeerRegistry =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let shared = Arc::new(Shared {
             key: key_arr,
             group_id: group_id.clone(),
             blob,
             lan_peers: lan_peers.clone(),
+            lan_peer_names: lan_peer_names.clone(),
         });
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
@@ -162,9 +176,11 @@ impl Client {
                     worker_group,
                     key_arr,
                     device_id,
+                    device_name,
                     listener,
                     cmd_rx,
                     lan_peers,
+                    lan_peer_names,
                 ));
             })
             .map_err(|e| FfiError::Internal {
@@ -260,6 +276,19 @@ impl Client {
         self.shared.lan_peers.load(Ordering::Relaxed) as u32
     }
 
+    /// Snapshot of currently-connected peers' device names. Order is not
+    /// stable across calls (HashMap iteration). Empty vec = no LAN peers
+    /// (relay-only). UI uses this to render the actual peer list, which
+    /// makes mesh asymmetry obvious — if Mac shows ["Android"] and
+    /// Android shows ["Mac", "iPhone"], the missing edge is Mac↔iPhone.
+    pub fn lan_peers(&self) -> Vec<String> {
+        let g = match self.shared.lan_peer_names.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.values().cloned().collect()
+    }
+
     /// Signal the worker thread to disconnect and wait for it to finish.
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(Cmd::Stop);
@@ -283,9 +312,11 @@ async fn run(
     group_id: String,
     key: [u8; KEY_LEN],
     device_id: String,
+    device_name: String,
     listener: Arc<dyn ClipListener>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     lan_peers: Arc<AtomicUsize>,
+    lan_peer_names: PeerRegistry,
 ) {
     // Receive-side dedup. The same (sender_device_id, ts) pair may arrive
     // both from the relay WS and from a LAN peer; whichever lands first
@@ -297,7 +328,17 @@ async fn run(
     // refused, port bind failed in a sandboxed test env) is non-fatal:
     // we just degrade to relay-only and log it.
     let (lan_in_tx, lan_in_rx) = mpsc::unbounded_channel::<IncomingLanClip>();
-    let lan = match LanNode::spawn(group_id.clone(), device_id.clone(), key, lan_in_tx, lan_peers).await {
+    let lan = match LanNode::spawn(
+        group_id.clone(),
+        device_id.clone(),
+        device_name.clone(),
+        key,
+        lan_in_tx,
+        lan_peers,
+        lan_peer_names,
+    )
+    .await
+    {
         Ok(n) => {
             tracing::info!("lan transport up");
             Some(Arc::new(n))

@@ -535,6 +535,15 @@ public protocol ClientProtocol: AnyObject, Sendable {
      */
     func lanPeerCount()  -> UInt32
     
+    /**
+     * Snapshot of currently-connected peers' device names. Order is not
+     * stable across calls (HashMap iteration). Empty vec = no LAN peers
+     * (relay-only). UI uses this to render the actual peer list, which
+     * makes mesh asymmetry obvious — if Mac shows ["Android"] and
+     * Android shows ["Mac", "iPhone"], the missing edge is Mac↔iPhone.
+     */
+    func lanPeers()  -> [String]
+    
     func sendClip(payload: ClipPayload) throws 
     
     /**
@@ -594,8 +603,13 @@ open class Client: ClientProtocol, @unchecked Sendable {
      * Spawn a background thread that connects to the relay, joins the group,
      * and forwards encrypted clips. The provided `listener` is invoked for
      * each decrypted incoming clip and on connection-state transitions.
+     *
+     * `device_name` is the human-readable label shown to other peers in
+     * LAN status badges (and already what we attach to outgoing clip
+     * payloads). Pass the same string the platform uses for clip
+     * `device_name` so peers render us with a consistent identity.
      */
-public convenience init(relayUrl: String, groupId: String, key: Data, deviceId: String, listener: ClipListener)throws  {
+public convenience init(relayUrl: String, groupId: String, key: Data, deviceId: String, deviceName: String, listener: ClipListener)throws  {
     let handle =
         try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_clipbridge_core_fn_constructor_client_new(
@@ -603,6 +617,7 @@ public convenience init(relayUrl: String, groupId: String, key: Data, deviceId: 
         FfiConverterString.lower(groupId),
         FfiConverterData.lower(key),
         FfiConverterString.lower(deviceId),
+        FfiConverterString.lower(deviceName),
         FfiConverterTypeClipListener_lower(listener),$0
     )
 }
@@ -651,6 +666,21 @@ open func fetchRecent()throws   {try rustCallWithError(FfiConverterTypeFfiError_
 open func lanPeerCount() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_clipbridge_core_fn_method_client_lan_peer_count(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Snapshot of currently-connected peers' device names. Order is not
+     * stable across calls (HashMap iteration). Empty vec = no LAN peers
+     * (relay-only). UI uses this to render the actual peer list, which
+     * makes mesh asymmetry obvious — if Mac shows ["Android"] and
+     * Android shows ["Mac", "iPhone"], the missing edge is Mac↔iPhone.
+     */
+open func lanPeers() -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_clipbridge_core_fn_method_client_lan_peers(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -1450,6 +1480,31 @@ fileprivate struct FfiConverterOptionTypeImageMeta: FfiConverterRustBuffer {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
 private enum InitializationResult {
     case ok
     case contractVersionMismatch
@@ -1474,6 +1529,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_clipbridge_core_checksum_method_client_lan_peer_count() != 51217) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_clipbridge_core_checksum_method_client_lan_peers() != 35633) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_clipbridge_core_checksum_method_client_send_clip() != 42893) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1489,7 +1547,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_clipbridge_core_checksum_method_cliplistener_on_state() != 58396) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_clipbridge_core_checksum_constructor_client_new() != 11902) {
+    if (uniffi_clipbridge_core_checksum_constructor_client_new() != 5913) {
         return InitializationResult.apiChecksumMismatch
     }
 

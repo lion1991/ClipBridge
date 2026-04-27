@@ -52,8 +52,15 @@ const OUT_BUFFER: usize = 32;
 #[serde(tag = "type", rename_all = "snake_case")]
 enum LanMessage {
     /// First frame on every connection. Tells the other side which device
-    /// we are so they can drop self-loops and feed dedup.
-    Hello { device_id: String, version: u32 },
+    /// we are so they can drop self-loops and feed dedup. `device_name` is
+    /// the human-friendly label shown in the receiver's UI peer list —
+    /// `serde(default)` so older peers that don't send it still parse.
+    Hello {
+        device_id: String,
+        version: u32,
+        #[serde(default)]
+        device_name: String,
+    },
     Clip {
         sender_device_id: String,
         ts: u64,
@@ -130,6 +137,12 @@ impl From<mdns_sd::Error> for LanError {
     }
 }
 
+/// Live registry of peers we currently have a fully-handshaked LAN session
+/// to, keyed by mDNS instance fullname (so two processes on one device —
+/// e.g. iOS main app + keyboard — count as separate entries). The values
+/// are the human-friendly device names the peers sent in their Hello.
+pub type PeerRegistry = Arc<std::sync::Mutex<HashMap<String, String>>>;
+
 /// Owns the mDNS daemon, accept loop, and per-peer connection tasks. Drop
 /// to tear everything down — the broadcast sender closes, peer tasks see
 /// EOF and exit, and the daemon's own thread is shut down by `Drop`.
@@ -139,6 +152,10 @@ pub struct LanNode {
     /// when `run_peer` finishes its handshake, decremented when its
     /// task ends. Read by the FFI getter so the UI can show "LAN: N".
     peer_count: Arc<AtomicUsize>,
+    /// fullname → peer device_name. Populated alongside `peer_count` so
+    /// the FFI layer can also render "局域网: Mac, iPhone" instead of
+    /// just a count, which makes mesh asymmetry visible across devices.
+    peers: PeerRegistry,
     /// Kept alive so the daemon and its background thread stay up. The
     /// `mdns_sd::ServiceDaemon::Drop` impl unregisters the service and
     /// stops the daemon.
@@ -153,14 +170,18 @@ impl LanNode {
     /// it, browse for other peers, and start forwarding clips.
     ///
     /// Must be called from within a tokio runtime context — spawns long-
-    /// lived tasks via `tokio::spawn`. `peer_count` is shared with the
-    /// owner so they can poll it from outside the runtime (FFI getter).
+    /// lived tasks via `tokio::spawn`. `peer_count` and `peers` are
+    /// shared with the owner so they can be polled from outside the
+    /// runtime (FFI getters). `device_name` is sent to peers in our
+    /// Hello so they can render us in their UI peer list.
     pub async fn spawn(
         group_id: String,
         device_id: String,
+        device_name: String,
         key: [u8; KEY_LEN],
         inbound: mpsc::UnboundedSender<IncomingLanClip>,
         peer_count: Arc<AtomicUsize>,
+        peers: PeerRegistry,
     ) -> Result<Self, LanError> {
         let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
         let port = listener.local_addr()?.port();
@@ -225,12 +246,17 @@ impl LanNode {
         let outbound_peers: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Accept loop: inbound connections from peers that found us first.
+        // Inbound peers don't have a known mDNS fullname (we didn't dial
+        // them), so we synthesize one from the connection's remote addr
+        // for the purpose of the peer registry. It's just a unique key.
         {
             let key = key;
             let device_id = device_id.clone();
+            let device_name = device_name.clone();
             let inbound = inbound.clone();
             let out_tx = out_tx.clone();
             let peer_count = peer_count.clone();
+            let peers = peers.clone();
             tokio::spawn(async move {
                 loop {
                     let (stream, addr) = match listener.accept().await {
@@ -243,12 +269,27 @@ impl LanNode {
                     };
                     let key = key;
                     let device_id = device_id.clone();
+                    let device_name = device_name.clone();
                     let inbound = inbound.clone();
                     let out_rx = out_tx.subscribe();
                     let peer_count = peer_count.clone();
+                    let peers = peers.clone();
+                    let registry_key = format!("inbound:{addr}");
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            run_peer(stream, addr, key, device_id, inbound, out_rx, None, peer_count).await
+                        if let Err(e) = run_peer(
+                            stream,
+                            addr,
+                            key,
+                            device_id,
+                            device_name,
+                            inbound,
+                            out_rx,
+                            None,
+                            peer_count,
+                            peers,
+                            registry_key,
+                        )
+                        .await
                         {
                             tracing::debug!(?e, %addr, "lan peer (inbound) ended");
                         }
@@ -262,11 +303,13 @@ impl LanNode {
         {
             let key = key;
             let device_id = device_id.clone();
+            let device_name = device_name.clone();
             let fingerprint = fingerprint.clone();
             let inbound = inbound.clone();
             let out_tx = out_tx.clone();
             let outbound_peers = outbound_peers.clone();
             let peer_count = peer_count.clone();
+            let peers = peers.clone();
             tokio::spawn(async move {
                 let mut event_rx = event_rx;
                 while let Some(event) = event_rx.recv().await {
@@ -326,11 +369,14 @@ impl LanNode {
                     }
                     let key = key;
                     let device_id = device_id.clone();
+                    let device_name = device_name.clone();
                     let inbound = inbound.clone();
                     let out_rx = out_tx.subscribe();
                     let outbound_peers = outbound_peers.clone();
                     let peer_did_owned = peer_did.to_string();
                     let peer_count = peer_count.clone();
+                    let peers_for_run = peers.clone();
+                    let registry_key = fullname.clone();
                     tokio::spawn(async move {
                         // Try each candidate address with a short timeout.
                         // First success wins; on failure we leave the
@@ -362,10 +408,13 @@ impl LanNode {
                                 sock,
                                 key,
                                 device_id,
+                                device_name,
                                 inbound,
                                 out_rx,
                                 Some(peer_did_owned.clone()),
                                 peer_count,
+                                peers_for_run,
+                                registry_key,
                             )
                             .await
                         } else {
@@ -386,6 +435,7 @@ impl LanNode {
         Ok(Self {
             out_tx,
             peer_count,
+            peers,
             _daemon: daemon,
             _forwarder: forwarder,
         })
@@ -407,6 +457,19 @@ impl LanNode {
     pub fn peer_count(&self) -> usize {
         self.peer_count.load(Ordering::Relaxed)
     }
+
+    /// Snapshot of currently-connected peers as their human-friendly
+    /// device names. UI uses this to render "局域网: Mac, iPhone" so
+    /// users can spot mesh asymmetry at a glance (e.g. Android sees
+    /// both Mac and iOS but Mac and iOS only see Android → we know
+    /// the missing edge is Mac↔iOS).
+    pub fn peer_names(&self) -> Vec<String> {
+        let g = match self.peers.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.values().cloned().collect()
+    }
 }
 
 /// First 8 chars of the device_id, lowercased. Just enough uniqueness for
@@ -417,19 +480,29 @@ fn short_id(device_id: &str) -> String {
     s.to_lowercase()
 }
 
-/// RAII guard that bumps `peer_count` on construction and decrements on
-/// drop, so an early-return / panic in `run_peer` can't leave the counter
-/// permanently inflated.
-struct PeerCountGuard(Arc<AtomicUsize>);
-impl PeerCountGuard {
-    fn new(c: Arc<AtomicUsize>) -> Self {
-        c.fetch_add(1, Ordering::Relaxed);
-        Self(c)
+/// RAII guard that bumps `peer_count` on construction, registers the
+/// peer's name, and reverses both on drop. Even if `run_peer` returns
+/// early or panics the counter and registry stay consistent.
+struct PeerSessionGuard {
+    count: Arc<AtomicUsize>,
+    peers: PeerRegistry,
+    key: String,
+}
+impl PeerSessionGuard {
+    fn new(count: Arc<AtomicUsize>, peers: PeerRegistry, key: String, name: String) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut g) = peers.lock() {
+            g.insert(key.clone(), name);
+        }
+        Self { count, peers, key }
     }
 }
-impl Drop for PeerCountGuard {
+impl Drop for PeerSessionGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.count.fetch_sub(1, Ordering::Relaxed);
+        if let Ok(mut g) = self.peers.lock() {
+            g.remove(&self.key);
+        }
     }
 }
 
@@ -440,10 +513,13 @@ async fn run_peer(
     addr: SocketAddr,
     key: [u8; KEY_LEN],
     self_device_id: String,
+    self_device_name: String,
     inbound: mpsc::UnboundedSender<IncomingLanClip>,
     mut out_rx: broadcast::Receiver<OutgoingLan>,
     expected_peer: Option<String>,
     peer_count: Arc<AtomicUsize>,
+    peers: PeerRegistry,
+    registry_key: String,
 ) -> Result<(), LanError> {
     let _ = stream.set_nodelay(true);
     let (mut reader, mut writer) = stream.into_split();
@@ -452,12 +528,13 @@ async fn run_peer(
     let hello = LanMessage::Hello {
         device_id: self_device_id.clone(),
         version: PROTO_VERSION,
+        device_name: self_device_name,
     };
     write_frame(&mut writer, &key, &hello).await?;
 
-    // Read the peer's Hello to learn its device_id.
-    let peer_did = match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader, &key)).await {
-        Ok(Ok(Some(LanMessage::Hello { device_id, .. }))) => device_id,
+    // Read the peer's Hello to learn its device_id and friendly name.
+    let (peer_did, peer_name) = match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader, &key)).await {
+        Ok(Ok(Some(LanMessage::Hello { device_id, device_name, .. }))) => (device_id, device_name),
         Ok(Ok(Some(_))) => {
             return Err(LanError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -485,10 +562,18 @@ async fn run_peer(
     if peer_did == self_device_id {
         return Ok(()); // self-connect (shouldn't happen, but cheap to guard)
     }
-    // Only bump the public counter once we have a real handshake. Drop
-    // happens automatically when this function returns or panics.
-    let _peer_guard = PeerCountGuard::new(peer_count);
-    tracing::info!(%addr, peer = %short_id(&peer_did), "lan peer up");
+    // Fall back to a short device_id snippet if the peer is on an older
+    // build that doesn't send `device_name` (Hello field is `default`).
+    let display_name = if peer_name.trim().is_empty() {
+        short_id(&peer_did)
+    } else {
+        peer_name
+    };
+    // Only bump the public counter / registry once we have a real
+    // handshake. Drop happens automatically when this function returns
+    // or panics, so the count and the name list stay consistent.
+    let _peer_guard = PeerSessionGuard::new(peer_count, peers, registry_key, display_name.clone());
+    tracing::info!(%addr, peer = %display_name, "lan peer up");
 
     // Outbound + inbound run concurrently until either errors or EOF.
     let send_task = async move {
@@ -652,6 +737,7 @@ mod tests {
         let msg = LanMessage::Hello {
             device_id: "x".into(),
             version: 1,
+            device_name: "x-name".into(),
         };
         write_frame(&mut a, &[1u8; KEY_LEN], &msg).await.unwrap();
         let r = read_frame(&mut b, &[2u8; KEY_LEN]).await;
@@ -687,12 +773,30 @@ mod tests {
 
         let count_a = Arc::new(AtomicUsize::new(0));
         let count_b = Arc::new(AtomicUsize::new(0));
-        let node_a = LanNode::spawn(group.clone(), did_a.clone(), key, a_tx, count_a)
-            .await
-            .expect("spawn A");
-        let node_b = LanNode::spawn(group.clone(), did_b.clone(), key, b_tx, count_b)
-            .await
-            .expect("spawn B");
+        let peers_a: PeerRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let peers_b: PeerRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let node_a = LanNode::spawn(
+            group.clone(),
+            did_a.clone(),
+            "node-A".into(),
+            key,
+            a_tx,
+            count_a,
+            peers_a,
+        )
+        .await
+        .expect("spawn A");
+        let node_b = LanNode::spawn(
+            group.clone(),
+            did_b.clone(),
+            "node-B".into(),
+            key,
+            b_tx,
+            count_b,
+            peers_b,
+        )
+        .await
+        .expect("spawn B");
 
         // Discovery is asynchronous; poll-broadcast until B receives.
         let payload = ClipPayload {
