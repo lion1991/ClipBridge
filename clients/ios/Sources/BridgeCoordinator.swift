@@ -12,15 +12,18 @@ enum BridgeStatus: Equatable {
     case error(String)
 }
 
-/// Foreground-only sync coordinator for the main ClipBridge app.
+/// Sync coordinator for the main ClipBridge app.
 ///
-/// We deliberately don't fight iOS's background-suspension model here. While
-/// the main app is foregrounded, this connects to the relay and polls the
-/// pasteboard the same way every other client does; on backgrounding it
-/// tears the client down. Long-running cross-app sync is the keyboard
-/// extension's job — it has runtime whenever the user is typing.
+/// Holds an audio keepalive so the WebSocket survives backgrounding past
+/// iOS's normal suspension window. Whether iOS 17+'s pasted gate then
+/// allows pasteboard reads/writes from a non-foreground app is the open
+/// question this build is meant to answer; the listener still buffers
+/// incoming clips into `recentClips` regardless, so the user can see them
+/// on next foreground even if pasted denies the in-background write.
 final class BridgeCoordinator: ObservableObject {
     static let shared = BridgeCoordinator()
+
+    private let audio = AudioKeepalive()
 
     @Published private(set) var status: BridgeStatus = .notPaired
     @Published private(set) var hasPairing: Bool = false
@@ -52,9 +55,14 @@ final class BridgeCoordinator: ObservableObject {
     func bootstrap() {
         hasPairing = PairingStore.load() != nil
         status = hasPairing ? .disconnected : .notPaired
+        audio.start()
     }
 
     func applicationDidBecomeActive() {
+        // Re-arm audio: the session can be deactivated by iOS during phone
+        // calls, Siri, or mediaserverd respawns. Calling start() is
+        // idempotent — only does work if something actually died.
+        audio.start()
         guard let cfg = PairingStore.load() else {
             stopSync()
             hasPairing = false
@@ -62,16 +70,31 @@ final class BridgeCoordinator: ObservableObject {
             return
         }
         hasPairing = true
-        startSync(with: cfg)
+        // Reuse existing client if it survived the last backgrounding.
+        // Only build a fresh one if there isn't one (first launch, or
+        // we lost it via interruption / pairing change).
+        if client == nil {
+            startSync(with: cfg)
+        } else {
+            // Audio keepalive kept the WebSocket alive across the last
+            // backgrounding, but pasted's foreground gate likely denied any
+            // pasteboard writes that happened while we were in background.
+            // Re-pulling Recent now (we're foreground again, gate accepts)
+            // re-runs handleIncoming and lands the latest clip on the OS
+            // pasteboard. Cheap, idempotent — the relay just rebroadcasts
+            // its 5-min cache.
+            try? client?.fetchRecent()
+        }
     }
 
     func applicationDidEnterBackground() {
-        // Keyboard extension takes over from here whenever the user types in
-        // any app. Nothing to keep alive in the main app.
-        stopSync()
-        if hasPairing {
-            status = .disconnected
-        }
+        // Audio keepalive keeps us alive — DON'T stopSync. We want the
+        // WebSocket to keep delivering clips (visible to the user as
+        // updates to recentClips on next foreground). Whether the
+        // pasteboard write inside handleIncoming actually lands while
+        // we're backgrounded is the open question; the foreground gate
+        // in pasted may deny it. Either way, leaving the client running
+        // is strictly better than tearing it down.
     }
 
     // MARK: - Pairing lifecycle

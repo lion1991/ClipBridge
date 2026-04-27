@@ -44,10 +44,12 @@ targets:
         UIRequiresFullScreen: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-        # 不再声明任何 background mode。同步交给键盘扩展:键盘被加载时
-        # (任意 App 内调起输入)就有进程 runtime,做剪切板轮询 + WebSocket;
-        # 没被加载就不同步。比 audio session + 静音环 那套可靠得多,也不用
-        # 跟 iOS 后台挂起规则斗。
+        # 加 audio 后台模式 + AudioKeepalive 静音环让主 App 在 background
+        # 状态保持进程活着,WebSocket 不挂。键盘扩展继续作为另一条路径覆盖
+        # "用户在打字" 场景。这是个 spike:不知道 iOS 17+ 的 pasted gate 会
+        # 不会让一个有 inactive scene + alive 进程的 App 读写 pasteboard。
+        UIBackgroundModes:
+          - audio
         # Allow plain ws:// inside trusted LANs as well as wss://.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
