@@ -8,6 +8,17 @@ struct ContentView: View {
     @State private var saveToast: String?
 
     var body: some View {
+        TabView {
+            syncTab
+                .tabItem { Label("同步", systemImage: "doc.on.clipboard") }
+            imagesTab
+                .tabItem { Label("图片", systemImage: "photo.on.rectangle.angled") }
+        }
+    }
+
+    // MARK: - Sync tab (status, pairing, text history)
+
+    private var syncTab: some View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 16) {
@@ -17,18 +28,20 @@ struct ContentView: View {
                         onTap: { showPairing = true }
                     )
                     if coordinator.hasPairing {
-                        ImageTransferCard(onSendImage: { showPhotoPicker = true })
+                        // Filter at the card boundary rather than passing
+                        // a `kind` flag in. Kept the cards generic so the
+                        // image tab can reuse the exact same component.
                         ClipHistoryCard(
                             title: "最近收到",
                             hint: "下拉刷新",
-                            emptyMessage: "暂无 — 等待其他设备复制的内容",
-                            clips: coordinator.recentClips
+                            emptyMessage: "暂无 — 等待其他设备复制的文字",
+                            clips: coordinator.recentClips.filter { $0.kind == .text }
                         )
                         ClipHistoryCard(
                             title: "最近发送",
                             hint: nil,
                             emptyMessage: "暂无 — 在本机复制后会出现",
-                            clips: coordinator.sentClips
+                            clips: coordinator.sentClips.filter { $0.kind == .text }
                         )
                     }
                     Spacer(minLength: 12)
@@ -38,13 +51,7 @@ struct ContentView: View {
                 }
                 .padding(20)
             }
-            // Pull-to-refresh kicks `Client.fetchRecent()` so the relay
-            // pushes its 5-min cache again. Updates land via the listener
-            // → handleIncoming → recentClips. Auto-cancels when the gesture
-            // ends; we don't await anything so the spinner just blinks.
-            .refreshable {
-                coordinator.refreshRecent()
-            }
+            .refreshable { coordinator.refreshRecent() }
             .navigationTitle("ClipBridge")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showPairing) {
@@ -53,6 +60,50 @@ struct ContentView: View {
                     coordinator: coordinator
                 )
             }
+        }
+        .navigationViewStyle(.stack)
+    }
+
+    // MARK: - Images tab (send hero, image-only history with save/share)
+
+    private var imagesTab: some View {
+        NavigationView {
+            ScrollView {
+                VStack(spacing: 16) {
+                    if coordinator.hasPairing {
+                        ImageTransferCard(onSendImage: { showPhotoPicker = true })
+                        ClipHistoryCard(
+                            title: "最近收到",
+                            hint: "下拉刷新",
+                            emptyMessage: "暂无 — 等其他设备发图过来",
+                            clips: coordinator.recentClips.filter { $0.kind == .image }
+                        )
+                        ClipHistoryCard(
+                            title: "最近发送",
+                            hint: nil,
+                            emptyMessage: "暂无 — 选图发送或本机复制图片后会出现",
+                            clips: coordinator.sentClips.filter { $0.kind == .image }
+                        )
+                    } else {
+                        // Pre-pairing nudge — the sync tab is where the
+                        // user pairs, so just point them there.
+                        VStack(spacing: 8) {
+                            Image(systemName: "qrcode")
+                                .font(.system(size: 36))
+                                .foregroundColor(.secondary)
+                            Text("先到「同步」标签完成配对").font(.callout)
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 40)
+                    }
+                    Spacer(minLength: 12)
+                }
+                .padding(20)
+            }
+            .refreshable { coordinator.refreshRecent() }
+            .navigationTitle("图片")
+            .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showPhotoPicker) {
                 PhotoPickerSheet(isPresented: $showPhotoPicker) { bytes in
                     coordinator.sendImageBytes(bytes)

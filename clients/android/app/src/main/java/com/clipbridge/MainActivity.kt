@@ -74,6 +74,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -218,6 +220,7 @@ private fun PairingScreen(
     }
 
     val imageHistory by ClipBridgeAccessibilityService.imageHistory.collectAsStateWithLifecycle()
+    var selectedTab by remember { mutableStateOf(BottomTab.Sync) }
 
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         val contents = result?.contents ?: return@rememberLauncherForActivityResult
@@ -237,29 +240,50 @@ private fun PairingScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("ClipBridge", style = MaterialTheme.typography.titleLarge) },
+                title = {
+                    Text(
+                        when (selectedTab) {
+                            BottomTab.Sync -> "ClipBridge"
+                            BottomTab.Images -> "图片"
+                        },
+                        style = MaterialTheme.typography.titleLarge,
+                    )
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface,
                 ),
             )
         },
+        bottomBar = {
+            NavigationBar {
+                NavigationBarItem(
+                    selected = selectedTab == BottomTab.Sync,
+                    onClick = { selectedTab = BottomTab.Sync },
+                    icon = { Icon(Icons.Filled.Sync, contentDescription = null) },
+                    label = { Text("同步") },
+                )
+                NavigationBarItem(
+                    selected = selectedTab == BottomTab.Images,
+                    onClick = { selectedTab = BottomTab.Images },
+                    icon = { Icon(Icons.Filled.PhotoLibrary, contentDescription = null) },
+                    label = { Text("图片") },
+                )
+            }
+        },
         snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            ConnectionPill(
-                state = connState,
-                paired = isPaired,
+        when (selectedTab) {
+            BottomTab.Sync -> SyncTabContent(
+                padding = padding,
+                connState = connState,
+                isPaired = isPaired,
                 asEnabled = asEnabled,
-            )
-
-            ScanHero(
-                paired = isPaired,
+                shizukuState = shizukuState,
+                batteryOptDisabled = batteryOptDisabled,
+                imageReadGranted = imageReadGranted,
+                advancedOpen = advancedOpen,
+                configText = configText,
+                error = error,
                 onScan = {
                     scanLauncher.launch(
                         ScanOptions()
@@ -270,39 +294,6 @@ private fun PairingScreen(
                             .setPrompt("对准另一台设备显示的二维码"),
                     )
                 },
-            )
-
-            if (isPaired) {
-                ImageTransferCard(
-                    history = imageHistory,
-                    onPickFromGallery = {
-                        pickMediaLauncher.launch(
-                            PickVisualMediaRequest(
-                                ActivityResultContracts.PickVisualMedia.ImageOnly,
-                            ),
-                        )
-                    },
-                    onSaveToGallery = { entry ->
-                        scope.launch {
-                            val uri = withContext(Dispatchers.IO) {
-                                ImagePipeline.saveToGallery(context, entry.bytes, entry.mime)
-                            }
-                            snackbarHostState.showSnackbar(
-                                if (uri != null) "已保存到「图片/ClipBridge」" else "保存失败"
-                            )
-                        }
-                    },
-                    onShare = { entry ->
-                        shareImage(context, entry)
-                    },
-                )
-            }
-
-            StatusSection(
-                shizukuState = shizukuState,
-                asEnabled = asEnabled,
-                batteryOptDisabled = batteryOptDisabled,
-                imageReadGranted = imageReadGranted,
                 onShizukuTap = {
                     when (shizukuState) {
                         ShizukuBridge.State.NOT_AUTHORIZED ->
@@ -321,50 +312,194 @@ private fun PairingScreen(
                         imagePermLauncher.launch(imageReadPermissionName())
                     }
                 },
+                onAdvancedToggle = { advancedOpen = !advancedOpen },
+                onConfigChange = { configText = it; error = null },
+                onGenerate = {
+                    val cfg = PairingConfig.makeNew()
+                    configText = json.encodeToString(PairingConfig.serializer(), cfg)
+                },
+                onSavePairing = {
+                    error = null
+                    runCatching {
+                        val cfg = json.decodeFromString(
+                            PairingConfig.serializer(),
+                            configText,
+                        )
+                        require(cfg.keyBytes()?.size == 32) { "密钥长度必须为 32 字节" }
+                        onSave(cfg)
+                        toast("已保存，开始同步")
+                    }.onFailure {
+                        error = "配对信息无效：${it.message}"
+                        toast("保存失败：${it.message}")
+                    }
+                },
+                onResetPairing = {
+                    onClear()
+                    configText = ""
+                    error = null
+                    toast("已重置配对")
+                },
             )
-
-            AdvancedToggle(open = advancedOpen, onToggle = { advancedOpen = !advancedOpen })
-            AnimatedVisibility(visible = advancedOpen) {
-                AdvancedPanel(
-                    configText = configText,
-                    error = error,
-                    onConfigChange = { configText = it; error = null },
-                    onGenerate = {
-                        val cfg = PairingConfig.makeNew()
-                        configText = json.encodeToString(PairingConfig.serializer(), cfg)
-                    },
-                    onSave = {
-                        error = null
-                        runCatching {
-                            val cfg = json.decodeFromString(
-                                PairingConfig.serializer(),
-                                configText,
-                            )
-                            require(cfg.keyBytes()?.size == 32) { "密钥长度必须为 32 字节" }
-                            onSave(cfg)
-                            toast("已保存，开始同步")
-                        }.onFailure {
-                            error = "配对信息无效：${it.message}"
-                            toast("保存失败：${it.message}")
+            BottomTab.Images -> ImagesTabContent(
+                padding = padding,
+                isPaired = isPaired,
+                history = imageHistory,
+                onPickFromGallery = {
+                    pickMediaLauncher.launch(
+                        PickVisualMediaRequest(
+                            ActivityResultContracts.PickVisualMedia.ImageOnly,
+                        ),
+                    )
+                },
+                onSaveToGallery = { entry ->
+                    scope.launch {
+                        val uri = withContext(Dispatchers.IO) {
+                            ImagePipeline.saveToGallery(context, entry.bytes, entry.mime)
                         }
-                    },
-                    onReset = {
-                        onClear()
-                        configText = ""
-                        error = null
-                        toast("已重置配对")
-                    },
-                )
-            }
-
-            Spacer(Modifier.height(8.dp))
-            Text(
-                "默认中继 · ${DEFAULT_RELAY_URL.removePrefix("wss://")}",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.fillMaxWidth(),
+                        snackbarHostState.showSnackbar(
+                            if (uri != null) "已保存到「图片/ClipBridge」" else "保存失败"
+                        )
+                    }
+                },
+                onShare = { entry -> shareImage(context, entry) },
             )
         }
+    }
+}
+
+private enum class BottomTab { Sync, Images }
+
+@Composable
+private fun SyncTabContent(
+    padding: androidx.compose.foundation.layout.PaddingValues,
+    connState: UiConnState,
+    isPaired: Boolean,
+    asEnabled: Boolean,
+    shizukuState: ShizukuBridge.State,
+    batteryOptDisabled: Boolean,
+    imageReadGranted: Boolean,
+    advancedOpen: Boolean,
+    configText: String,
+    error: String?,
+    onScan: () -> Unit,
+    onShizukuTap: () -> Unit,
+    onAccessibilityTap: () -> Unit,
+    onBatteryTap: () -> Unit,
+    onImageReadTap: () -> Unit,
+    onAdvancedToggle: () -> Unit,
+    onConfigChange: (String) -> Unit,
+    onGenerate: () -> Unit,
+    onSavePairing: () -> Unit,
+    onResetPairing: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .padding(padding)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        ConnectionPill(state = connState, paired = isPaired, asEnabled = asEnabled)
+        ScanHero(paired = isPaired, onScan = onScan)
+        StatusSection(
+            shizukuState = shizukuState,
+            asEnabled = asEnabled,
+            batteryOptDisabled = batteryOptDisabled,
+            imageReadGranted = imageReadGranted,
+            onShizukuTap = onShizukuTap,
+            onAccessibilityTap = onAccessibilityTap,
+            onBatteryTap = onBatteryTap,
+            onImageReadTap = onImageReadTap,
+        )
+        AdvancedToggle(open = advancedOpen, onToggle = onAdvancedToggle)
+        AnimatedVisibility(visible = advancedOpen) {
+            AdvancedPanel(
+                configText = configText,
+                error = error,
+                onConfigChange = onConfigChange,
+                onGenerate = onGenerate,
+                onSave = onSavePairing,
+                onReset = onResetPairing,
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "默认中继 · ${DEFAULT_RELAY_URL.removePrefix("wss://")}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+@Composable
+private fun ImagesTabContent(
+    padding: androidx.compose.foundation.layout.PaddingValues,
+    isPaired: Boolean,
+    history: List<ImageHistoryEntry>,
+    onPickFromGallery: () -> Unit,
+    onSaveToGallery: (ImageHistoryEntry) -> Unit,
+    onShare: (ImageHistoryEntry) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .padding(padding)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        if (!isPaired) {
+            // Pre-pairing nudge — pairing lives on the sync tab.
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                ),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                shape = RoundedCornerShape(20.dp),
+            ) {
+                Row(
+                    modifier = Modifier.padding(20.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Filled.QrCodeScanner,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        "先到「同步」标签完成配对",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
+            return@Column
+        }
+
+        // Two sub-sections: received and sent. Keeps the user mental model
+        // aligned with iOS's "最近收到 / 最近发送" cards.
+        val received = history.filter { it.direction == ImageHistoryEntry.Direction.RECEIVED }
+        val sent = history.filter { it.direction == ImageHistoryEntry.Direction.SENT }
+
+        ImageTransferCard(
+            title = "最近收到",
+            emptyMessage = "暂无 — 等其他设备发图过来",
+            history = received,
+            onPickFromGallery = onPickFromGallery,
+            showPicker = true,
+            onSaveToGallery = onSaveToGallery,
+            onShare = onShare,
+        )
+        ImageTransferCard(
+            title = "最近发送",
+            emptyMessage = "暂无 — 选图发送或本机复制图片后会出现",
+            history = sent,
+            onPickFromGallery = onPickFromGallery,
+            showPicker = false,
+            onSaveToGallery = onSaveToGallery,
+            onShare = onShare,
+        )
     }
 }
 
@@ -745,8 +880,13 @@ private fun isImageReadGranted(context: Context): Boolean {
  */
 @Composable
 private fun ImageTransferCard(
+    title: String,
+    emptyMessage: String,
     history: List<ImageHistoryEntry>,
     onPickFromGallery: () -> Unit,
+    /// True only on the "最近收到" card so the picker button doesn't
+    /// appear twice (would be confusing — it's the same action either way).
+    showPicker: Boolean,
     onSaveToGallery: (ImageHistoryEntry) -> Unit,
     onShare: (ImageHistoryEntry) -> Unit,
 ) {
@@ -770,17 +910,19 @@ private fun ImageTransferCard(
                 )
                 Spacer(Modifier.width(10.dp))
                 Text(
-                    "图片传输",
+                    title,
                     style = MaterialTheme.typography.titleSmall,
                     modifier = Modifier.weight(1f),
                 )
-                TextButton(onClick = onPickFromGallery) {
-                    Text("从相册选图")
+                if (showPicker) {
+                    TextButton(onClick = onPickFromGallery) {
+                        Text("从相册选图")
+                    }
                 }
             }
             if (history.isEmpty()) {
                 Text(
-                    "暂无 — 选图发送, 或等待其他设备发图过来",
+                    emptyMessage,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
