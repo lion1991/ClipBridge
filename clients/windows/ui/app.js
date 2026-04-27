@@ -60,20 +60,37 @@ function toast(message) {
 }
 
 const PILL_CLASSES = ["pill-neutral", "pill-info", "pill-ok", "pill-error"];
+// Cached so the LAN-peer poll can re-render without losing the latest
+// state.kind from the bridge stream.
+let lastConnState = { kind: "idle" };
+let lastLanPeers = 0;
 function setStatus(state) {
+  lastConnState = state ?? { kind: "idle" };
+  renderStatusPill();
+}
+function setLanPeers(n) {
+  lastLanPeers = n | 0;
+  renderStatusPill();
+}
+function renderStatusPill() {
   const pill = $("status-pill");
   const label = $("status-label");
   PILL_CLASSES.forEach((c) => pill.classList.remove(c));
   let cls = "pill-neutral";
   let text = "等待启动";
-  switch (state?.kind) {
+  switch (lastConnState?.kind) {
     case "connecting":
       cls = "pill-info";
       text = "连接中…";
       break;
     case "connected":
       cls = "pill-ok";
-      text = "已连接 · 同步中";
+      // Only annotate transport when actually connected — before that
+      // the user cares about why the relay isn't up, not which lane
+      // would have been used.
+      text = lastLanPeers > 0
+        ? `已连接 · 同步中 · 局域网 ${lastLanPeers}`
+        : "已连接 · 同步中 · 仅中继";
       break;
     case "disconnected":
       cls = "pill-neutral";
@@ -81,7 +98,7 @@ function setStatus(state) {
       break;
     case "error":
       cls = "pill-error";
-      text = `连接出错:${state.message ?? ""}`;
+      text = `连接出错:${lastConnState.message ?? ""}`;
       break;
     case "idle":
     default:
@@ -225,6 +242,20 @@ async function init() {
   // Live state updates from the bridge.
   await listen("connection-state", (evt) => setStatus(evt.payload));
   setStatus(await invoke("cmd_current_state"));
+
+  // LAN peer count: poll every 2s. Cheap (just an atomic load on the
+  // Rust side) and the LAN topology doesn't change fast enough to need
+  // event-driven plumbing here.
+  const pollLanPeers = async () => {
+    try {
+      const n = await invoke("cmd_lan_peer_count");
+      setLanPeers(typeof n === "number" ? n : 0);
+    } catch (e) {
+      // Bridge not started yet — keep the previous value.
+    }
+  };
+  await pollLanPeers();
+  setInterval(pollLanPeers, 2000);
 
   // Image events stream.
   await listen("image-event", (evt) => appendOrReplaceEntry(evt.payload));

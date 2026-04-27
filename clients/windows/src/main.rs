@@ -54,6 +54,7 @@ fn main() {
             cmd_clear_pairing,
             cmd_generate_pairing,
             cmd_current_state,
+            cmd_lan_peer_count,
             cmd_show_window,
             cmd_quit,
             cmd_recent_images,
@@ -224,6 +225,19 @@ fn cmd_current_state(state: State<'_, AppState>) -> UiState {
         .lock()
         .map(|s| s.clone())
         .unwrap_or(UiState::Idle)
+}
+
+/// Polled by the frontend every couple of seconds to render the
+/// "transport" badge alongside the connection state. Returns 0 when no
+/// client is up *or* when the LAN transport is up but hasn't found any
+/// peers yet — both cases display as "仅中继" in the UI.
+#[tauri::command]
+fn cmd_lan_peer_count(state: State<'_, AppState>) -> u32 {
+    state
+        .bridge
+        .lock()
+        .map(|b| b.lan_peer_count())
+        .unwrap_or(0)
 }
 
 #[tauri::command]

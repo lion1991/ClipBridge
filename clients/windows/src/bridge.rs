@@ -216,6 +216,14 @@ impl Bridge {
             .unwrap_or_default()
     }
 
+    /// Number of LAN peers currently in a fully-handshaked mDNS session.
+    /// Drives the frontend's "局域网:N / 仅中继" status badge. 0 when
+    /// LAN didn't start (e.g. firewall blocked the bind) or no peer is
+    /// online on the same subnet.
+    pub fn lan_peer_count(&self) -> u32 {
+        self.client.as_ref().map(|c| c.lan_peer_count()).unwrap_or(0)
+    }
+
     /// Look up the full PNG bytes of an entry by id (for save-to-file).
     /// None if the id was evicted under HISTORY_LIMIT pressure.
     pub fn image_bytes_for(&self, id: &str) -> Option<Vec<u8>> {
