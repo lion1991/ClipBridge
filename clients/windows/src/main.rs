@@ -16,9 +16,10 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
 };
+use tauri_plugin_dialog::{DialogExt, FilePath};
 use tokio::sync::mpsc;
 
-use crate::bridge::{Bridge, UiState};
+use crate::bridge::{Bridge, ImageHistoryEntry, UiState};
 use crate::pairing::{PairingConfig, Store};
 
 struct AppState {
@@ -34,9 +35,11 @@ struct PairingDto {
 
 fn main() {
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<UiState>();
-    let bridge = Bridge::new(state_tx);
+    let (image_tx, mut image_rx) = mpsc::unbounded_channel::<ImageHistoryEntry>();
+    let bridge = Bridge::new(state_tx, image_tx);
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_autostart::init(
                 tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -55,6 +58,9 @@ fn main() {
             cmd_current_state,
             cmd_show_window,
             cmd_quit,
+            cmd_recent_images,
+            cmd_send_image_bytes,
+            cmd_save_image_to_file,
         ])
         .setup(move |app| {
             // Tray icon + menu.
@@ -94,6 +100,15 @@ fn main() {
                         }
                     }
                     let _ = app_handle.emit("connection-state", &state);
+                }
+            });
+
+            // Same for image history events — the frontend appends each
+            // entry to its in-memory list and re-renders the image tab.
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some(entry) = image_rx.recv().await {
+                    let _ = app_handle.emit("image-event", &entry);
                 }
             });
 
@@ -216,6 +231,70 @@ fn cmd_show_window(app: AppHandle) {
 #[tauri::command]
 fn cmd_quit(app: AppHandle) {
     quit_app(&app);
+}
+
+/// Snapshot of the in-process image history. Used on window-open to
+/// repaint after a hide/show — `image-event` covers live updates.
+#[tauri::command]
+fn cmd_recent_images(state: State<'_, AppState>) -> Vec<ImageHistoryEntry> {
+    state
+        .bridge
+        .lock()
+        .map(|b| b.recent_images())
+        .unwrap_or_default()
+}
+
+/// Picker-driven send: frontend reads a File via FileReader, ships the
+/// bytes here. Returns the new history entry so the UI can render
+/// optimistically before the listener fires.
+#[tauri::command]
+fn cmd_send_image_bytes(
+    bytes: Vec<u8>,
+    state: State<'_, AppState>,
+) -> Result<ImageHistoryEntry, String> {
+    state
+        .bridge
+        .lock()
+        .map_err(|e| e.to_string())?
+        .send_image_bytes(bytes)
+}
+
+/// Save an image from history to a user-chosen file. The frontend passes
+/// the entry id and a default file name; we open a Save dialog and write
+/// the original PNG bytes verbatim (no re-encoding).
+#[tauri::command]
+async fn cmd_save_image_to_file(
+    id: String,
+    default_name: String,
+    app: AppHandle,
+) -> Result<Option<String>, String> {
+    let bytes = {
+        let state = app
+            .try_state::<AppState>()
+            .ok_or_else(|| "app state missing".to_string())?;
+        let bridge = state.bridge.lock().map_err(|e| e.to_string())?;
+        bridge
+            .image_bytes_for(&id)
+            .ok_or_else(|| "图片字节已过期 (历史已清)".to_string())?
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel::<Option<FilePath>>();
+    app.dialog()
+        .file()
+        .set_title("保存图片")
+        .set_file_name(&default_name)
+        .add_filter("PNG", &["png"])
+        .save_file(move |maybe_path| {
+            let _ = tx.send(maybe_path);
+        });
+    let chosen = rx.recv().map_err(|e| format!("dialog: {e}"))?;
+    let Some(file_path) = chosen else { return Ok(None) };
+    let path = file_path
+        .as_path()
+        .ok_or_else(|| "save dialog returned non-filesystem path".to_string())?
+        .to_path_buf();
+    std::fs::write(&path, &bytes).map_err(|e| format!("写入失败:{e}"))?;
+    Ok(Some(path.display().to_string()))
 }
 
 fn render_qr(text: &str) -> Option<String> {

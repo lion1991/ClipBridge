@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <main>
+    <main id="view-sync" class="view">
       <div id="status-pill" class="pill pill-neutral">
         <span class="dot"></span>
         <span id="status-label">等待启动</span>
@@ -51,6 +51,41 @@
         默认中继 · <code id="default-relay">clip.wrlog.cn</code>
       </div>
     </main>
+
+    <main id="view-images" class="view hidden">
+      <section class="card">
+        <h2>发送图片</h2>
+        <p class="hint">从本地选图发送, 或在「同步」标签下复制图片自动同步。</p>
+        <div class="actions">
+          <button id="btn-pick-image" class="primary">从本地选择…</button>
+          <button id="btn-send-clipboard">从剪切板发送</button>
+        </div>
+        <input id="file-input" type="file" accept="image/*" multiple class="hidden" />
+      </section>
+
+      <section class="card">
+        <h2>最近收到</h2>
+        <div id="received-empty" class="hint">暂无 — 等其他设备发图过来</div>
+        <div id="received-grid" class="image-grid hidden"></div>
+      </section>
+
+      <section class="card">
+        <h2>最近发送</h2>
+        <div id="sent-empty" class="hint">暂无 — 选图发送或本机复制图片后会出现</div>
+        <div id="sent-grid" class="image-grid hidden"></div>
+      </section>
+    </main>
+
+    <nav class="bottom-tabs">
+      <button class="tab-btn active" data-tab="sync">
+        <span class="tab-icon">⇆</span>
+        <span class="tab-label">同步</span>
+      </button>
+      <button class="tab-btn" data-tab="images">
+        <span class="tab-icon">▥</span>
+        <span class="tab-label">图片</span>
+      </button>
+    </nav>
 
     <div id="toast" class="toast hidden"></div>
 

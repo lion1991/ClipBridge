@@ -29,6 +29,15 @@ clipbridge-core = { path = "../../core" }
 # Clipboard read/write — cross-platform but we only build on Windows here.
 arboard = "3"
 
+# Image format conversion. arboard hands us raw RGBA buffers from the
+# Windows clipboard; we PNG-encode for the wire and decode incoming PNGs
+# back to RGBA before set_image. Default features cover PNG/JPEG which
+# is all we need.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Save dialog for "保存图片到本地".
+tauri-plugin-dialog = "2"
+
 # QR generation for the pairing window.
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
