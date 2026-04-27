@@ -44,6 +44,15 @@ const FRAME_MAX: usize = 1024 * 1024;
 /// drop a clip on the LAN side than back-pressure the sender. The relay
 /// path will still deliver it.
 const OUT_BUFFER: usize = 32;
+/// How often each peer task sends a no-op Ping, and how long since any
+/// inbound frame we wait before declaring the link dead. The 3× ratio
+/// gives one missed ping margin before tearing the connection down.
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+/// How often the reconciler re-tries dialing known-but-not-connected
+/// peers. mDNS only emits `ServiceResolved` once per service unless the
+/// records change, so without this loop a TCP drop never reconnects.
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One-line wire message for the LAN socket. Goes through AEAD before
 /// hitting the wire, so the same `LanMessage` discriminant doubles as the
@@ -66,6 +75,12 @@ enum LanMessage {
         ts: u64,
         payload: ClipPayload,
     },
+    /// Liveness keep-alive. Sent every `PING_INTERVAL` regardless of clip
+    /// traffic so each side can detect a silently-dead peer via the
+    /// `IDLE_TIMEOUT`. No payload — just the wakeup. Older peers without
+    /// this variant fail JSON parse and we drop them, which is fine —
+    /// they'd reconnect on the next mDNS event with a matching version.
+    Ping,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +157,20 @@ impl From<mdns_sd::Error> for LanError {
 /// e.g. iOS main app + keyboard — count as separate entries). The values
 /// are the human-friendly device names the peers sent in their Hello.
 pub type PeerRegistry = Arc<std::sync::Mutex<HashMap<String, String>>>;
+
+/// Information cached from an mDNS `ServiceResolved` event. The reconciler
+/// loop scans this every `RECONNECT_INTERVAL` and re-dials any entry that
+/// isn't currently in `outbound_peers`, so a dropped TCP recovers without
+/// waiting for mDNS to re-announce (which it may never do for a stable
+/// peer once the initial cache is hot).
+#[derive(Debug, Clone)]
+struct KnownPeer {
+    /// Device id from the TXT record. Carried so the dial side can
+    /// confirm the handshake matches who mDNS thought we were dialing.
+    peer_did: String,
+    /// Already-filtered, IPv4-first list of addresses to attempt in order.
+    candidates: Vec<SocketAddr>,
+}
 
 /// Owns the mDNS daemon, accept loop, and per-peer connection tasks. Drop
 /// to tear everything down — the broadcast sender closes, peer tasks see
@@ -239,11 +268,18 @@ impl LanNode {
         // `peer_count` is provided by the caller so the FFI side can read
         // it from outside the tokio runtime that owns this LanNode.
 
-        // Shared state for outbound dedup of peer connections. Keyed by
-        // mDNS instance fullname (not device_id) so that two processes
-        // running on the same physical device — e.g. the iOS main app and
-        // its keyboard extension — both get a connection.
+        // Currently-dialing-or-connected outbound peers. Keyed by mDNS
+        // instance fullname so two processes on one device count as
+        // separate entries (iOS main app vs keyboard extension).
         let outbound_peers: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        // Long-lived cache of every peer we've ever resolved via mDNS in
+        // this group, scrubbed only on `ServiceRemoved`. The reconciler
+        // loop scans this every few seconds and re-dials anything not
+        // currently in `outbound_peers` — without this we'd never recover
+        // from a TCP drop because mDNS rarely re-emits `ServiceResolved`
+        // for an unchanged service.
+        let known_peers: Arc<Mutex<HashMap<String, KnownPeer>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // Accept loop: inbound connections from peers that found us first.
         // Inbound peers don't have a known mDNS fullname (we didn't dial
@@ -298,136 +334,144 @@ impl LanNode {
             });
         }
 
-        // Discover loop: react to mDNS events. For each remote peer in the
-        // same group, open a TCP connection and start a session.
+        // Discover loop: feed `known_peers` from mDNS events. The actual
+        // dialing happens in the reconciler below — keeping discovery and
+        // (re)connection separate is what lets us recover from TCP drops
+        // even when mDNS doesn't re-emit `ServiceResolved`.
+        {
+            let device_id = device_id.clone();
+            let fingerprint = fingerprint.clone();
+            let known_peers = known_peers.clone();
+            tokio::spawn(async move {
+                let mut event_rx = event_rx;
+                while let Some(event) = event_rx.recv().await {
+                    match event {
+                        ServiceEvent::ServiceResolved(info) => {
+                            let props = info.get_properties();
+                            let peer_gid = props.get_property_val_str("gid").unwrap_or("");
+                            let peer_did = props.get_property_val_str("did").unwrap_or("");
+                            if peer_gid != fingerprint {
+                                continue;
+                            }
+                            if peer_did.is_empty() {
+                                continue;
+                            }
+                            // Lexicographic tiebreak: only the side with the
+                            // larger device_id initiates. Equal ids (same
+                            // physical device — iOS main app vs keyboard)
+                            // also short-circuit here.
+                            if device_id.as_str() <= peer_did {
+                                continue;
+                            }
+                            let port = info.get_port();
+                            // mDNS gives us a HashSet of addresses with
+                            // unstable iteration order. iOS in particular
+                            // publishes IPv6 link-local on awdl0/utun that
+                            // need %scope to dial. Filter & sort: drop
+                            // link-local v6, IPv4 first, global v6 second.
+                            let mut candidates: Vec<SocketAddr> = info
+                                .get_addresses()
+                                .iter()
+                                .copied()
+                                .filter(|a| !is_unroutable(a))
+                                .map(|a| SocketAddr::new(a, port))
+                                .collect();
+                            candidates.sort_by_key(|sa| match sa.ip() {
+                                IpAddr::V4(_) => 0,
+                                IpAddr::V6(_) => 1,
+                            });
+                            if candidates.is_empty() {
+                                continue;
+                            }
+                            let fullname = info.get_fullname().to_string();
+                            let mut g = known_peers.lock().await;
+                            g.insert(
+                                fullname,
+                                KnownPeer {
+                                    peer_did: peer_did.to_string(),
+                                    candidates,
+                                },
+                            );
+                        }
+                        ServiceEvent::ServiceRemoved(_, fullname) => {
+                            // mDNS TTL expired with no re-announcement —
+                            // peer is presumed gone. Stop reconnect retries
+                            // until they show up again.
+                            known_peers.lock().await.remove(&fullname);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        // Reconciler: every RECONNECT_INTERVAL, dial any known peer that
+        // doesn't currently have an in-flight or live outbound session.
+        // This is what makes "I disconnected and now I'm back" work
+        // automatically — the peer task's disconnect cleanup removes the
+        // outbound_peers entry, and the next reconciler tick re-dials.
         {
             let key = key;
-            let device_id = device_id.clone();
-            let device_name = device_name.clone();
-            let fingerprint = fingerprint.clone();
+            let device_id_for_recon = device_id.clone();
+            let device_name_for_recon = device_name.clone();
             let inbound = inbound.clone();
             let out_tx = out_tx.clone();
             let outbound_peers = outbound_peers.clone();
             let peer_count = peer_count.clone();
             let peers = peers.clone();
+            let known_peers = known_peers.clone();
             tokio::spawn(async move {
-                let mut event_rx = event_rx;
-                while let Some(event) = event_rx.recv().await {
-                    let info = match event {
-                        ServiceEvent::ServiceResolved(info) => info,
-                        _ => continue,
+                let mut interval = tokio::time::interval(RECONNECT_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                interval.tick().await; // burn the immediate first tick
+                loop {
+                    interval.tick().await;
+                    let snapshot: Vec<(String, KnownPeer)> = {
+                        let g = known_peers.lock().await;
+                        g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
                     };
-                    let props = info.get_properties();
-                    let peer_gid = props.get_property_val_str("gid").unwrap_or("");
-                    let peer_did = props.get_property_val_str("did").unwrap_or("");
-                    if peer_gid != fingerprint {
-                        continue; // different group on the same LAN
-                    }
-                    if peer_did.is_empty() {
-                        continue;
-                    }
-                    // Lexicographic tiebreak: only the side with the larger
-                    // device_id initiates. Otherwise both sides try to
-                    // connect simultaneously and we end up with two
-                    // sessions per peer pair. Equal device_ids (same
-                    // physical device, e.g. iOS main app vs keyboard
-                    // extension) also short-circuit here — there's no
-                    // value in cross-talking with our own twin.
-                    if device_id.as_str() <= peer_did {
-                        continue;
-                    }
-                    let fullname = info.get_fullname().to_string();
-                    {
-                        let mut p = outbound_peers.lock().await;
-                        if p.contains_key(&fullname) {
-                            continue;
-                        }
-                        p.insert(fullname.clone(), ());
-                    }
-                    let port = info.get_port();
-                    // mDNS gives us a HashSet of advertised addresses with
-                    // unstable iteration order. iOS in particular publishes
-                    // both an IPv4 and an IPv6 link-local on `awdl0`/`utun`;
-                    // the link-local needs a %scope to dial and we don't
-                    // track that, so blindly grabbing `iter().next()` would
-                    // sometimes pick the unconnectable one and the pair
-                    // would never link up. Filter & sort: drop link-local
-                    // IPv6, then IPv4 first, IPv6 global second.
-                    let mut candidates: Vec<SocketAddr> = info
-                        .get_addresses()
-                        .iter()
-                        .copied()
-                        .filter(|a| !is_unroutable(a))
-                        .map(|a| SocketAddr::new(a, port))
-                        .collect();
-                    candidates.sort_by_key(|sa| match sa.ip() {
-                        IpAddr::V4(_) => 0,
-                        IpAddr::V6(_) => 1,
-                    });
-                    if candidates.is_empty() {
-                        continue;
-                    }
-                    let key = key;
-                    let device_id = device_id.clone();
-                    let device_name = device_name.clone();
-                    let inbound = inbound.clone();
-                    let out_rx = out_tx.subscribe();
-                    let outbound_peers = outbound_peers.clone();
-                    let peer_did_owned = peer_did.to_string();
-                    let peer_count = peer_count.clone();
-                    let peers_for_run = peers.clone();
-                    let registry_key = fullname.clone();
-                    tokio::spawn(async move {
-                        // Try each candidate address with a short timeout.
-                        // First success wins; on failure we leave the
-                        // outbound_peers entry behind so the next mDNS
-                        // re-resolve (~30s) can try again.
-                        let mut connected: Option<(TcpStream, SocketAddr)> = None;
-                        for cand in &candidates {
-                            match tokio::time::timeout(
-                                Duration::from_secs(3),
-                                TcpStream::connect(cand),
-                            )
-                            .await
-                            {
-                                Ok(Ok(s)) => {
-                                    connected = Some((s, *cand));
-                                    break;
-                                }
-                                Ok(Err(e)) => {
-                                    tracing::debug!(?e, %cand, "lan dial failed, trying next");
-                                }
-                                Err(_) => {
-                                    tracing::debug!(%cand, "lan dial timed out, trying next");
-                                }
+                    for (fullname, kp) in snapshot {
+                        // Reserve the slot atomically with the live-check
+                        // so two reconciler ticks (or a stale mDNS event
+                        // path) can't race into duplicate dials.
+                        {
+                            let mut p = outbound_peers.lock().await;
+                            if p.contains_key(&fullname) {
+                                continue;
                             }
+                            p.insert(fullname.clone(), ());
                         }
-                        let res = if let Some((stream, sock)) = connected {
-                            run_peer(
-                                stream,
-                                sock,
+                        let key = key;
+                        let device_id = device_id_for_recon.clone();
+                        let device_name = device_name_for_recon.clone();
+                        let inbound = inbound.clone();
+                        let out_rx = out_tx.subscribe();
+                        let outbound_peers = outbound_peers.clone();
+                        let peer_count = peer_count.clone();
+                        let peers_for_run = peers.clone();
+                        let registry_key = fullname.clone();
+                        let peer_did_owned = kp.peer_did.clone();
+                        let candidates = kp.candidates.clone();
+                        tokio::spawn(async move {
+                            let res = dial_and_run(
+                                candidates,
                                 key,
                                 device_id,
                                 device_name,
                                 inbound,
                                 out_rx,
-                                Some(peer_did_owned.clone()),
+                                peer_did_owned,
                                 peer_count,
                                 peers_for_run,
                                 registry_key,
                             )
-                            .await
-                        } else {
-                            Err(LanError::Io(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionRefused,
-                                "no advertised address was reachable",
-                            )))
-                        };
-                        if let Err(e) = res {
-                            tracing::debug!(?e, "lan peer (outbound) ended");
-                        }
-                        outbound_peers.lock().await.remove(&fullname);
-                    });
+                            .await;
+                            if let Err(e) = res {
+                                tracing::debug!(?e, %fullname, "lan peer (outbound) ended");
+                            }
+                            outbound_peers.lock().await.remove(&fullname);
+                        });
+                    }
                 }
             });
         }
@@ -506,6 +550,56 @@ impl Drop for PeerSessionGuard {
     }
 }
 
+/// Try each candidate address in order with a short per-attempt timeout,
+/// then hand the first connected stream to `run_peer`. Used by both the
+/// initial-discovery and reconciler paths so dial logic stays in one
+/// place.
+#[allow(clippy::too_many_arguments)]
+async fn dial_and_run(
+    candidates: Vec<SocketAddr>,
+    key: [u8; KEY_LEN],
+    self_device_id: String,
+    self_device_name: String,
+    inbound: mpsc::UnboundedSender<IncomingLanClip>,
+    out_rx: broadcast::Receiver<OutgoingLan>,
+    expected_peer: String,
+    peer_count: Arc<AtomicUsize>,
+    peers: PeerRegistry,
+    registry_key: String,
+) -> Result<(), LanError> {
+    let mut connected: Option<(TcpStream, SocketAddr)> = None;
+    for cand in &candidates {
+        match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(cand)).await {
+            Ok(Ok(s)) => {
+                connected = Some((s, *cand));
+                break;
+            }
+            Ok(Err(e)) => tracing::debug!(?e, %cand, "lan dial failed, trying next"),
+            Err(_) => tracing::debug!(%cand, "lan dial timed out, trying next"),
+        }
+    }
+    let (stream, sock) = connected.ok_or_else(|| {
+        LanError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "no advertised address was reachable",
+        ))
+    })?;
+    run_peer(
+        stream,
+        sock,
+        key,
+        self_device_id,
+        self_device_name,
+        inbound,
+        out_rx,
+        Some(expected_peer),
+        peer_count,
+        peers,
+        registry_key,
+    )
+    .await
+}
+
 /// Drive one TCP session: send Hello, then concurrently push outbound
 /// clips and pull inbound frames until either side closes.
 async fn run_peer(
@@ -575,59 +669,79 @@ async fn run_peer(
     let _peer_guard = PeerSessionGuard::new(peer_count, peers, registry_key, display_name.clone());
     tracing::info!(%addr, peer = %display_name, "lan peer up");
 
-    // Outbound + inbound run concurrently until either errors or EOF.
-    let send_task = async move {
-        loop {
-            match out_rx.recv().await {
-                Ok(out) => {
-                    // Don't echo a clip back to the device that originally
-                    // sent it. (We only know the *original* sender here,
-                    // which may be a third device in larger groups.)
-                    if out.sender_device_id == peer_did {
-                        continue;
-                    }
-                    let msg = LanMessage::Clip {
-                        sender_device_id: out.sender_device_id,
-                        ts: out.ts,
-                        payload: out.payload,
-                    };
-                    if let Err(e) = write_frame(&mut writer, &key, &msg).await {
-                        return Err::<(), LanError>(e);
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(skipped = n, "lan broadcast lagged");
-                }
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+    // Single select! for outbound writes (clips + ping), inbound reads,
+    // and an idle deadline. This keeps writes and reads serialized which
+    // is fine over a short-lived lock-step LAN connection, and lets the
+    // idle check share state with both sides.
+    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ping_interval.tick().await; // burn the immediate first tick
+    let mut last_seen = tokio::time::Instant::now();
+    loop {
+        let idle_deadline = last_seen + IDLE_TIMEOUT;
+        tokio::select! {
+            biased;
+            // Idle check first so a saturated read loop can't keep us
+            // hanging on a dead peer past the deadline.
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                tracing::debug!(peer = %display_name, "lan idle timeout, closing");
+                return Err(LanError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "no inbound frame within idle window",
+                )));
             }
-        }
-    };
-
-    let recv_task = async move {
-        loop {
-            match read_frame(&mut reader, &key).await? {
-                Some(LanMessage::Clip {
-                    sender_device_id,
-                    ts,
-                    payload,
-                }) => {
-                    let _ = inbound.send(IncomingLanClip {
+            _ = ping_interval.tick() => {
+                if let Err(e) = write_frame(&mut writer, &key, &LanMessage::Ping).await {
+                    return Err(e);
+                }
+            }
+            out = out_rx.recv() => {
+                match out {
+                    Ok(out) => {
+                        // Don't echo a clip back to the device that
+                        // originally sent it.
+                        if out.sender_device_id == peer_did {
+                            continue;
+                        }
+                        let msg = LanMessage::Clip {
+                            sender_device_id: out.sender_device_id,
+                            ts: out.ts,
+                            payload: out.payload,
+                        };
+                        if let Err(e) = write_frame(&mut writer, &key, &msg).await {
+                            return Err(e);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "lan broadcast lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+            frame = read_frame(&mut reader, &key) => {
+                last_seen = tokio::time::Instant::now();
+                match frame? {
+                    Some(LanMessage::Clip {
                         sender_device_id,
                         ts,
                         payload,
-                    });
+                    }) => {
+                        let _ = inbound.send(IncomingLanClip {
+                            sender_device_id,
+                            ts,
+                            payload,
+                        });
+                    }
+                    Some(LanMessage::Hello { .. }) => {
+                        // Spurious second Hello — ignore.
+                    }
+                    Some(LanMessage::Ping) => {
+                        // Already touched last_seen above; nothing more.
+                    }
+                    None => return Ok(()),
                 }
-                Some(LanMessage::Hello { .. }) => {
-                    // Spurious second Hello — ignore.
-                }
-                None => return Ok::<(), LanError>(()),
             }
         }
-    };
-
-    tokio::select! {
-        r = send_task => r,
-        r = recv_task => r,
     }
 }
 
