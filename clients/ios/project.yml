@@ -44,11 +44,10 @@ targets:
         UIRequiresFullScreen: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-        # 只用 audio 后台模式 + AVAudioSession.playback 维持 WebSocket。
-        # processing/fetch 我们没在代码里用 BackgroundTasks 调度,留着只会
-        # 让 LaunchServices 多检查规则,还可能触发奇怪的注册失败。
-        UIBackgroundModes:
-          - audio
+        # 不再声明任何 background mode。同步交给键盘扩展:键盘被加载时
+        # (任意 App 内调起输入)就有进程 runtime,做剪切板轮询 + WebSocket;
+        # 没被加载就不同步。比 audio session + 静音环 那套可靠得多,也不用
+        # 跟 iOS 后台挂起规则斗。
         # Allow plain ws:// inside trusted LANs as well as wss://.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
@@ -71,6 +70,66 @@ targets:
       # ("Unable to register" / TrollStore error 181) because the file isn't
       # a valid .framework or .dylib. embed: false skips the copy step;
       # everything still gets linked correctly.
+      - framework: ../../build/ios/ClipbridgeCore.xcframework
+        embed: false
+        codeSign: false
+      # Embed the keyboard extension as PlugIns/ClipBridgeKeyboard.appex.
+      # codeSign: false because TrollStore will re-sign on install; we run
+      # ldid -S separately on each binary in the build script.
+      - target: ClipBridgeKeyboard
+        embed: true
+        codeSign: false
+
+  ClipBridgeKeyboard:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - Keyboard
+      # Share the Rust glue + pairing config + relay URL constant with the
+      # main app. Each target compiles its own copy, but the source file
+      # lives in one place so changes don't drift.
+      - path: Sources/ClipbridgeCore
+      - path: Sources/PairingConfig.swift
+    info:
+      path: Keyboard/Info.plist
+      # xcodegen rewrites this plist from `properties:` on every regenerate
+      # — anything not listed here is dropped. So NSExtension and its
+      # attributes have to live inline, not in the on-disk file.
+      properties:
+        CFBundleDisplayName: ClipBridge
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.keyboard-service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).KeyboardViewController
+          NSExtensionAttributes:
+            # IsASCIICapable=true 让 pkd 在所有 input mode (包括 URL/密码框
+            # 这种只放 ASCII 键盘的) 都把我们当候选。之前 false + 中文
+            # PrimaryLanguage 可能让 pkd 在英文输入场景把我们过滤掉,这是
+            # "globe 长按看不到我们"的最大嫌疑。
+            IsASCIICapable: true
+            PrefersRightToLeft: false
+            # PrimaryLanguage 改成 mul (multilingual) 让 pkd 不按单一语言
+            # 过滤。我们这个键盘其实不参与文字输入,只做剪切板同步,声明
+            # multilingual 最贴合实际行为。
+            PrimaryLanguage: mul
+            # 用户在 设置 里手动开"完全访问"。我们的 platform-application
+            # 入口 entitlement 理论上能绕过此开关,但请求位还是要置上,
+            # 不然 iOS 会按"未请求 = 拒绝联网/读 pasteboard"严判。
+            RequestsOpenAccess: true
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.clipbridge.ios.keyboard
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: "NO"
+        # Match main app — TrollStore-signed extensions inherit the host's
+        # entitlement story but each binary gets its own ldid pass, so we
+        # need a separate plist file here.
+        CODE_SIGN_ENTITLEMENTS: Keyboard/ClipBridgeKeyboard.entitlements
+    dependencies:
       - framework: ../../build/ios/ClipbridgeCore.xcframework
         embed: false
         codeSign: false

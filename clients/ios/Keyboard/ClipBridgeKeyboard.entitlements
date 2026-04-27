@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 联网。键盘扩展默认拿不到这权限,要么靠 Open Access,要么靠
+         platform-application 入口 entitlement 直接放行。 -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- 把扩展也提到 platform-application 一档。
+         注:之前一度怀疑这条加上 no-container 会让 pkd 把我们 .appex
+         过滤掉,所以临时撤过。撤了也没解决"长按 🌐 看不到我们键盘"的
+         问题,说明 pkd 的过滤跟 platform-application 无关。把它加回来
+         有两个收益:(1) 键盘读 UIPasteboard 时不弹 toast (跟下面的
+         allow-paste-without-prompt 配套);(2) 跨进程 pasteboard 访问
+         不用走 Open Access 那条路。 -->
+    <key>platform-application</key>
+    <true/>
+
+    <!-- 跟 platform-application 配套用,push 到系统 App 那档。
+         no-container 的副作用之前没验出问题,留着。 -->
+    <key>com.apple.private.security.no-container</key>
+    <true/>
+
+    <!-- iOS 14+ 默认每次跨 App 读 pasteboard 弹 "已粘贴自..." toast,
+         这条把它静音。仅对 platform-application 生效。 -->
+    <key>com.apple.UIKit.allow-paste-without-prompt</key>
+    <true/>
+
+    <!-- App Group:跟主 App 共享 PairingStore。两边的 application-groups
+         必须一致,键盘进程才能 UserDefaults(suiteName:) 读到主 App 写的
+         配对信息。 -->
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.com.clipbridge.shared</string>
+    </array>
+</dict>
+</plist>

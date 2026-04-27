@@ -91,12 +91,45 @@ APP="$DERIVED/Build/Products/Release-iphoneos/ClipBridge.app"
 # our private TrollStore-only keys are LOST. Running ldid afterward bakes
 # the full entitlements plist into the LC_CODE_SIGNATURE; TrollStore's own
 # re-sign preserves them.
+#
+# Both the main app binary AND the keyboard extension binary need their
+# own pass — they're separate Mach-O files and TrollStore re-signs each
+# one independently. The keyboard ent. file declares the same App Group
+# so PairingStore is shared.
 echo "==> 3a/4 embedding entitlements via ldid"
 if ! command -v ldid >/dev/null 2>&1; then
-  echo "ldid not found. Install: brew install ldid" >&2
+  echo "ldid not found. Install: brew install ldid-procursus" >&2
+  exit 1
+fi
+# iOS 16+/macOS 11+ require entitlements in BOTH XML (csmagic 0xfade7171)
+# AND DER form (0xfade7172). Saurik's classic ldid (homebrew "ldid") only
+# writes XML; the OS then logs "binary contains an invalid entitlements
+# blob" and TrollStore's signApp returns -67062 (errSecCSBadObjectFormat)
+# which silently drops the .appex from the install. Procursus ldid writes
+# both. Detect the upstream variant and refuse to build with it.
+if ! ldid 2>&1 | grep -q "procursus"; then
+  cat <<EOF >&2
+ldid is the saurik build, which doesn't emit DER entitlements. The
+keyboard extension will install but its entitlements will be silently
+ignored, and TrollStore may drop the .appex entirely (-67062 in the
+device log). Switch to the Procursus build:
+
+  brew uninstall ldid && brew install ldid-procursus
+
+EOF
   exit 1
 fi
 ldid "-S$ROOT/clients/ios/ClipBridge.entitlements" "$APP/ClipBridge"
+
+KEYBOARD_APPEX="$APP/PlugIns/ClipBridgeKeyboard.appex"
+if [[ -d "$KEYBOARD_APPEX" ]]; then
+  ldid \
+    "-S$ROOT/clients/ios/Keyboard/ClipBridgeKeyboard.entitlements" \
+    "$KEYBOARD_APPEX/ClipBridgeKeyboard"
+else
+  echo "expected $KEYBOARD_APPEX, keyboard extension didn't build" >&2
+  exit 1
+fi
 
 # 4. Zip into the standard IPA layout (Payload/<App>.app/...).
 echo "==> 4/4 packaging IPA"

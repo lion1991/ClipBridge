@@ -52,28 +52,61 @@ extension Data {
 }
 
 enum PairingStore {
-    private static let key = "com.clipbridge.pairing.v1"
+    /// Shared between the main app and the keyboard extension. Must match
+    /// the value in both targets' entitlements (`application-groups`).
+    static let appGroupId = "group.com.clipbridge.shared"
+
+    private static let pairingKey = "com.clipbridge.pairing.v1"
+    private static let deviceIdKey = "com.clipbridge.device_id"
+
+    /// Falls back to `.standard` only if the App Group container hasn't been
+    /// granted yet (eg. user is on a build that predates this entitlement).
+    /// Keyboard-extension reads will silently fail in that case, which is
+    /// acceptable — they'll start working as soon as the user re-installs
+    /// the IPA with both entitlements files signed in.
+    private static var defaults: UserDefaults {
+        UserDefaults(suiteName: appGroupId) ?? .standard
+    }
 
     static func load() -> PairingConfig? {
-        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
-        return try? JSONDecoder().decode(PairingConfig.self, from: data)
+        if let data = defaults.data(forKey: pairingKey),
+           let cfg = try? JSONDecoder().decode(PairingConfig.self, from: data) {
+            return cfg
+        }
+        // One-shot migration: pre-keyboard-extension installs stored the
+        // pairing in `.standard`. Lift it into the App Group container so the
+        // keyboard can see it, then clear the legacy copy.
+        guard
+            let legacyData = UserDefaults.standard.data(forKey: pairingKey),
+            let cfg = try? JSONDecoder().decode(PairingConfig.self, from: legacyData)
+        else { return nil }
+        defaults.set(legacyData, forKey: pairingKey)
+        UserDefaults.standard.removeObject(forKey: pairingKey)
+        return cfg
     }
 
     static func save(_ config: PairingConfig) {
         if let data = try? JSONEncoder().encode(config) {
-            UserDefaults.standard.set(data, forKey: key)
+            defaults.set(data, forKey: pairingKey)
         }
     }
 
     static func clear() {
-        UserDefaults.standard.removeObject(forKey: key)
+        defaults.removeObject(forKey: pairingKey)
     }
 
     static func deviceId() -> String {
-        let key = "com.clipbridge.device_id"
-        if let id = UserDefaults.standard.string(forKey: key) { return id }
+        if let id = defaults.string(forKey: deviceIdKey) { return id }
+        // Same migration story as pairing: legacy device_id lived in
+        // .standard. Lift it before minting a fresh UUID, otherwise the
+        // device looks like a brand new client to the relay.
+        if let legacy = UserDefaults.standard.string(forKey: deviceIdKey) {
+            defaults.set(legacy, forKey: deviceIdKey)
+            UserDefaults.standard.removeObject(forKey: deviceIdKey)
+            return legacy
+        }
         let id = UUID().uuidString
-        UserDefaults.standard.set(id, forKey: key)
+        defaults.set(id, forKey: deviceIdKey)
         return id
     }
 }

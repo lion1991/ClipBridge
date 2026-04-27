@@ -24,5 +24,13 @@
          它静音。仅对 platform-application 生效,所以必须和上面那条配套。 -->
     <key>com.apple.UIKit.allow-paste-without-prompt</key>
     <true/>
+
+    <!-- App Group:让主 App 和键盘扩展共享 PairingStore(配对 JSON +
+         device_id)。两边的 UserDefaults(suiteName:) 走同一个 plist。
+         键盘扩展是独立进程,没有 App Group 它读不到主 App 写的配对。 -->
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.com.clipbridge.shared</string>
+    </array>
 </dict>
 </plist>

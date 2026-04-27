@@ -30,4 +30,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, ObservableObject {
     func applicationDidBecomeActive(_ application: UIApplication) {
         coordinator.applicationDidBecomeActive()
     }
+
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        coordinator.applicationDidEnterBackground()
+    }
 }

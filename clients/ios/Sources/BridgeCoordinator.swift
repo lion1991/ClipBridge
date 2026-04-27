@@ -1,4 +1,3 @@
-import AVFoundation
 import Combine
 import UIKit
 // Swift glue from clipbridge_core.swift is compiled into this same target,
@@ -13,10 +12,13 @@ enum BridgeStatus: Equatable {
     case error(String)
 }
 
-/// Singleton owning the Rust `Client`, the pasteboard polling, and the
-/// background-audio session that keeps us awake on TrollStore-signed
-/// installs (private entitlements would obviate the audio trick, but the
-/// silent-loop keeps the app alive even on stricter sandboxes).
+/// Foreground-only sync coordinator for the main ClipBridge app.
+///
+/// We deliberately don't fight iOS's background-suspension model here. While
+/// the main app is foregrounded, this connects to the relay and polls the
+/// pasteboard the same way every other client does; on backgrounding it
+/// tears the client down. Long-running cross-app sync is the keyboard
+/// extension's job — it has runtime whenever the user is typing.
 final class BridgeCoordinator: ObservableObject {
     static let shared = BridgeCoordinator()
 
@@ -31,37 +33,31 @@ final class BridgeCoordinator: ObservableObject {
     // doing so would also block the user from re-copying the same text.
     private var lastChangeCount: Int = UIPasteboard.general.changeCount
 
-    private var audioPlayer: AVAudioPlayer?
-
     private init() {}
 
     func bootstrap() {
-        configureBackgroundAudio()
-        if let cfg = PairingStore.load() {
-            startCoordinator(with: cfg)
-            hasPairing = true
-        } else {
-            status = .notPaired
-            hasPairing = false
-        }
+        hasPairing = PairingStore.load() != nil
+        status = hasPairing ? .disconnected : .notPaired
     }
 
     func applicationDidBecomeActive() {
-        // The audio session can be deactivated by iOS when we lose audio
-        // focus (incoming call, Siri, etc.). Re-arming it here guarantees we
-        // get background runtime again on the next backgrounding.
-        reactivateAudioSession()
+        guard let cfg = PairingStore.load() else {
+            stopSync()
+            hasPairing = false
+            status = .notPaired
+            return
+        }
+        hasPairing = true
+        startSync(with: cfg)
+    }
 
-        // Coming back to foreground is the perfect moment to drain pasteboard
-        // changes that may have happened while we were truly suspended.
-        checkPasteboard()
-
-        // If the bridge is alive but missed broadcasts during a suspension
-        // (eg. iOS killed the audio session and we lost runtime), this pulls
-        // anything still in the relay's 5-min cache. Cheap belt-and-braces;
-        // the relay also sends Recent automatically on every reconnect, so
-        // the worst case here is a duplicate write to the pasteboard.
-        try? client?.fetchRecent()
+    func applicationDidEnterBackground() {
+        // Keyboard extension takes over from here whenever the user types in
+        // any app. Nothing to keep alive in the main app.
+        stopSync()
+        if hasPairing {
+            status = .disconnected
+        }
     }
 
     // MARK: - Pairing lifecycle
@@ -69,18 +65,18 @@ final class BridgeCoordinator: ObservableObject {
     func savePairing(_ cfg: PairingConfig) {
         PairingStore.save(cfg)
         hasPairing = true
-        startCoordinator(with: cfg)
+        startSync(with: cfg)
     }
 
     func resetPairing() {
-        stopCoordinator()
+        stopSync()
         PairingStore.clear()
         hasPairing = false
         status = .notPaired
     }
 
-    private func startCoordinator(with cfg: PairingConfig) {
-        stopCoordinator()
+    private func startSync(with cfg: PairingConfig) {
+        stopSync()
         guard let key = cfg.keyData else {
             status = .error("密钥无效")
             return
@@ -103,7 +99,7 @@ final class BridgeCoordinator: ObservableObject {
         startPolling()
     }
 
-    private func stopCoordinator() {
+    private func stopSync() {
         pollTimer?.invalidate()
         pollTimer = nil
         client?.stop()
@@ -160,118 +156,6 @@ final class BridgeCoordinator: ObservableObject {
             case .disconnected: self.status = .disconnected
             case .error(let message): self.status = .error(message)
             }
-        }
-    }
-
-    // MARK: - Background audio (keeps us alive when iOS would otherwise suspend)
-
-    private func configureBackgroundAudio() {
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(
-                .playback,
-                mode: .default,
-                options: [.mixWithOthers, .allowBluetooth]
-            )
-            try session.setActive(true)
-        } catch {
-            // Not fatal — TrollStore entitlements alone may keep us alive.
-            return
-        }
-        observeAudioInterruptions()
-        playSilentLoop()
-    }
-
-    /// Without this, a phone call / Siri / another music app interrupts our
-    /// session, iOS pauses the silent loop, and we silently lose all
-    /// background runtime from then on. Resuming on `.ended` re-acquires it.
-    private func observeAudioInterruptions() {
-        let nc = NotificationCenter.default
-        nc.addObserver(
-            self,
-            selector: #selector(handleAudioInterruption(_:)),
-            name: AVAudioSession.interruptionNotification,
-            object: nil
-        )
-        nc.addObserver(
-            self,
-            selector: #selector(handleAudioRouteChange(_:)),
-            name: AVAudioSession.routeChangeNotification,
-            object: nil
-        )
-    }
-
-    @objc private func handleAudioInterruption(_ note: Notification) {
-        guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-              let type = AVAudioSession.InterruptionType(rawValue: raw)
-        else { return }
-        if type == .ended {
-            reactivateAudioSession()
-            audioPlayer?.play()
-        }
-    }
-
-    @objc private func handleAudioRouteChange(_ note: Notification) {
-        // Headphone unplug / Bluetooth disconnect can stop the player. Just
-        // kick it back to playing — `.mixWithOthers` means it never grabbed
-        // the route exclusively, so this is non-disruptive.
-        if audioPlayer?.isPlaying == false {
-            reactivateAudioSession()
-            audioPlayer?.play()
-        }
-    }
-
-    private func reactivateAudioSession() {
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setActive(true, options: [])
-        } catch {
-            // Best-effort; nothing actionable on failure.
-        }
-    }
-
-    private func playSilentLoop() {
-        // Generate ~0.5s of silent PCM and play on infinite loop. The audio
-        // session being active under .playback category is what actually
-        // earns us the background runtime; the audio data being silent is
-        // both ethical and unobtrusive.
-        let sampleRate = 22_050.0
-        let durationSeconds = 0.5
-        let frameCount = AVAudioFrameCount(sampleRate * durationSeconds)
-        guard
-            let format = AVAudioFormat(
-                standardFormatWithSampleRate: sampleRate,
-                channels: 1
-            ),
-            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)
-        else { return }
-        buffer.frameLength = frameCount
-        if let data = buffer.floatChannelData?[0] {
-            for i in 0..<Int(frameCount) { data[i] = 0 }
-        }
-
-        // AVAudioPlayer wants a file URL — write a tiny WAV to a temp file.
-        let tmpURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("clipbridge-silence.wav")
-        if !FileManager.default.fileExists(atPath: tmpURL.path) {
-            do {
-                let file = try AVAudioFile(forWriting: tmpURL, settings: format.settings)
-                try file.write(from: buffer)
-            } catch {
-                return
-            }
-        }
-        do {
-            audioPlayer = try AVAudioPlayer(contentsOf: tmpURL)
-            audioPlayer?.numberOfLoops = -1
-            // iOS treats `volume == 0` as "not really playing" and may suspend
-            // us anyway. A vanishingly small non-zero value keeps the audio
-            // session genuinely active without being audible. The buffer is
-            // silent regardless, so this stays inaudible end-to-end.
-            audioPlayer?.volume = 0.0001
-            audioPlayer?.play()
-        } catch {
-            return
         }
     }
 }
