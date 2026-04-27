@@ -31,6 +31,11 @@ services:
     environment:
       RUST_LOG: "info"
       CLIPBRIDGE_BIND: "0.0.0.0:8787"
+      # Image blob retention. Defaults are 5 min / 256 MB, but the iPhone
+      # can sit on a stale meta and try to fetch it ~10 min later (background
+      # → foreground, network blip + reconnect, etc.) and would otherwise
+      # see "图片已过期". 30 min gives plenty of grace at modest memory cost.
+      CLIPBRIDGE_BLOB_TTL_SECS: "1800"
     ports:
       # Exposed publicly. Override host-side port (left of colon) if 8787
       # collides with something else on the box.

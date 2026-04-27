@@ -77,6 +77,50 @@ func sha256Hex(_ s: String) -> String {
     sha256Hex(Data(s.utf8))
 }
 
+/// Pixel-content hash for image bytes — invariant to encoder differences.
+/// Decodes the image, draws it into a known 32-bit RGBA bitmap, hashes that.
+///
+/// Why not just hash the file bytes? PNG / JPEG / HEIC all have multiple
+/// valid encodings of the same pixel grid (different compression levels,
+/// metadata blocks, idat chunk sizes). Apple's Universal Clipboard appears
+/// to round-trip images through CoreImage on at least one hop, producing
+/// byte-different but pixel-identical files. Without pixel hashing, our
+/// dedup misses the UC echo and we publish the "same" image as if it were
+/// new — visible as duplicate rows in the transfer window's recent lists.
+///
+/// Cost: one decode + one CGContext draw + sha256 of W·H·4 bytes. For a
+/// typical 1MP screenshot ~10ms; for a full-screen 14" MBP retina image
+/// ~80ms. Acceptable at our 0.5Hz poll cadence.
+func imagePixelHashHex(_ data: Data) -> String? {
+    guard let rep = NSBitmapImageRep(data: data),
+          let cg = rep.cgImage
+    else { return nil }
+    let width = cg.width
+    let height = cg.height
+    guard width > 0, height > 0 else { return nil }
+    let bytesPerRow = width * 4
+    var buffer = Data(count: height * bytesPerRow)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bitmapInfo: UInt32 =
+        CGImageAlphaInfo.premultipliedLast.rawValue
+        | CGBitmapInfo.byteOrder32Big.rawValue
+    let drewOK: Bool = buffer.withUnsafeMutableBytes { raw -> Bool in
+        guard let ctx = CGContext(
+            data: raw.baseAddress,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else { return false }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return true
+    }
+    guard drewOK else { return nil }
+    return sha256Hex(buffer)
+}
+
 final class BridgeCoordinator: ObservableObject {
     private let config: PairingConfig
     private let onStateChange: (BridgeStatus) -> Void
@@ -103,6 +147,11 @@ final class BridgeCoordinator: ObservableObject {
     @Published private(set) var receivedImages: [ImageHistoryEntry] = []
     @Published private(set) var sentImages: [ImageHistoryEntry] = []
     private static let imageHistoryLimit = 12
+
+    /// Most recent ConnectionState — used to revert after a transient error
+    /// auto-clears. See `showTransientError`.
+    private var lastConnectionStatus: BridgeStatus = .disconnected
+    private var transientErrorToken: UInt64 = 0
 
     private static let deviceId: String = {
         let key = "com.clipbridge.device_id"
@@ -168,7 +217,10 @@ final class BridgeCoordinator: ObservableObject {
         // Image first: screenshots set both image and text reps, but the
         // user pretty much always wants the picture, not its filename.
         if let image = readClipboardImage() {
-            let h = sha256Hex(image.bytes)
+            // Pixel hash, not byte hash — see `imagePixelHashHex` for why.
+            // Falls back to byte hash if decode somehow fails (kept just so
+            // the dedup path never silently lets the same bytes through).
+            let h = imagePixelHashHex(image.bytes) ?? sha256Hex(image.bytes)
             if seenHashes.contains(h) { return }
             seenHashes.insert(h)
             sendImage(image)
@@ -265,9 +317,7 @@ final class BridgeCoordinator: ObservableObject {
                     ts: ts
                 )
             } catch {
-                DispatchQueue.main.async {
-                    self.onStateChange(.error("图片发送失败:\(error)"))
-                }
+                self.showTransientError("图片发送失败: \(self.friendlyErrorMessage(error))")
             }
         }
     }
@@ -299,6 +349,15 @@ final class BridgeCoordinator: ObservableObject {
         guard let client = self.client else { return }
         do {
             let bytes = try client.fetchImage(meta: meta)
+            let h = imagePixelHashHex(bytes) ?? sha256Hex(bytes)
+            // Same content already on our pasteboard / in our history — skip
+            // the write and the history append. Catches the UC bounce-back
+            // where iPhone re-encoded our image and broadcast it back.
+            if seenHashes.contains(h) {
+                seenHashes.insert(h)   // refresh TTL
+                return
+            }
+            seenHashes.insert(h)
             let entry = ImageHistoryEntry(
                 bytes: bytes,
                 mime: meta.mimeType,
@@ -315,13 +374,17 @@ final class BridgeCoordinator: ObservableObject {
             // don't want the pasteboard write to wait on it.
             autoSaveIfConfigured(entry)
         } catch {
-            DispatchQueue.main.async {
-                self.onStateChange(.error("图片接收失败:\(error)"))
-            }
+            showTransientError("图片接收失败: \(friendlyErrorMessage(error))")
         }
     }
 
     private func writeImage(_ data: Data) {
+        // Insert the pixel hash so the next poll's pixel-hash check still
+        // matches — and falls through to byte hash as a belt-and-suspenders
+        // for the case where the same bytes literally come back (no UC
+        // re-encoding) and the receive path's pixel-hash already sat in
+        // the set.
+        if let ph = imagePixelHashHex(data) { seenHashes.insert(ph) }
         seenHashes.insert(sha256Hex(data))
         let pb = NSPasteboard.general
         pb.clearContents()
@@ -349,7 +412,37 @@ final class BridgeCoordinator: ObservableObject {
         case .disconnected: .disconnected
         case .error(let message): .error(message)
         }
-        DispatchQueue.main.async { self.onStateChange(mapped) }
+        DispatchQueue.main.async {
+            self.lastConnectionStatus = mapped
+            self.onStateChange(mapped)
+        }
+    }
+
+    /// Show a non-fatal error, then auto-revert to the last known WS state.
+    /// For hiccups (stale blob refs, single failed send) — sticky errors
+    /// would make the menu-bar look perpetually broken even after recovery.
+    private func showTransientError(_ message: String, seconds: TimeInterval = 4) {
+        DispatchQueue.main.async {
+            self.transientErrorToken &+= 1
+            let token = self.transientErrorToken
+            self.onStateChange(.error(message))
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+                guard let self else { return }
+                guard self.transientErrorToken == token else { return }
+                self.onStateChange(self.lastConnectionStatus)
+            }
+        }
+    }
+
+    private func friendlyErrorMessage(_ error: Error) -> String {
+        let text = String(describing: error)
+        if text.contains("BlobNotFound") {
+            return "图片已过期 (relay 默认 5 分钟保留, 请源设备重新复制)"
+        }
+        if text.contains("BlobTooLarge") {
+            return "图片超过 relay 单条上限"
+        }
+        return text
     }
 
     // MARK: - Image history & auto-save

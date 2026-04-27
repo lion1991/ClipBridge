@@ -24,6 +24,8 @@ services:
     environment:
       RUST_LOG: "info"
       CLIPBRIDGE_BIND: "0.0.0.0:8787"
+      # See deploy/docker-compose.yml for why we override the default 5min.
+      CLIPBRIDGE_BLOB_TTL_SECS: "1800"
     ports:
       # Bind to loopback only — the reverse proxy fronts public traffic.
       # If you prefer to expose directly, change to "8787:8787".
