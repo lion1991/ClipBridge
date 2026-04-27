@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var coordinator: BridgeCoordinator?
     private var pairingWindow: NSWindow?
+    private var imageWindow: NSWindow?
     private var autostartItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -23,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "状态:未配对", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(makeItem("图片传输…", #selector(showImageTransfer), key: "i"))
         menu.addItem(makeItem("打开配对窗口…", #selector(showPairing), key: "p"))
         menu.addItem(makeItem("重置配对", #selector(resetPairing), key: ""))
         menu.addItem(NSMenuItem.separator())
@@ -79,11 +81,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func resetPairing() {
+        coordinator?.clearImageHistory()
         coordinator?.stop()
         coordinator = nil
         PairingStore.clear()
         applyStatus(.notPaired)
         showPairing()
+    }
+
+    @objc private func showImageTransfer() {
+        guard let coord = coordinator else {
+            // No active client = pairing is missing or hasn't connected yet.
+            // Nudge the user toward pairing first instead of opening an
+            // empty image window with no way to send.
+            let alert = NSAlert()
+            alert.messageText = "未配对"
+            alert.informativeText = "请先在「打开配对窗口…」完成扫码配对, 才能使用图片传输。"
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "打开配对窗口…")
+            alert.addButton(withTitle: "取消")
+            if alert.runModal() == .alertFirstButtonReturn {
+                showPairing()
+            }
+            return
+        }
+        if imageWindow == nil {
+            let win = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 520, height: 640),
+                styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                backing: .buffered,
+                defer: false
+            )
+            win.title = "ClipBridge · 图片传输"
+            win.isReleasedWhenClosed = false
+            win.center()
+            imageWindow = win
+        }
+        guard let win = imageWindow else { return }
+        win.contentViewController = NSHostingController(
+            rootView: ImageTransferView(coordinator: coord)
+        )
+        NSApp.activate(ignoringOtherApps: true)
+        win.makeKeyAndOrderFront(nil)
     }
 
     @objc private func quit() {

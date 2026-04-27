@@ -77,7 +77,7 @@ func sha256Hex(_ s: String) -> String {
     sha256Hex(Data(s.utf8))
 }
 
-final class BridgeCoordinator {
+final class BridgeCoordinator: ObservableObject {
     private let config: PairingConfig
     private let onStateChange: (BridgeStatus) -> Void
     private var client: Client?
@@ -95,6 +95,14 @@ final class BridgeCoordinator {
     /// publish and on receive-write so the next poll round skips both our
     /// own echoes and Universal Clipboard duplicates.
     private let seenHashes = RecentHashes()
+
+    /// Image traffic history surfaced to the dedicated transfer window.
+    /// Newest first, capped at `imageHistoryLimit`. Only includes binary
+    /// image clips (text is not surfaced — the menu-bar app doesn't have
+    /// a text history view today).
+    @Published private(set) var receivedImages: [ImageHistoryEntry] = []
+    @Published private(set) var sentImages: [ImageHistoryEntry] = []
+    private static let imageHistoryLimit = 12
 
     private static let deviceId: String = {
         let key = "com.clipbridge.device_id"
@@ -190,6 +198,42 @@ final class BridgeCoordinator {
         }
     }
 
+    /// Public entry point for the image-transfer window: send raw image
+    /// bytes that the user explicitly handed us (drag-drop or file picker)
+    /// without round-tripping through the system pasteboard. Returns
+    /// synchronously after queueing — the actual upload happens off the
+    /// caller's thread.
+    func sendImageFromFile(at url: URL) {
+        do {
+            let bytes = try Data(contentsOf: url)
+            guard let image = NSImage(data: bytes) else {
+                onStateChange(.error("无法解码 \(url.lastPathComponent)"))
+                return
+            }
+            // Re-encode to PNG so receivers don't need a HEIC/TIFF/etc
+            // decoder. Skip when the source is already PNG to avoid a
+            // pointless decode→encode round trip that changes bytes.
+            let (pngBytes, mime): (Data, String) = {
+                if url.pathExtension.lowercased() == "png" { return (bytes, "image/png") }
+                if let rep = NSBitmapImageRep(data: bytes),
+                   let png = rep.representation(using: .png, properties: [:])
+                {
+                    return (png, "image/png")
+                }
+                return (bytes, "application/octet-stream")
+            }()
+            let clip = ClipboardImage(
+                bytes: pngBytes,
+                mime: mime,
+                width: UInt32(image.size.width.rounded()),
+                height: UInt32(image.size.height.rounded())
+            )
+            sendImage(clip)
+        } catch {
+            onStateChange(.error("读取失败:\(error.localizedDescription)"))
+        }
+    }
+
     private func sendImage(_ image: ClipboardImage) {
         guard image.bytes.count <= maxImageBytes else {
             let mb = image.bytes.count / 1024 / 1024
@@ -198,6 +242,17 @@ final class BridgeCoordinator {
         }
         let deviceName = Self.deviceName
         let ts = nowMillis()
+        // Surface in the sent-history list immediately so the transfer
+        // window's row appears before the upload finishes (often takes a
+        // second or two for a multi-MB image on slow uplinks).
+        appendSent(ImageHistoryEntry(
+            bytes: image.bytes,
+            mime: image.mime,
+            width: image.width,
+            height: image.height,
+            deviceName: deviceName,
+            ts: ts
+        ))
         blobQueue.async { [weak self] in
             guard let self, let client = self.client else { return }
             do {
@@ -224,7 +279,7 @@ final class BridgeCoordinator {
         case .image:
             guard let meta = payload.image else { return }
             blobQueue.async { [weak self] in
-                self?.fetchAndPasteImage(meta: meta)
+                self?.fetchAndPasteImage(payload: payload, meta: meta)
             }
         }
     }
@@ -240,11 +295,25 @@ final class BridgeCoordinator {
         lastChangeCount = pb.changeCount
     }
 
-    private func fetchAndPasteImage(meta: ImageMeta) {
+    private func fetchAndPasteImage(payload: ClipPayload, meta: ImageMeta) {
         guard let client = self.client else { return }
         do {
             let bytes = try client.fetchImage(meta: meta)
-            DispatchQueue.main.async { self.writeImage(bytes) }
+            let entry = ImageHistoryEntry(
+                bytes: bytes,
+                mime: meta.mimeType,
+                width: meta.width,
+                height: meta.height,
+                deviceName: payload.deviceName,
+                ts: payload.ts
+            )
+            DispatchQueue.main.async {
+                self.writeImage(bytes)
+                self.appendReceived(entry)
+            }
+            // Auto-save outside the main queue — file I/O is sync and we
+            // don't want the pasteboard write to wait on it.
+            autoSaveIfConfigured(entry)
         } catch {
             DispatchQueue.main.async {
                 self.onStateChange(.error("图片接收失败:\(error)"))
@@ -281,6 +350,117 @@ final class BridgeCoordinator {
         case .error(let message): .error(message)
         }
         DispatchQueue.main.async { self.onStateChange(mapped) }
+    }
+
+    // MARK: - Image history & auto-save
+
+    private func appendReceived(_ entry: ImageHistoryEntry) {
+        receivedImages.insert(entry, at: 0)
+        if receivedImages.count > Self.imageHistoryLimit {
+            receivedImages.removeLast(receivedImages.count - Self.imageHistoryLimit)
+        }
+    }
+
+    private func appendSent(_ entry: ImageHistoryEntry) {
+        DispatchQueue.main.async {
+            self.sentImages.insert(entry, at: 0)
+            if self.sentImages.count > Self.imageHistoryLimit {
+                self.sentImages.removeLast(self.sentImages.count - Self.imageHistoryLimit)
+            }
+        }
+    }
+
+    /// Drop the in-memory image lists. Called when the user resets pairing
+    /// — old images belong to the previous group and the new pairing should
+    /// start with a clean history.
+    func clearImageHistory() {
+        DispatchQueue.main.async {
+            self.receivedImages.removeAll()
+            self.sentImages.removeAll()
+        }
+    }
+
+    private func autoSaveIfConfigured(_ entry: ImageHistoryEntry) {
+        guard let folder = AppSettings.imageAutoSaveFolder else { return }
+        do {
+            try FileManager.default.createDirectory(
+                at: folder, withIntermediateDirectories: true
+            )
+            let url = folder.appendingPathComponent(entry.suggestedFilename)
+            try entry.bytes.write(to: url)
+        } catch {
+            DispatchQueue.main.async {
+                self.onStateChange(.error("自动保存失败:\(error.localizedDescription)"))
+            }
+        }
+    }
+}
+
+/// One image's worth of metadata + bytes for the transfer-window UI. Holds
+/// the full payload (capped at 12 entries to bound memory; a typical
+/// screenshot is <2 MB so the realistic ceiling is ~24 MB).
+struct ImageHistoryEntry: Identifiable, Equatable {
+    let id = UUID()
+    let bytes: Data
+    let mime: String
+    let width: UInt32
+    let height: UInt32
+    let deviceName: String
+    let ts: UInt64
+
+    static func == (lhs: ImageHistoryEntry, rhs: ImageHistoryEntry) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    var sizeLabel: String {
+        let kb = max(1, bytes.count / 1024)
+        return kb >= 1024
+            ? String(format: "%.1f MB", Double(kb) / 1024.0)
+            : "\(kb) KB"
+    }
+
+    var dimsLabel: String { "\(width)×\(height)" }
+
+    var date: Date { Date(timeIntervalSince1970: TimeInterval(ts) / 1000) }
+
+    /// Filesystem-safe suggested name with a stable ts prefix so files
+    /// listed in Finder sort the same way as the in-app history.
+    var suggestedFilename: String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = formatter.string(from: date)
+        let slug = deviceName
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: " ", with: "_")
+        let ext: String = {
+            switch mime {
+            case "image/png": return "png"
+            case "image/jpeg": return "jpg"
+            case "image/heic": return "heic"
+            default: return "img"
+            }
+        }()
+        return "ClipBridge-\(stamp)-\(slug).\(ext)"
+    }
+}
+
+/// Lightweight wrapper around UserDefaults for the menu-bar app's
+/// preferences. Currently just the auto-save target folder.
+enum AppSettings {
+    private static let autoSaveFolderKey = "imageAutoSaveFolder"
+
+    /// File-URL the user picked via the folder panel in the transfer
+    /// window. Stored as a string path; the unsandboxed Mac app can read
+    /// arbitrary paths so we don't need a security-scoped bookmark.
+    static var imageAutoSaveFolder: URL? {
+        get {
+            guard let s = UserDefaults.standard.string(forKey: autoSaveFolderKey),
+                  !s.isEmpty else { return nil }
+            return URL(fileURLWithPath: s, isDirectory: true)
+        }
+        set {
+            UserDefaults.standard.set(newValue?.path, forKey: autoSaveFolderKey)
+        }
     }
 }
 
