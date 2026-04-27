@@ -9,6 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pairingWindow: NSWindow?
     private var imageWindow: NSWindow?
     private var autostartItem: NSMenuItem!
+    /// Refreshes the "传输:..." menu item every 2s. The peer count comes
+    /// from the Rust `Client` and changes asynchronously when peers come
+    /// or go on the LAN, so a tight UI binding isn't worth the wiring.
+    private var transportTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -23,6 +27,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "状态:未配对", action: nil, keyEquivalent: ""))
+        // Transport status: shows "局域网:N 设备" when peers are connected
+        // via mDNS, "仅中继" otherwise. Refreshed by `transportTimer`.
+        menu.addItem(NSMenuItem(title: "传输:仅中继", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(makeItem("图片传输…", #selector(showImageTransfer), key: "i"))
         menu.addItem(makeItem("打开配对窗口…", #selector(showPairing), key: "p"))
@@ -41,10 +48,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             applyStatus(.notPaired)
             showPairing()
         }
+
+        // Start the transport poll. Common(.commonModes) keeps it firing
+        // while the menu is open — otherwise NSMenu's tracking runloop
+        // suspends our default-mode timer and the badge freezes mid-view.
+        let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.refreshTransportItem()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        transportTimer = timer
+        refreshTransportItem()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        transportTimer?.invalidate()
+        transportTimer = nil
         coordinator?.stop()
+    }
+
+    private func refreshTransportItem() {
+        let title: String
+        if coordinator == nil {
+            title = "传输:未配对"
+        } else {
+            let n = coordinator?.lanPeerCount ?? 0
+            title = n == 0 ? "传输:仅中继" : "传输:局域网 \(n) 设备"
+        }
+        statusItem.menu?.item(at: 1)?.title = title
     }
 
     @objc private func showPairing() {

@@ -151,6 +151,17 @@ cat >"$APP/Contents/Info.plist" <<PLIST
     <key>NSHumanReadableCopyright</key>      <string>© 2026 ClipBridge</string>
     <key>NSSupportsAutomaticTermination</key> <false/>
     <key>NSSupportsSuddenTermination</key>   <true/>
+    <!-- LAN peer discovery (mDNS / DNS-SD). macOS Sonoma+ requires both
+         a usage string and an explicit list of advertised service types
+         before the app is allowed to send/receive multicast on the local
+         network. Without these the user is never prompted and mDNS
+         silently fails — the app falls back to relay-only. -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>用于在同一局域网内发现其它 ClipBridge 设备并直连传输, 无需经过中继服务器。</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_clipbridge._tcp</string>
+    </array>
 </dict>
 </plist>
 PLIST

@@ -187,6 +187,14 @@ final class BridgeCoordinator: ObservableObject {
         self.onStateChange = onStateChange
     }
 
+    /// Number of LAN peers we currently have a direct mDNS-discovered TCP
+    /// session to. 0 means LAN didn't find anyone (or didn't start at all
+    /// because Local Network permission was declined). Drives the menu-bar
+    /// transport badge.
+    var lanPeerCount: UInt32 {
+        client?.lanPeerCount() ?? 0
+    }
+
     func start() {
         guard let key = config.keyData else {
             onStateChange(.error("密钥无效"))
