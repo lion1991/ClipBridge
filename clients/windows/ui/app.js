@@ -63,13 +63,13 @@ const PILL_CLASSES = ["pill-neutral", "pill-info", "pill-ok", "pill-error"];
 // Cached so the LAN-peer poll can re-render without losing the latest
 // state.kind from the bridge stream.
 let lastConnState = { kind: "idle" };
-let lastLanPeers = 0;
+let lastLanPeerNames = [];
 function setStatus(state) {
   lastConnState = state ?? { kind: "idle" };
   renderStatusPill();
 }
-function setLanPeers(n) {
-  lastLanPeers = n | 0;
+function setLanPeerNames(names) {
+  lastLanPeerNames = Array.isArray(names) ? names.slice().sort() : [];
   renderStatusPill();
 }
 function renderStatusPill() {
@@ -88,8 +88,8 @@ function renderStatusPill() {
       // Only annotate transport when actually connected — before that
       // the user cares about why the relay isn't up, not which lane
       // would have been used.
-      text = lastLanPeers > 0
-        ? `已连接 · 同步中 · 局域网 ${lastLanPeers}`
+      text = lastLanPeerNames.length > 0
+        ? `已连接 · 同步中 · 局域网 ${lastLanPeerNames.length} (${lastLanPeerNames.join(", ")})`
         : "已连接 · 同步中 · 仅中继";
       break;
     case "disconnected":
@@ -243,13 +243,13 @@ async function init() {
   await listen("connection-state", (evt) => setStatus(evt.payload));
   setStatus(await invoke("cmd_current_state"));
 
-  // LAN peer count: poll every 2s. Cheap (just an atomic load on the
-  // Rust side) and the LAN topology doesn't change fast enough to need
-  // event-driven plumbing here.
+  // LAN peer names: poll every 2s. Cheap (atomic + small HashMap snapshot
+  // on the Rust side) and the LAN topology doesn't change fast enough to
+  // need event-driven plumbing here.
   const pollLanPeers = async () => {
     try {
-      const n = await invoke("cmd_lan_peer_count");
-      setLanPeers(typeof n === "number" ? n : 0);
+      const names = await invoke("cmd_lan_peer_names");
+      setLanPeerNames(names);
     } catch (e) {
       // Bridge not started yet — keep the previous value.
     }
