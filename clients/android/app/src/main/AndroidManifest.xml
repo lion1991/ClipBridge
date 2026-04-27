@@ -24,6 +24,21 @@
             android:exported="true"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
+        <!-- FileProvider exposes received image bytes as a content:// URI so
+             we can hand them to ClipboardManager via ClipData.newUri. iOS
+             apps and Mac don't need this dance because their pasteboards
+             accept raw bytes; Android's clipboard can only carry items as
+             text, html, intents, or URIs. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

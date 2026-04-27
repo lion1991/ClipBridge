@@ -2,6 +2,7 @@ package com.clipbridge
 
 import android.content.ClipData
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.IBinder
 import android.util.Log
 import rikka.shizuku.Shizuku
@@ -83,11 +84,19 @@ object ShizukuBridge {
         Shizuku.requestPermission(requestCode)
     }
 
+    /** Return type of `readPrimaryClip` — exactly one of text or imageUri. */
+    sealed class Clip {
+        data class Text(val value: String) : Clip()
+        data class ImageUri(val uri: Uri) : Clip()
+    }
+
     /**
-     * Read the current primary clipboard's text. Returns null when Shizuku
-     * isn't authorized, the clipboard is empty, or the reflected call fails.
+     * Read the current primary clipboard. Distinguishes text from image URIs
+     * so the caller can route to the right pipeline. Returns null when
+     * Shizuku isn't authorized, the clipboard is empty, or the reflected
+     * call fails.
      */
-    fun readPrimaryClipText(): String? {
+    fun readPrimaryClip(): Clip? {
         if (state() != State.READY) return null
         return runCatching {
             val rawBinder = SystemServiceHelper.getSystemService("clipboard")
@@ -95,9 +104,13 @@ object ShizukuBridge {
             val proxy: IBinder = ShizukuBinderWrapper(rawBinder)
             val clipboard: Any = asInterface(proxy) ?: return@runCatching null
             val clip = invokeGetPrimaryClip(clipboard) ?: return@runCatching null
-            extractText(clip)
-        }.onFailure { Log.w(TAG, "readPrimaryClipText failed", it) }.getOrNull()
+            extractClip(clip)
+        }.onFailure { Log.w(TAG, "readPrimaryClip failed", it) }.getOrNull()
     }
+
+    /** Convenience for the text-only path that pre-existed the image work. */
+    fun readPrimaryClipText(): String? =
+        (readPrimaryClip() as? Clip.Text)?.value
 
     private fun asInterface(binder: IBinder): Any? {
         val stubClass = Class.forName("android.content.IClipboard\$Stub")
@@ -151,13 +164,27 @@ object ShizukuBridge {
         return null
     }
 
-    private fun extractText(clip: ClipData): String? {
+    /**
+     * Distinguish text vs image-URI without a Context. ClipDescription's
+     * mime types are the canonical signal — anything starting with
+     * `image/` indicates the Item carries a URI we can openInputStream
+     * on (with proper permission handed off to the caller).
+     */
+    private fun extractClip(clip: ClipData): Clip? {
         if (clip.itemCount == 0) return null
         val item = clip.getItemAt(0) ?: return null
-        // No Context here — coerceToText needs one for HtmlConverter, so we
-        // settle for plain text + URI fallback.
-        return item.text?.toString()
+        val desc = clip.description
+        // Image: any image-typed mime → return the URI.
+        for (i in 0 until desc.mimeTypeCount) {
+            if (desc.getMimeType(i).startsWith("image/")) {
+                val uri = item.uri ?: continue
+                return Clip.ImageUri(uri)
+            }
+        }
+        // Text path — same fallbacks as before.
+        val text = item.text?.toString()
             ?: item.htmlText
             ?: item.uri?.toString()
+        return text?.let { Clip.Text(it) }
     }
 }

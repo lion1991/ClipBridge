@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider roots for ClipBridge.
+
+  We expose only the cache subdirectory `clipbridge_images/` so image
+  payloads we receive from peers can be handed to the system clipboard as
+  content:// URIs. Cache files are GC'd by Android under storage pressure;
+  we don't need to keep them past the user's next paste.
+-->
+<paths>
+    <cache-path name="clipbridge_images" path="clipbridge_images/" />
+</paths>

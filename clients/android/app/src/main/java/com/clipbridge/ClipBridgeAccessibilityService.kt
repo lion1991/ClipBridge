@@ -26,6 +26,7 @@ import uniffi.clipbridge_core.ClipKind
 import uniffi.clipbridge_core.ClipListener
 import uniffi.clipbridge_core.ClipPayload
 import uniffi.clipbridge_core.ConnectionState
+import uniffi.clipbridge_core.ImageMeta
 
 /**
  * Two paths to picking up clipboard changes on Android 10+, where background
@@ -62,6 +63,20 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     @Volatile private var lastPublishedAt: Long = 0L
     private var lastSelection: String? = null
     private var lastSelectionAt: Long = 0L
+
+    // Image-side dedup. Pixel-content hash of every image we've sent or
+    // received recently — used to drop both our own write echoes (the
+    // listener fires after we put the image on the clipboard) and any
+    // re-encoded duplicates the system might produce when ferrying URIs
+    // through ContentResolver. Bounded so a long-running session can't
+    // grow it unbounded; entries beyond capacity get LRU-evicted.
+    private val recentImageHashes = LinkedHashSet<String>()
+    private val recentImageHashesCap = 32
+    // Last image URI we observed via the Shizuku poller, dedup'd by URI
+    // string. Tracks "is this the same clip we already saw?" between
+    // ticks; cross-source dedup with the listener happens in publishImage
+    // via `recentImageHashes`.
+    private var lastPolledImageUri: String? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var pollerJob: Job? = null
@@ -100,9 +115,9 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             Log.i(TAG, "shizuku poller starting, initial state=${ShizukuBridge.state()}")
             var lastLoggedState: ShizukuBridge.State? = null
             var tickCount = 0
-            // Poll-local change detection: only act when the read text differs
+            // Poll-local change detection: only act when the read content differs
             // from what we saw last tick. Cross-source dedupe with the clipboard
-            // listener and copy toast happens inside `publish()`.
+            // listener and copy toast happens inside `publish*()`.
             var lastPolledText: String? = null
             while (isActive) {
                 val state = ShizukuBridge.state()
@@ -111,16 +126,36 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
                     lastLoggedState = state
                 }
                 if (state == ShizukuBridge.State.READY) {
-                    val text = ShizukuBridge.readPrimaryClipText()
+                    val clip = ShizukuBridge.readPrimaryClip()
                     if (++tickCount % 10 == 0) {
-                        Log.d(TAG, "shizuku tick $tickCount: text len=${text?.length ?: -1}")
+                        Log.d(TAG, "shizuku tick $tickCount: clip=$clip")
                     }
-                    if (!text.isNullOrEmpty() && text != lastPolledText) {
-                        lastPolledText = text
-                        withContext(Dispatchers.Main) {
-                            Log.i(TAG, "shizuku read NEW: ${text.length} chars")
-                            publish(text)
+                    when (clip) {
+                        is ShizukuBridge.Clip.Text -> {
+                            val text = clip.value
+                            if (text.isNotEmpty() && text != lastPolledText) {
+                                lastPolledText = text
+                                withContext(Dispatchers.Main) {
+                                    Log.i(TAG, "shizuku read NEW text: ${text.length} chars")
+                                    publish(text)
+                                }
+                            }
                         }
+                        is ShizukuBridge.Clip.ImageUri -> {
+                            val key = clip.uri.toString()
+                            if (key != lastPolledImageUri) {
+                                lastPolledImageUri = key
+                                Log.i(TAG, "shizuku read NEW image uri: $key")
+                                val outbound = ImagePipeline.outboundFromUri(
+                                    this@ClipBridgeAccessibilityService,
+                                    clip.uri,
+                                )
+                                if (outbound != null) {
+                                    withContext(Dispatchers.Main) { publishImage(outbound) }
+                                }
+                            }
+                        }
+                        null -> { /* Shizuku not ready or read failed */ }
                     }
                 }
                 delay(POLL_INTERVAL_MS)
@@ -232,6 +267,25 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         val cb = clipboard ?: return
         val cd = cb.primaryClip ?: return
         if (cd.itemCount == 0) return
+
+        // Image first: if the description advertises any image/* mime, take
+        // that path. coerceToText on an image clip returns the URI as a
+        // string, which we don't want to ship as a text clip.
+        val desc = cd.description
+        for (i in 0 until desc.mimeTypeCount) {
+            if (desc.getMimeType(i).startsWith("image/")) {
+                val uri = cd.getItemAt(0).uri ?: return
+                scope.launch(Dispatchers.IO) {
+                    val outbound = ImagePipeline.outboundFromUri(
+                        this@ClipBridgeAccessibilityService,
+                        uri,
+                    ) ?: return@launch
+                    withContext(Dispatchers.Main) { publishImage(outbound) }
+                }
+                return
+            }
+        }
+
         val text = cd.getItemAt(0).coerceToText(this).toString()
         if (text.isEmpty()) return
         publish(text)
@@ -257,6 +311,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             content = text,
             deviceName = android.os.Build.MODEL ?: "Android",
             ts = System.currentTimeMillis().toULong(),
+            image = null,
         )
         try {
             client?.sendClip(payload)
@@ -264,6 +319,67 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         } catch (t: Throwable) {
             Log.e(TAG, "sendClip failed", t)
         }
+    }
+
+    /**
+     * Image counterpart to `publish(text)`. Hash-dedups against
+     * `recentImageHashes` so:
+     *   - We don't republish what we just wrote ourselves on receive
+     *     (`writeImageBytesToClipboard` inserts the hash before setPrimaryClip).
+     *   - Multiple sources (clipboard listener, Shizuku poller) firing for
+     *     the same user copy collapse to one publish.
+     */
+    private fun publishImage(outbound: ImagePipeline.Outbound) {
+        if (outbound.bytes.size > ImagePipeline.MAX_IMAGE_BYTES) {
+            val mb = outbound.bytes.size / 1024 / 1024
+            Log.w(TAG, "image ${mb}MB exceeds ${ImagePipeline.MAX_IMAGE_BYTES} bytes, skipping")
+            return
+        }
+        val h = ImagePipeline.pixelHashHex(outbound.bytes)
+            ?: ImagePipeline.sha256Hex(outbound.bytes)
+        if (rememberImageHash(h)) {
+            Log.i(TAG, "skip image: matches recent hash")
+            return
+        }
+        val deviceName = android.os.Build.MODEL ?: "Android"
+        val ts = System.currentTimeMillis().toULong()
+        scope.launch(Dispatchers.IO) {
+            try {
+                client?.sendImage(
+                    imageBytes = outbound.bytes,
+                    mimeType = outbound.mime,
+                    width = outbound.width,
+                    height = outbound.height,
+                    deviceName = deviceName,
+                    ts = ts,
+                )
+                Log.i(TAG, "published image (${outbound.bytes.size}B, " +
+                    "${outbound.width}×${outbound.height})")
+            } catch (t: Throwable) {
+                Log.e(TAG, "sendImage failed", t)
+            }
+        }
+    }
+
+    /**
+     * Insert into the bounded LRU `recentImageHashes`. Returns true if the
+     * hash was already present (so the caller knows to skip), false if
+     * this is a new hash and we just inserted it.
+     */
+    @Synchronized
+    private fun rememberImageHash(hash: String): Boolean {
+        if (recentImageHashes.contains(hash)) {
+            // Refresh recency.
+            recentImageHashes.remove(hash)
+            recentImageHashes.add(hash)
+            return true
+        }
+        recentImageHashes.add(hash)
+        while (recentImageHashes.size > recentImageHashesCap) {
+            val oldest = recentImageHashes.iterator().next()
+            recentImageHashes.remove(oldest)
+        }
+        return false
     }
 
     private fun startClient() {
@@ -312,13 +428,57 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     }
 
     private fun handleRemoteClip(payload: ClipPayload) {
-        if (payload.kind != ClipKind.TEXT) return
-        Log.i(TAG, "remote clip received (${payload.content.length} chars)")
-        // Mark as expected echo *before* writing so the resulting
-        // OnPrimaryClipChangedListener / Shizuku tick recognises it.
-        expectedEcho = payload.content
-        expectedEchoAt = System.currentTimeMillis()
-        clipboard?.setPrimaryClip(ClipData.newPlainText("ClipBridge", payload.content))
+        when (payload.kind) {
+            ClipKind.TEXT -> {
+                Log.i(TAG, "remote text clip (${payload.content.length} chars)")
+                // Mark as expected echo *before* writing so the resulting
+                // OnPrimaryClipChangedListener / Shizuku tick recognises it.
+                expectedEcho = payload.content
+                expectedEchoAt = System.currentTimeMillis()
+                clipboard?.setPrimaryClip(
+                    ClipData.newPlainText("ClipBridge", payload.content)
+                )
+            }
+            ClipKind.IMAGE -> handleRemoteImage(payload)
+        }
+    }
+
+    private fun handleRemoteImage(payload: ClipPayload) {
+        val meta = payload.image
+        if (meta == null) {
+            Log.w(TAG, "image clip missing meta, skipping")
+            return
+        }
+        Log.i(TAG, "remote image clip (${meta.width}×${meta.height}, ${meta.sizeBytes}B)")
+        scope.launch(Dispatchers.IO) {
+            val bytes = try {
+                client?.fetchImage(meta)
+            } catch (t: Throwable) {
+                Log.w(TAG, "fetchImage failed: ${t.message}")
+                null
+            } ?: return@launch
+
+            val h = ImagePipeline.pixelHashHex(bytes) ?: ImagePipeline.sha256Hex(bytes)
+            if (rememberImageHash(h)) {
+                // Already on the clipboard from an earlier path (e.g. our
+                // own poll picked up the same image moments ago). Skip
+                // the redundant write — clobbering would just bump
+                // changeCount for nothing.
+                Log.i(TAG, "skip remote image: matches recent hash")
+                return@launch
+            }
+            withContext(Dispatchers.Main) {
+                val cb = clipboard ?: return@withContext
+                val ok = ImagePipeline.writeImageToClipboard(
+                    cb,
+                    this@ClipBridgeAccessibilityService,
+                    bytes,
+                    meta.mimeType,
+                )
+                if (!ok) Log.w(TAG, "writeImageToClipboard returned false")
+                else Log.i(TAG, "wrote remote image to clipboard")
+            }
+        }
     }
 
     companion object {
