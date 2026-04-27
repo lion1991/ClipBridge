@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Share
@@ -361,6 +362,18 @@ private fun PairingScreen(
                         )
                     }
                 },
+                onCopyToClipboard = { entry ->
+                    val cb = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                        as android.content.ClipboardManager
+                    val ok = ImagePipeline.writeImageToClipboard(
+                        cb, context, entry.bytes, entry.mime,
+                    )
+                    scope.launch {
+                        snackbarHostState.showSnackbar(
+                            if (ok) "已复制到剪切板, 可在其它 app 粘贴" else "复制失败"
+                        )
+                    }
+                },
                 onShare = { entry -> shareImage(context, entry) },
             )
         }
@@ -439,6 +452,7 @@ private fun ImagesTabContent(
     history: List<ImageHistoryEntry>,
     onPickFromGallery: () -> Unit,
     onSaveToGallery: (ImageHistoryEntry) -> Unit,
+    onCopyToClipboard: (ImageHistoryEntry) -> Unit,
     onShare: (ImageHistoryEntry) -> Unit,
 ) {
     Column(
@@ -489,6 +503,7 @@ private fun ImagesTabContent(
             onPickFromGallery = onPickFromGallery,
             showPicker = true,
             onSaveToGallery = onSaveToGallery,
+            onCopyToClipboard = onCopyToClipboard,
             onShare = onShare,
         )
         ImageTransferCard(
@@ -498,6 +513,7 @@ private fun ImagesTabContent(
             onPickFromGallery = onPickFromGallery,
             showPicker = false,
             onSaveToGallery = onSaveToGallery,
+            onCopyToClipboard = onCopyToClipboard,
             onShare = onShare,
         )
     }
@@ -888,6 +904,7 @@ private fun ImageTransferCard(
     /// appear twice (would be confusing — it's the same action either way).
     showPicker: Boolean,
     onSaveToGallery: (ImageHistoryEntry) -> Unit,
+    onCopyToClipboard: (ImageHistoryEntry) -> Unit,
     onShare: (ImageHistoryEntry) -> Unit,
 ) {
     Card(
@@ -934,6 +951,7 @@ private fun ImageTransferCard(
                         ImageThumbCell(
                             entry = entry,
                             onSave = { onSaveToGallery(entry) },
+                            onCopy = { onCopyToClipboard(entry) },
                             onShare = { onShare(entry) },
                         )
                     }
@@ -947,6 +965,7 @@ private fun ImageTransferCard(
 private fun ImageThumbCell(
     entry: ImageHistoryEntry,
     onSave: () -> Unit,
+    onCopy: () -> Unit,
     onShare: () -> Unit,
 ) {
     // Decode bytes to a Bitmap on first composition. NSCache-style bounded
@@ -999,6 +1018,13 @@ private fun ImageThumbCell(
             overflow = TextOverflow.Ellipsis,
         )
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            IconButton(onClick = onCopy, modifier = Modifier.size(28.dp)) {
+                Icon(
+                    Icons.Filled.ContentCopy,
+                    contentDescription = "复制到剪切板",
+                    modifier = Modifier.size(18.dp),
+                )
+            }
             IconButton(onClick = onSave, modifier = Modifier.size(28.dp)) {
                 Icon(
                     Icons.Filled.SaveAlt,
