@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -51,6 +52,11 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private var clipboard: ClipboardManager? = null
     private var clipListener: ClipboardManager.OnPrimaryClipChangedListener? = null
     private var prefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
+    // Held while a Client is alive, so the LAN transport's mDNS multicast
+    // packets aren't dropped by Wi-Fi power save. Released when the client
+    // is stopped (pairing change, service unbind) so we don't keep Wi-Fi
+    // hot when there's no client to use it.
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     // Most recent content we wrote to the clipboard from a remote clip.
     // Any local change that matches this within ECHO_WINDOW_MS is treated as
@@ -81,6 +87,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var pollerJob: Job? = null
+    private var lanCountJob: Job? = null
 
     init {
         _stateFlow.value = UiConnState.Idle
@@ -108,7 +115,18 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
 
         ShizukuBridge.register()
         startShizukuPoller()
+        startLanCountPoller()
         startClient()
+    }
+
+    private fun startLanCountPoller() {
+        lanCountJob?.cancel()
+        lanCountJob = scope.launch {
+            while (isActive) {
+                _lanPeerCount.value = client?.lanPeerCount()?.toInt() ?: 0
+                delay(2_000)
+            }
+        }
     }
 
     private fun startShizukuPoller() {
@@ -183,6 +201,8 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         if (instanceRef === this) instanceRef = null
         pollerJob?.cancel()
         pollerJob = null
+        lanCountJob?.cancel()
+        lanCountJob = null
         scope.cancel()
         ShizukuBridge.unregister()
         clipListener?.let { clipboard?.removePrimaryClipChangedListener(it) }
@@ -194,6 +214,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         prefsListener = null
         client?.stop()
         client = null
+        releaseMulticastLock()
         _stateFlow.value = UiConnState.Idle
         return super.onUnbind(intent)
     }
@@ -451,6 +472,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             return
         }
         val deviceId = PairingStore.deviceId(this)
+        acquireMulticastLock()
         client = try {
             Client(
                 relayUrl = config.relayUrl,
@@ -482,7 +504,38 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private fun restartClient() {
         client?.stop()
         client = null
+        releaseMulticastLock()
         startClient()
+    }
+
+    private fun acquireMulticastLock() {
+        if (multicastLock?.isHeld == true) return
+        try {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                ?: return
+            val lock = wifi.createMulticastLock("clipbridge-mdns").apply {
+                // Hold across rebinds — we'll release it explicitly in
+                // onUnbind / restartClient.
+                setReferenceCounted(false)
+                acquire()
+            }
+            multicastLock = lock
+            Log.i(TAG, "multicast lock acquired")
+        } catch (t: Throwable) {
+            // Missing CHANGE_WIFI_MULTICAST_STATE shouldn't happen (it's in
+            // the manifest) but if it does we degrade to relay-only rather
+            // than crashing the service.
+            Log.w(TAG, "failed to acquire multicast lock; LAN may be limited", t)
+        }
+    }
+
+    private fun releaseMulticastLock() {
+        multicastLock?.let {
+            if (it.isHeld) {
+                try { it.release() } catch (_: Throwable) {}
+            }
+        }
+        multicastLock = null
     }
 
     /**
@@ -586,6 +639,12 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         // a plain MutableStateFlow is the cheapest reactive bridge.
         private val _stateFlow = MutableStateFlow<UiConnState>(UiConnState.Idle)
         val stateFlow: StateFlow<UiConnState> = _stateFlow.asStateFlow()
+
+        // LAN peer count, polled from the Rust core every couple of seconds
+        // by the service. The UI binds this to render a "局域网:N / 仅中继"
+        // badge alongside the existing connection state.
+        private val _lanPeerCount = MutableStateFlow(0)
+        val lanPeerCount: StateFlow<Int> = _lanPeerCount.asStateFlow()
 
         // Image traffic history surfaced to the UI's image transfer card.
         // Newest first, capped at HISTORY_LIMIT. Sent and received both

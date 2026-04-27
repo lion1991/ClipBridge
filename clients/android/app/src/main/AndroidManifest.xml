@@ -5,6 +5,17 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- LAN peer discovery (mDNS over UDP multicast). CHANGE_WIFI_MULTICAST_STATE
+         is required to acquire WifiManager.MulticastLock — most Android devices
+         drop multicast packets to save battery once Wi-Fi enters power-save
+         mode, and our Rust core silently sees zero peers without the lock. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Android 13+ scopes mDNS / NSD scanning behind a runtime permission.
+         neverForLocation tells the system this is purely for peer discovery,
+         not location inference, so we don't need ACCESS_FINE_LOCATION. -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        android:minSdkVersion="33" />
     <!-- Read image bytes from MediaStore-backed clipboard URIs (e.g. when
          the user copies a photo from Samsung Gallery / Google Photos /
          system file picker). Without this our background accessibility

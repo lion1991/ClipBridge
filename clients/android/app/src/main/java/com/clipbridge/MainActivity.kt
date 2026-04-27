@@ -173,6 +173,26 @@ private fun PairingScreen(
     val imagePermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted -> imageReadGranted = granted }
+
+    // NEARBY_WIFI_DEVICES is required for any Wi-Fi-based peer discovery
+    // (mDNS / NSD) on Android 13+. Ask once, opportunistically — if the
+    // user denies we silently fall back to relay-only. This isn't gated
+    // on a button press because the LAN feature is always-on; the dialog
+    // shows up the first time MainActivity is opened on a 13+ device.
+    val nearbyWifiLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { /* result is informational; LAN code degrades silently if denied */ }
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val perm = "android.permission.NEARBY_WIFI_DEVICES"
+            if (ContextCompat.checkSelfPermission(context, perm) !=
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                nearbyWifiLauncher.launch(perm)
+            }
+        }
+    }
+
     val isPaired = existing != null
 
     val snackbarHostState = remember { SnackbarHostState() }
@@ -182,6 +202,7 @@ private fun PairingScreen(
     }
 
     val connState by ClipBridgeAccessibilityService.stateFlow.collectAsStateWithLifecycle()
+    val lanPeers by ClipBridgeAccessibilityService.lanPeerCount.collectAsStateWithLifecycle()
 
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
@@ -277,6 +298,7 @@ private fun PairingScreen(
             BottomTab.Sync -> SyncTabContent(
                 padding = padding,
                 connState = connState,
+                lanPeers = lanPeers,
                 isPaired = isPaired,
                 asEnabled = asEnabled,
                 shizukuState = shizukuState,
@@ -386,6 +408,7 @@ private enum class BottomTab { Sync, Images }
 private fun SyncTabContent(
     padding: androidx.compose.foundation.layout.PaddingValues,
     connState: UiConnState,
+    lanPeers: Int,
     isPaired: Boolean,
     asEnabled: Boolean,
     shizukuState: ShizukuBridge.State,
@@ -412,7 +435,7 @@ private fun SyncTabContent(
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        ConnectionPill(state = connState, paired = isPaired, asEnabled = asEnabled)
+        ConnectionPill(state = connState, paired = isPaired, asEnabled = asEnabled, lanPeers = lanPeers)
         ScanHero(paired = isPaired, onScan = onScan)
         StatusSection(
             shizukuState = shizukuState,
@@ -530,6 +553,7 @@ private fun ConnectionPill(
     state: UiConnState,
     paired: Boolean,
     asEnabled: Boolean,
+    lanPeers: Int,
 ) {
     data class Pill(
         val label: String,
@@ -539,13 +563,19 @@ private fun ConnectionPill(
     )
 
     val cs = MaterialTheme.colorScheme
+    // Only worth surfacing the transport hint once we're actually connected
+    // — before that the user cares about why pairing/connection isn't up,
+    // not which transport will be used when it does.
+    val transportSuffix = if (paired && asEnabled && state is UiConnState.Connected) {
+        if (lanPeers > 0) " · 局域网 $lanPeers" else " · 仅中继"
+    } else ""
     val pill = when {
         !asEnabled -> Pill("无障碍未启用", Icons.Filled.Warning, cs.errorContainer, cs.onErrorContainer)
         !paired -> Pill("未配对", Icons.Filled.LinkOff, cs.surfaceVariant, cs.onSurfaceVariant)
         else -> when (state) {
             UiConnState.Idle -> Pill("等待启动", Icons.Filled.RadioButtonUnchecked, cs.surfaceVariant, cs.onSurfaceVariant)
             UiConnState.Connecting -> Pill("连接中…", Icons.Filled.Sync, cs.tertiaryContainer, cs.onTertiaryContainer)
-            UiConnState.Connected -> Pill("已连接 · 同步中", Icons.Filled.CheckCircle, cs.primaryContainer, cs.onPrimaryContainer)
+            UiConnState.Connected -> Pill("已连接 · 同步中$transportSuffix", Icons.Filled.CheckCircle, cs.primaryContainer, cs.onPrimaryContainer)
             UiConnState.Disconnected -> Pill("已断开,正在重连", Icons.Filled.CloudOff, cs.surfaceVariant, cs.onSurfaceVariant)
             is UiConnState.Error -> Pill("连接出错:${state.message}", Icons.Filled.Error, cs.errorContainer, cs.onErrorContainer)
         }
