@@ -57,6 +57,18 @@ final class BridgeCoordinator: ObservableObject {
     /// the status pill doesn't stay red while the connection is healthy.
     private var lastConnectionStatus: BridgeStatus = .disconnected
     private var transientErrorToken: UInt64 = 0
+
+    /// "Don't touch the pasteboard until this date" — set after every
+    /// outbound send AND every inbound write. Apple's Universal Clipboard
+    /// independently re-delivers the same content within 1-2 seconds; if
+    /// we read during that window iOS shows a `想从 "Mac" 粘贴` prompt
+    /// (annoying) and we'd risk publishing the UC-encoded version back to
+    /// the relay (creates a duplicate row on the source device, possibly
+    /// looping). Inside the window we still bump lastChangeCount so we
+    /// don't re-evaluate the same UC drop every poll tick — we just refuse
+    /// to *read* the bytes, so no prompt and no echo publish.
+    private var quietPasteboardUntil: Date = .distantPast
+    private static let quietWindow: TimeInterval = 5
     // `handleIncoming` updates `lastChangeCount` after writing remote clips
     // so the poll tick skips them. We deliberately don't compare strings —
     // doing so would also block the user from re-copying the same text.
@@ -202,6 +214,7 @@ final class BridgeCoordinator: ObservableObject {
             "public.image": bytes,
         ]])
         lastChangeCount = UIPasteboard.general.changeCount
+        enterQuietWindow()
     }
 
     private func startSync(with cfg: PairingConfig) {
@@ -252,6 +265,18 @@ final class BridgeCoordinator: ObservableObject {
         let cc = pb.changeCount
         guard cc != lastChangeCount else { return }
 
+        // Apple Universal Clipboard echo guard: if we recently sent or
+        // received via ClipBridge, UC is almost certainly delivering the
+        // same content to this device's pasteboard around now. Reading
+        // would (a) trigger iOS's "想从 Mac 粘贴" prompt and (b) risk us
+        // publishing a UC-re-encoded copy back to the relay (the source
+        // device sees a duplicate). Bump lastChangeCount so the next poll
+        // doesn't keep retrying, then bail.
+        if Date() < quietPasteboardUntil {
+            lastChangeCount = cc
+            return
+        }
+
         // Image first — screenshots set both image and text reps, but the
         // user almost always wants the picture (text rep is usually the
         // file URL or empty).
@@ -292,9 +317,20 @@ final class BridgeCoordinator: ObservableObject {
         )
         do {
             try client?.sendClip(payload: payload)
+            enterQuietWindow()
             appendSent(payload)
         } catch {
             DispatchQueue.main.async { self.status = .error("发送失败: \(error)") }
+        }
+    }
+
+    /// Open the no-read window for `quietWindow` seconds. Called after any
+    /// outbound publish or inbound write so the UC echo is silently
+    /// swallowed instead of triggering the iOS paste prompt + republish.
+    private func enterQuietWindow() {
+        let candidate = Date().addingTimeInterval(Self.quietWindow)
+        if candidate > quietPasteboardUntil {
+            quietPasteboardUntil = candidate
         }
     }
 
@@ -324,6 +360,7 @@ final class BridgeCoordinator: ObservableObject {
                     deviceName: deviceName,
                     ts: ts
                 )
+                DispatchQueue.main.async { self.enterQuietWindow() }
                 // Build a synthetic ClipPayload mirroring what the wire
                 // would carry, so the sent-card UI is consistent with the
                 // received-card. We don't have the real ImageMeta back from
@@ -384,6 +421,7 @@ final class BridgeCoordinator: ObservableObject {
         // Capture the post-write changeCount so the next poll tick treats
         // our own write as a no-op instead of re-publishing it.
         lastChangeCount = UIPasteboard.general.changeCount
+        enterQuietWindow()
         appendRecent(payload)
     }
 

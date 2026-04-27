@@ -153,6 +153,23 @@ final class BridgeCoordinator: ObservableObject {
     private var lastConnectionStatus: BridgeStatus = .disconnected
     private var transientErrorToken: UInt64 = 0
 
+    /// "Don't touch the pasteboard until this date" — set after every
+    /// outbound send AND every inbound write. Apple's Universal Clipboard
+    /// re-delivers the same content to this device's pasteboard within
+    /// 1-2 seconds; reading inside that window risks publishing the UC-
+    /// re-encoded copy back to the relay (creates a duplicate row on the
+    /// other device, possibly looping). Inside the window we still bump
+    /// lastChangeCount so we don't keep re-evaluating the UC drop.
+    private var quietPasteboardUntil: Date = .distantPast
+    private static let quietWindow: TimeInterval = 5
+
+    private func enterQuietWindow() {
+        let candidate = Date().addingTimeInterval(Self.quietWindow)
+        if candidate > quietPasteboardUntil {
+            quietPasteboardUntil = candidate
+        }
+    }
+
     private static let deviceId: String = {
         let key = "com.clipbridge.device_id"
         if let id = UserDefaults.standard.string(forKey: key) { return id }
@@ -214,6 +231,14 @@ final class BridgeCoordinator: ObservableObject {
         guard pb.changeCount != lastChangeCount else { return }
         lastChangeCount = pb.changeCount
 
+        // Apple Universal Clipboard echo guard. We've just sent or
+        // received a clip via ClipBridge; UC is independently delivering
+        // (probably the same) content to this pasteboard within 1-2s.
+        // Reading + publishing now would either bounce our own clip back
+        // to the source device (visible as a duplicate row) or cycle
+        // through repeated re-encodings. Skip the read entirely.
+        if Date() < quietPasteboardUntil { return }
+
         // Image first: screenshots set both image and text reps, but the
         // user pretty much always wants the picture, not its filename.
         if let image = readClipboardImage() {
@@ -245,6 +270,7 @@ final class BridgeCoordinator: ObservableObject {
         )
         do {
             try client?.sendClip(payload: payload)
+            enterQuietWindow()
         } catch {
             onStateChange(.error("发送失败:\(error)"))
         }
@@ -316,6 +342,7 @@ final class BridgeCoordinator: ObservableObject {
                     deviceName: deviceName,
                     ts: ts
                 )
+                DispatchQueue.main.async { self.enterQuietWindow() }
             } catch {
                 self.showTransientError("图片发送失败: \(self.friendlyErrorMessage(error))")
             }
@@ -343,6 +370,7 @@ final class BridgeCoordinator: ObservableObject {
         // Capture the post-write changeCount so the next poll tick treats
         // our own write as a no-op instead of re-publishing it.
         lastChangeCount = pb.changeCount
+        enterQuietWindow()
     }
 
     private func fetchAndPasteImage(payload: ClipPayload, meta: ImageMeta) {
@@ -403,6 +431,7 @@ final class BridgeCoordinator: ObservableObject {
             pb.setData(tiff, forType: .tiff)
         }
         lastChangeCount = pb.changeCount
+        enterQuietWindow()
     }
 
     fileprivate func handleState(_ state: ConnectionState) {
