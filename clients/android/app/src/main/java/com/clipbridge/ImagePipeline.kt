@@ -3,10 +3,14 @@ package com.clipbridge
 import android.content.ClipData
 import android.content.ClipDescription
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.util.Log
 import androidx.core.content.FileProvider
 import java.io.ByteArrayOutputStream
@@ -198,6 +202,55 @@ object ImagePipeline {
     }
 
     fun sha256Hex(s: String): String = sha256Hex(s.toByteArray(Charsets.UTF_8))
+
+    // -------------------- Save to gallery --------------------
+
+    /**
+     * Save bytes to the system "Pictures/ClipBridge" album via MediaStore.
+     * Works without WRITE_EXTERNAL_STORAGE on Android 10+ (scoped storage:
+     * MediaStore-owned files are accessible to the owner app). On older
+     * APIs we still use MediaStore but it's backed by the legacy storage
+     * permission which the user already grants for image read.
+     *
+     * Returns the inserted MediaStore URI on success, null on failure.
+     */
+    fun saveToGallery(ctx: Context, bytes: ByteArray, mime: String): Uri? {
+        val ext = when (mime) {
+            "image/png" -> "png"
+            "image/jpeg" -> "jpg"
+            "image/heic" -> "heic"
+            else -> "img"
+        }
+        val name = "ClipBridge_${System.currentTimeMillis()}.$ext"
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, mime)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // RELATIVE_PATH lets us drop into a sub-album without
+                // needing legacy Environment.getExternalStoragePublicDirectory.
+                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/ClipBridge")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+        }
+        val resolver = ctx.contentResolver
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        }
+
+        return runCatching {
+            val uri = resolver.insert(collection, values) ?: return@runCatching null
+            resolver.openOutputStream(uri)?.use { it.write(bytes) }
+                ?: return@runCatching null
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.clear()
+                values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+            }
+            uri
+        }.onFailure { Log.w(TAG, "saveToGallery failed", it) }.getOrNull()
+    }
 
     private fun ByteArray.toHex(): String {
         val sb = StringBuilder(size * 2)

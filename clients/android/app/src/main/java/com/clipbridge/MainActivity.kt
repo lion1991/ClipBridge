@@ -15,8 +15,17 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.Image as ImageView
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import android.graphics.BitmapFactory
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -40,6 +49,9 @@ import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.SaveAlt
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.CloudOff
@@ -55,6 +67,7 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -91,8 +104,11 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import java.io.File
 import rikka.shizuku.Shizuku
 
 class MainActivity : ComponentActivity() {
@@ -183,6 +199,26 @@ private fun PairingScreen(
         onDispose { ShizukuBridge.removeStateListener(l) }
     }
 
+    val pickMediaLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(maxItems = 9),
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        for (uri in uris) {
+            // PickVisualMedia hands us a content URI with temporary read
+            // permission scoped to this activity. The accessibility
+            // service runs in the same process, so it can re-use the
+            // permission while the activity is alive — we read bytes
+            // synchronously inside `sendImageFromUri`'s Dispatchers.IO
+            // launch to keep the URI valid.
+            ClipBridgeAccessibilityService.activeService()?.sendImageFromUri(uri)
+                ?: scope.launch {
+                    snackbarHostState.showSnackbar("无障碍服务未启动, 无法发送")
+                }
+        }
+    }
+
+    val imageHistory by ClipBridgeAccessibilityService.imageHistory.collectAsStateWithLifecycle()
+
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         val contents = result?.contents ?: return@rememberLauncherForActivityResult
         configText = contents
@@ -235,6 +271,32 @@ private fun PairingScreen(
                     )
                 },
             )
+
+            if (isPaired) {
+                ImageTransferCard(
+                    history = imageHistory,
+                    onPickFromGallery = {
+                        pickMediaLauncher.launch(
+                            PickVisualMediaRequest(
+                                ActivityResultContracts.PickVisualMedia.ImageOnly,
+                            ),
+                        )
+                    },
+                    onSaveToGallery = { entry ->
+                        scope.launch {
+                            val uri = withContext(Dispatchers.IO) {
+                                ImagePipeline.saveToGallery(context, entry.bytes, entry.mime)
+                            }
+                            snackbarHostState.showSnackbar(
+                                if (uri != null) "已保存到「图片/ClipBridge」" else "保存失败"
+                            )
+                        }
+                    },
+                    onShare = { entry ->
+                        shareImage(context, entry)
+                    },
+                )
+            }
 
             StatusSection(
                 shizukuState = shizukuState,
@@ -671,6 +733,176 @@ private fun isImageReadGranted(context: Context): Boolean {
     val perm = imageReadPermissionName()
     return ContextCompat.checkSelfPermission(context, perm) ==
         PackageManager.PERMISSION_GRANTED
+}
+
+/**
+ * Image transfer area: send-from-gallery button + horizontally-scrolling
+ * thumbnails of recent images (received and sent). Each thumbnail offers
+ * "保存到相册" and "分享" via tap-to-expand actions.
+ *
+ * No image text body — that's covered in the existing pasteboard sync.
+ * This card is for explicit image traffic the user wants to act on.
+ */
+@Composable
+private fun ImageTransferCard(
+    history: List<ImageHistoryEntry>,
+    onPickFromGallery: () -> Unit,
+    onSaveToGallery: (ImageHistoryEntry) -> Unit,
+    onShare: (ImageHistoryEntry) -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        shape = RoundedCornerShape(20.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Filled.Image,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    "图片传输",
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onPickFromGallery) {
+                    Text("从相册选图")
+                }
+            }
+            if (history.isEmpty()) {
+                Text(
+                    "暂无 — 选图发送, 或等待其他设备发图过来",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    items(history, key = { it.id }) { entry ->
+                        ImageThumbCell(
+                            entry = entry,
+                            onSave = { onSaveToGallery(entry) },
+                            onShare = { onShare(entry) },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ImageThumbCell(
+    entry: ImageHistoryEntry,
+    onSave: () -> Unit,
+    onShare: () -> Unit,
+) {
+    // Decode bytes to a Bitmap on first composition. NSCache-style bounded
+    // map would be nicer but Compose's `remember(entry.id)` keying gets us
+    // ~free re-decode skip on scrolls.
+    val bitmap = remember(entry.id) {
+        runCatching {
+            BitmapFactory.decodeByteArray(entry.bytes, 0, entry.bytes.size)
+        }.getOrNull()
+    }
+    Column(
+        modifier = Modifier.width(120.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(120.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.surface),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (bitmap != null) {
+                ImageView(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop,
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Filled.Image,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.outline,
+                )
+            }
+        }
+        Text(
+            "${entry.width}×${entry.height} · ${entry.sizeLabel}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            entry.deviceName,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            IconButton(onClick = onSave, modifier = Modifier.size(28.dp)) {
+                Icon(
+                    Icons.Filled.SaveAlt,
+                    contentDescription = "保存到相册",
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+            IconButton(onClick = onShare, modifier = Modifier.size(28.dp)) {
+                Icon(
+                    Icons.Filled.Share,
+                    contentDescription = "分享",
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Share via Android's standard chooser (ACTION_SEND with the entry's
+ * image mime). Routes through our FileProvider so any picked target —
+ * Files, Photos, messenger — can read the bytes via its temporary URI
+ * permission.
+ */
+private fun shareImage(context: Context, entry: ImageHistoryEntry) {
+    val ext = when (entry.mime) {
+        "image/png" -> "png"
+        "image/jpeg" -> "jpg"
+        else -> "img"
+    }
+    val cacheDir = File(context.cacheDir, "clipbridge_images").apply { mkdirs() }
+    val file = File(cacheDir, "share_${entry.id.take(16)}.$ext")
+    if (!file.exists() || file.length() != entry.bytes.size.toLong()) {
+        file.writeBytes(entry.bytes)
+    }
+    val uri = FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.fileprovider",
+        file,
+    )
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = entry.mime
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(send, "分享图片"))
 }
 
 @Suppress("BatteryLife") // we sideload — Play Store policy doesn't apply

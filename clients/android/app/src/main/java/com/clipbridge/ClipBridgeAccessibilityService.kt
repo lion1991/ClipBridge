@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.net.Uri
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -88,6 +89,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.i(TAG, "accessibility service connected")
+        instanceRef = this
 
         clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clipListener = ClipboardManager.OnPrimaryClipChangedListener {
@@ -178,6 +180,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         Log.i(TAG, "accessibility service unbinding")
+        if (instanceRef === this) instanceRef = null
         pollerJob?.cancel()
         pollerJob = null
         scope.cancel()
@@ -353,7 +356,21 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             return
         }
         val deviceName = android.os.Build.MODEL ?: "Android"
-        val ts = System.currentTimeMillis().toULong()
+        val ts = System.currentTimeMillis()
+        // Surface in the UI history immediately — the upload may take a
+        // second or two on slow uplinks and we don't want the row to lag.
+        appendImageHistory(
+            ImageHistoryEntry(
+                id = h,
+                bytes = outbound.bytes,
+                mime = outbound.mime,
+                width = outbound.width.toInt(),
+                height = outbound.height.toInt(),
+                deviceName = "$deviceName · 本机",
+                tsMillis = ts,
+                direction = ImageHistoryEntry.Direction.SENT,
+            )
+        )
         scope.launch(Dispatchers.IO) {
             try {
                 client?.sendImage(
@@ -362,7 +379,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
                     width = outbound.width,
                     height = outbound.height,
                     deviceName = deviceName,
-                    ts = ts,
+                    ts = ts.toULong(),
                 )
                 Log.i(TAG, "published image (${outbound.bytes.size}B, " +
                     "${outbound.width}×${outbound.height})")
@@ -454,6 +471,25 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         startClient()
     }
 
+    /**
+     * Public entry point for the picker-driven send: takes a URI from the
+     * PickVisualMedia activity result, reads bytes via ContentResolver
+     * (foreground activity has temp permission), and routes through the
+     * same `publishImage` path as a clipboard-driven send.
+     */
+    fun sendImageFromUri(uri: Uri) {
+        scope.launch(Dispatchers.IO) {
+            val outbound = ImagePipeline.outboundFromUri(
+                this@ClipBridgeAccessibilityService,
+                uri,
+            ) ?: run {
+                Log.w(TAG, "sendImageFromUri: outbound was null for $uri")
+                return@launch
+            }
+            withContext(Dispatchers.Main) { publishImage(outbound) }
+        }
+    }
+
     private fun handleRemoteClip(payload: ClipPayload) {
         when (payload.kind) {
             ClipKind.TEXT -> {
@@ -504,6 +540,18 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
                 )
                 if (!ok) Log.w(TAG, "writeImageToClipboard returned false")
                 else Log.i(TAG, "wrote remote image to clipboard")
+                appendImageHistory(
+                    ImageHistoryEntry(
+                        id = h,
+                        bytes = bytes,
+                        mime = meta.mimeType,
+                        width = meta.width.toInt(),
+                        height = meta.height.toInt(),
+                        deviceName = payload.deviceName,
+                        tsMillis = payload.ts.toLong(),
+                        direction = ImageHistoryEntry.Direction.RECEIVED,
+                    )
+                )
             }
         }
     }
@@ -522,7 +570,58 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         // a plain MutableStateFlow is the cheapest reactive bridge.
         private val _stateFlow = MutableStateFlow<UiConnState>(UiConnState.Idle)
         val stateFlow: StateFlow<UiConnState> = _stateFlow.asStateFlow()
+
+        // Image traffic history surfaced to the UI's image transfer card.
+        // Newest first, capped at HISTORY_LIMIT. Sent and received both
+        // appear here so the user can save / re-share their own outbound
+        // images too (no separate "sent" tab on Android — keeps the
+        // mobile UI compact).
+        private const val HISTORY_LIMIT = 12
+        private val _imageHistory = MutableStateFlow<List<ImageHistoryEntry>>(emptyList())
+        val imageHistory: StateFlow<List<ImageHistoryEntry>> = _imageHistory.asStateFlow()
+
+        internal fun appendImageHistory(entry: ImageHistoryEntry) {
+            val combined = (listOf(entry) + _imageHistory.value)
+                .distinctBy { it.id }
+                .take(HISTORY_LIMIT)
+            _imageHistory.value = combined
+        }
+
+        internal fun clearImageHistory() {
+            _imageHistory.value = emptyList()
+        }
+
+        // Weak handle to the live AccessibilityService instance for the UI
+        // to call into (sendImageFromUri). Not WeakRef because the service
+        // sets/clears it explicitly on connect/unbind, no GC race window.
+        @Volatile
+        private var instanceRef: ClipBridgeAccessibilityService? = null
+        fun activeService(): ClipBridgeAccessibilityService? = instanceRef
     }
+}
+
+/// Compact metadata + bytes for one image, surfaced to the UI. Bytes live
+/// here so "保存到相册" / "分享" don't need to refetch from the relay.
+data class ImageHistoryEntry(
+    val id: String,             // sha256 of bytes — also acts as dedup key
+    val bytes: ByteArray,
+    val mime: String,
+    val width: Int,
+    val height: Int,
+    val deviceName: String,
+    val tsMillis: Long,
+    val direction: Direction,
+) {
+    enum class Direction { RECEIVED, SENT }
+
+    val sizeLabel: String
+        get() {
+            val kb = (bytes.size / 1024).coerceAtLeast(1)
+            return if (kb >= 1024) String.format("%.1f MB", kb / 1024.0) else "$kb KB"
+        }
+
+    override fun equals(other: Any?): Boolean = other is ImageHistoryEntry && other.id == id
+    override fun hashCode(): Int = id.hashCode()
 }
 
 /// What the UI displays. Distinct from `uniffi.clipbridge_core.ConnectionState`

@@ -158,6 +158,36 @@ final class BridgeCoordinator: ObservableObject {
         try? client?.fetchRecent()
     }
 
+    /// Public entry point for the picker-driven send: hand us raw bytes
+    /// (any image format) and we'll decode → re-encode to PNG → upload via
+    /// blob, exactly the same path as a clipboard-driven send. Bypasses
+    /// UIPasteboard entirely so picking a photo doesn't clobber what the
+    /// user might have on their clipboard.
+    func sendImageBytes(_ bytes: Data) {
+        guard let image = UIImage(data: bytes) else {
+            DispatchQueue.main.async {
+                self.status = .error("图片解码失败")
+            }
+            return
+        }
+        // Re-encode to PNG so receivers on Win/Android don't need a HEIC
+        // decoder. Skip when source is already PNG.
+        let (pngBytes, mime): (Data, String) = {
+            if bytes.starts(with: [0x89, 0x50, 0x4e, 0x47]) {
+                return (bytes, "image/png")
+            }
+            return (image.pngData() ?? bytes, "image/png")
+        }()
+        let clip = ClipboardImage(
+            bytes: pngBytes,
+            mime: mime,
+            width: UInt32(image.size.width.rounded()),
+            height: UInt32(image.size.height.rounded()),
+            uiImage: image
+        )
+        sendImage(clip)
+    }
+
     /// Re-paste a previously-seen clip onto the local pasteboard from the
     /// row tap. Routes through the coordinator (rather than the row poking
     /// `UIPasteboard` directly) so we can fall back to a blob re-fetch when

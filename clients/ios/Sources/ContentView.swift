@@ -4,6 +4,8 @@ import UIKit
 struct ContentView: View {
     @EnvironmentObject var coordinator: BridgeCoordinator
     @State private var showPairing = false
+    @State private var showPhotoPicker = false
+    @State private var saveToast: String?
 
     var body: some View {
         NavigationView {
@@ -15,6 +17,7 @@ struct ContentView: View {
                         onTap: { showPairing = true }
                     )
                     if coordinator.hasPairing {
+                        ImageTransferCard(onSendImage: { showPhotoPicker = true })
                         ClipHistoryCard(
                             title: "最近收到",
                             hint: "下拉刷新",
@@ -50,8 +53,79 @@ struct ContentView: View {
                     coordinator: coordinator
                 )
             }
+            .sheet(isPresented: $showPhotoPicker) {
+                PhotoPickerSheet(isPresented: $showPhotoPicker) { bytes in
+                    coordinator.sendImageBytes(bytes)
+                }
+            }
+            .overlay(alignment: .bottom) {
+                if let toast = saveToast {
+                    Text(toast)
+                        .font(.callout)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(.thinMaterial)
+                        .clipShape(Capsule())
+                        .padding(.bottom, 24)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+            }
+            .onPreferenceChange(SaveToastPreferenceKey.self) { msg in
+                guard let msg else { return }
+                withAnimation { saveToast = msg }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    withAnimation { saveToast = nil }
+                }
+            }
         }
         .navigationViewStyle(.stack)
+    }
+}
+
+/// Preference key used by image rows to bubble "保存成功 / 失败" up to the
+/// root view's overlay toast — avoids passing a binding through the row
+/// constructor and keeps history rows free of save-state.
+struct SaveToastPreferenceKey: PreferenceKey {
+    static var defaultValue: String? = nil
+    static func reduce(value: inout String?, nextValue: () -> String?) {
+        let next = nextValue()
+        if next != nil { value = next }
+    }
+}
+
+/// Compact card with a single "从相册选图发送" button. Triggers the
+/// PhotosUI picker without requiring full library access — the picker
+/// runs in another process and only hands us the bytes for the items the
+/// user explicitly tapped.
+struct ImageTransferCard: View {
+    let onSendImage: () -> Void
+
+    var body: some View {
+        Button(action: onSendImage) {
+            HStack(spacing: 16) {
+                Image(systemName: "photo.on.rectangle.angled")
+                    .font(.system(size: 24))
+                    .foregroundColor(.accentColor)
+                    .frame(width: 48, height: 48)
+                    .background(Circle().fill(Color.accentColor.opacity(0.12)))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("从相册发送图片")
+                        .font(.headline)
+                    Text("不走剪切板, 直接选图加密上传")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.secondary)
+            }
+            .padding(16)
+            .background(
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color(uiColor: .secondarySystemBackground))
+            )
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -254,6 +328,7 @@ struct RecentClipRow: View {
 /// placeholder with the dimensions still visible so the row never collapses.
 private struct ImageClipBody: View {
     let clip: ClipPayload
+    @State private var saveToastMessage: String? = nil
 
     var body: some View {
         HStack(spacing: 12) {
@@ -267,7 +342,73 @@ private struct ImageClipBody: View {
                     .foregroundColor(.secondary)
             }
             Spacer(minLength: 0)
+            // Tap stops here so the parent row's "tap = re-paste" doesn't
+            // also fire. Menu wraps two destinations: camera roll (silent,
+            // permission-prompted on first save) and the share sheet
+            // (lets the user pick "Save to Files", AirDrop, etc.).
+            Menu {
+                Button {
+                    saveToCameraRoll()
+                } label: {
+                    Label("保存到相册", systemImage: "square.and.arrow.down")
+                }
+                Button {
+                    presentShareSheet()
+                } label: {
+                    Label("分享 / 保存到文件…", systemImage: "square.and.arrow.up")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.title3)
+                    .foregroundColor(.secondary)
+                    .padding(8)
+                    .contentShape(Rectangle())
+            }
+            // Stop the row's `Button(action:)` from intercepting taps that
+            // land on the menu. Without this, tapping the menu also fires
+            // re-paste underneath.
+            .onTapGesture { /* swallowed */ }
         }
+        .preference(key: SaveToastPreferenceKey.self, value: saveToastMessage)
+    }
+
+    private func bytes() -> Data? {
+        ImageThumbCache.shared.fullData(forTs: clip.ts)
+    }
+
+    private func saveToCameraRoll() {
+        guard let data = bytes() else {
+            postToast("图片字节已过期, 无法保存")
+            return
+        }
+        PhotoSaver.saveToCameraRoll(data) { ok in
+            postToast(ok ? "已保存到相册" : "保存失败 (检查相册权限)")
+        }
+    }
+
+    private func presentShareSheet() {
+        guard let data = bytes(), let img = UIImage(data: data) else {
+            postToast("图片字节已过期")
+            return
+        }
+        // Wrap the image so AirDrop / Files / WeChat all get a proper
+        // image attachment rather than raw NSData; iOS renders a preview
+        // in the share sheet too.
+        let activity = UIActivityViewController(
+            activityItems: [img],
+            applicationActivities: nil,
+        )
+        activity.completionWithItemsHandler = { _, completed, _, _ in
+            if completed { postToast("已分享") }
+        }
+        topViewController()?.present(activity, animated: true)
+    }
+
+    private func postToast(_ msg: String) {
+        // Push then immediately clear so consecutive identical messages
+        // still trigger the overlay (PreferenceKey only fires on change).
+        saveToastMessage = msg
+        DispatchQueue.main.async { saveToastMessage = nil }
     }
 
     @ViewBuilder
@@ -297,6 +438,22 @@ private struct ImageClipBody: View {
             : "\(kb) KB"
         return "\(meta.width)×\(meta.height) · \(size)"
     }
+}
+
+/// Walk to the topmost presented controller of the foreground key window
+/// so `present(_:)` lands on the correct host. SwiftUI doesn't expose the
+/// hosting controller directly; this is the canonical UIKit fallback.
+private func topViewController() -> UIViewController? {
+    let scenes = UIApplication.shared.connectedScenes
+    let keyWindow = scenes
+        .compactMap { $0 as? UIWindowScene }
+        .flatMap { $0.windows }
+        .first(where: { $0.isKeyWindow })
+    var top = keyWindow?.rootViewController
+    while let presented = top?.presentedViewController {
+        top = presented
+    }
+    return top
 }
 
 #Preview {

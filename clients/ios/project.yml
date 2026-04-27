@@ -54,6 +54,10 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSCameraUsageDescription: "扫描另一台设备显示的配对二维码。"
+        # Add-only access for "保存到相册" on received images. We never
+        # read the photo library — UIImageWriteToSavedPhotosAlbum is the
+        # only call that touches it, and iOS gates that on this key.
+        NSPhotoLibraryAddUsageDescription: "把收到的图片保存到「照片」。"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.clipbridge.ios
