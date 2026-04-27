@@ -32,6 +32,11 @@ final class BridgeCoordinator: ObservableObject {
     /// `Client` currently has a direct TCP session to. Polled every 2s
     /// from `pollTimer` so SwiftUI can render a transport badge.
     @Published private(set) var lanPeerCount: UInt32 = 0
+    /// Names of currently-connected LAN peers, sorted. Empty when LAN
+    /// hasn't found anyone (or didn't start). Drives the StatusPill's
+    /// "局域网: Mac mini, MacBook" suffix so the user can spot mesh
+    /// asymmetry across devices at a glance.
+    @Published private(set) var lanPeerNames: [String] = []
     /// Most recent inbound clips from other devices, newest first, capped
     /// at `recentLimit`. Lives only in memory — keyboard extension has its
     /// own copy. We could share via App Group later if we want unified
@@ -273,6 +278,7 @@ final class BridgeCoordinator: ObservableObject {
                 groupId: cfg.groupId,
                 key: key,
                 deviceId: PairingStore.deviceId(),
+                deviceName: UIDevice.current.name,
                 listener: listener
             )
             status = .connecting
@@ -303,9 +309,13 @@ final class BridgeCoordinator: ObservableObject {
             // poll every other tick (≈2s) which is plenty for a status badge.
             lanTick += 1
             if lanTick % 2 == 0 {
-                let n = self.client?.lanPeerCount() ?? 0
+                let names = (self.client?.lanPeers() ?? []).sorted()
+                let n = UInt32(names.count)
                 if n != self.lanPeerCount {
                     self.lanPeerCount = n
+                }
+                if names != self.lanPeerNames {
+                    self.lanPeerNames = names
                 }
             }
         }

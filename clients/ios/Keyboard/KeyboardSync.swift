@@ -62,6 +62,7 @@ final class KeyboardSync {
                 groupId: cfg.groupId,
                 key: key,
                 deviceId: PairingStore.deviceId(),
+                deviceName: "\(UIDevice.current.name) · 键盘",
                 listener: listener
             )
         } catch {
