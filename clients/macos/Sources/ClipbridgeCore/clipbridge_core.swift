@@ -518,9 +518,23 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 public protocol ClientProtocol: AnyObject, Sendable {
     
+    /**
+     * Download the ciphertext for `meta` from the relay and decrypt it
+     * with the group key. Blocking; safe to call from a background thread.
+     */
+    func fetchImage(meta: ImageMeta) throws  -> Data
+    
     func fetchRecent() throws 
     
     func sendClip(payload: ClipPayload) throws 
+    
+    /**
+     * Encrypt `image_bytes`, upload the ciphertext to the relay's blob
+     * endpoint, then queue a `Publish` carrying the resulting `ImageMeta`.
+     * Blocks the calling thread for the duration of the HTTP upload —
+     * hosts should call this from a background thread / coroutine.
+     */
+    func sendImage(imageBytes: Data, mimeType: String, width: UInt32, height: UInt32, deviceName: String, ts: UInt64) throws 
     
     /**
      * Signal the worker thread to disconnect and wait for it to finish.
@@ -598,6 +612,19 @@ public convenience init(relayUrl: String, groupId: String, key: Data, deviceId: 
     
 
     
+    /**
+     * Download the ciphertext for `meta` from the relay and decrypt it
+     * with the group key. Blocking; safe to call from a background thread.
+     */
+open func fetchImage(meta: ImageMeta)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_clipbridge_core_fn_method_client_fetch_image(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeImageMeta_lower(meta),$0
+    )
+})
+}
+    
 open func fetchRecent()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_clipbridge_core_fn_method_client_fetch_recent(
             self.uniffiCloneHandle(),$0
@@ -609,6 +636,25 @@ open func sendClip(payload: ClipPayload)throws   {try rustCallWithError(FfiConve
     uniffi_clipbridge_core_fn_method_client_send_clip(
             self.uniffiCloneHandle(),
         FfiConverterTypeClipPayload_lower(payload),$0
+    )
+}
+}
+    
+    /**
+     * Encrypt `image_bytes`, upload the ciphertext to the relay's blob
+     * endpoint, then queue a `Publish` carrying the resulting `ImageMeta`.
+     * Blocks the calling thread for the duration of the HTTP upload —
+     * hosts should call this from a background thread / coroutine.
+     */
+open func sendImage(imageBytes: Data, mimeType: String, width: UInt32, height: UInt32, deviceName: String, ts: UInt64)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_clipbridge_core_fn_method_client_send_image(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(imageBytes),
+        FfiConverterString.lower(mimeType),
+        FfiConverterUInt32.lower(width),
+        FfiConverterUInt32.lower(height),
+        FfiConverterString.lower(deviceName),
+        FfiConverterUInt64.lower(ts),$0
     )
 }
 }
@@ -908,20 +954,43 @@ public func FfiConverterTypeClipListener_lower(_ value: ClipListener) -> UInt64 
 
 /**
  * Decrypted payload (after group key opens the ciphertext).
+ *
+ * `image` and any other typed-payload sidecar fields are additive: old
+ * clients that don't know about them simply skip the unknown variant via
+ * the `kind` discriminant. New clients receiving an old payload (no
+ * `image` field) get `None` thanks to `serde(default)`.
  */
 public struct ClipPayload: Equatable, Hashable {
     public var kind: ClipKind
+    /**
+     * Text content. For non-text kinds this is empty (kept non-optional so
+     * the FFI surface stays stable for existing Swift/Kotlin call sites).
+     */
     public var content: String
     public var deviceName: String
     public var ts: UInt64
+    /**
+     * Present iff `kind == Image`. Carries the metadata needed to fetch
+     * and verify the encrypted blob from the relay's blob endpoint.
+     */
+    public var image: ImageMeta?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(kind: ClipKind, content: String, deviceName: String, ts: UInt64) {
+    public init(kind: ClipKind, 
+        /**
+         * Text content. For non-text kinds this is empty (kept non-optional so
+         * the FFI surface stays stable for existing Swift/Kotlin call sites).
+         */content: String, deviceName: String, ts: UInt64, 
+        /**
+         * Present iff `kind == Image`. Carries the metadata needed to fetch
+         * and verify the encrypted blob from the relay's blob endpoint.
+         */image: ImageMeta?) {
         self.kind = kind
         self.content = content
         self.deviceName = deviceName
         self.ts = ts
+        self.image = image
     }
 
     
@@ -943,7 +1012,8 @@ public struct FfiConverterTypeClipPayload: FfiConverterRustBuffer {
                 kind: FfiConverterTypeClipKind.read(from: &buf), 
                 content: FfiConverterString.read(from: &buf), 
                 deviceName: FfiConverterString.read(from: &buf), 
-                ts: FfiConverterUInt64.read(from: &buf)
+                ts: FfiConverterUInt64.read(from: &buf), 
+                image: FfiConverterOptionTypeImageMeta.read(from: &buf)
         )
     }
 
@@ -952,6 +1022,7 @@ public struct FfiConverterTypeClipPayload: FfiConverterRustBuffer {
         FfiConverterString.write(value.content, into: &buf)
         FfiConverterString.write(value.deviceName, into: &buf)
         FfiConverterUInt64.write(value.ts, into: &buf)
+        FfiConverterOptionTypeImageMeta.write(value.image, into: &buf)
     }
 }
 
@@ -968,6 +1039,107 @@ public func FfiConverterTypeClipPayload_lift(_ buf: RustBuffer) throws -> ClipPa
 #endif
 public func FfiConverterTypeClipPayload_lower(_ value: ClipPayload) -> RustBuffer {
     return FfiConverterTypeClipPayload.lower(value)
+}
+
+
+/**
+ * Metadata for an image clip. The actual image bytes live in the relay's
+ * blob store, addressed by `sha256_hex` (which is the SHA-256 of the
+ * ciphertext, not the plaintext — keeping the relay blind to whether two
+ * uploads contain the same image). Bytes are end-to-end encrypted with
+ * the group key.
+ */
+public struct ImageMeta: Equatable, Hashable {
+    public var mimeType: String
+    public var width: UInt32
+    public var height: UInt32
+    /**
+     * Plaintext byte length. Lets the receiver render a placeholder /
+     * progress bar before the blob arrives.
+     */
+    public var sizeBytes: UInt64
+    /**
+     * Hex-encoded SHA-256 of the *ciphertext* stored in the blob endpoint.
+     * Doubles as the blob URL key and a local-cache lookup key.
+     */
+    public var sha256Hex: String
+    /**
+     * Random 12-byte nonce used to encrypt the blob, base64-encoded.
+     * Required by ChaCha20-Poly1305 — must be unique per encryption.
+     */
+    public var nonceB64: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(mimeType: String, width: UInt32, height: UInt32, 
+        /**
+         * Plaintext byte length. Lets the receiver render a placeholder /
+         * progress bar before the blob arrives.
+         */sizeBytes: UInt64, 
+        /**
+         * Hex-encoded SHA-256 of the *ciphertext* stored in the blob endpoint.
+         * Doubles as the blob URL key and a local-cache lookup key.
+         */sha256Hex: String, 
+        /**
+         * Random 12-byte nonce used to encrypt the blob, base64-encoded.
+         * Required by ChaCha20-Poly1305 — must be unique per encryption.
+         */nonceB64: String) {
+        self.mimeType = mimeType
+        self.width = width
+        self.height = height
+        self.sizeBytes = sizeBytes
+        self.sha256Hex = sha256Hex
+        self.nonceB64 = nonceB64
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ImageMeta: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeImageMeta: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImageMeta {
+        return
+            try ImageMeta(
+                mimeType: FfiConverterString.read(from: &buf), 
+                width: FfiConverterUInt32.read(from: &buf), 
+                height: FfiConverterUInt32.read(from: &buf), 
+                sizeBytes: FfiConverterUInt64.read(from: &buf), 
+                sha256Hex: FfiConverterString.read(from: &buf), 
+                nonceB64: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ImageMeta, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.mimeType, into: &buf)
+        FfiConverterUInt32.write(value.width, into: &buf)
+        FfiConverterUInt32.write(value.height, into: &buf)
+        FfiConverterUInt64.write(value.sizeBytes, into: &buf)
+        FfiConverterString.write(value.sha256Hex, into: &buf)
+        FfiConverterString.write(value.nonceB64, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImageMeta_lift(_ buf: RustBuffer) throws -> ImageMeta {
+    return try FfiConverterTypeImageMeta.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImageMeta_lower(_ value: ImageMeta) -> RustBuffer {
+    return FfiConverterTypeImageMeta.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -1136,6 +1308,8 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
     case Stopped
     case InvalidKey(got: UInt32
     )
+    case BlobNotFound
+    case BlobTooLarge
     case Internal(reason: String
     )
 
@@ -1171,7 +1345,9 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         case 2: return .InvalidKey(
             got: try FfiConverterUInt32.read(from: &buf)
             )
-        case 3: return .Internal(
+        case 3: return .BlobNotFound
+        case 4: return .BlobTooLarge
+        case 5: return .Internal(
             reason: try FfiConverterString.read(from: &buf)
             )
 
@@ -1195,8 +1371,16 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             FfiConverterUInt32.write(got, into: &buf)
             
         
-        case let .Internal(reason):
+        case .BlobNotFound:
             writeInt(&buf, Int32(3))
+        
+        
+        case .BlobTooLarge:
+            writeInt(&buf, Int32(4))
+        
+        
+        case let .Internal(reason):
+            writeInt(&buf, Int32(5))
             FfiConverterString.write(reason, into: &buf)
             
         }
@@ -1218,6 +1402,30 @@ public func FfiConverterTypeFfiError_lower(_ value: FfiError) -> RustBuffer {
     return FfiConverterTypeFfiError.lower(value)
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeImageMeta: FfiConverterRustBuffer {
+    typealias SwiftType = ImageMeta?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeImageMeta.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeImageMeta.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
 private enum InitializationResult {
     case ok
     case contractVersionMismatch
@@ -1233,10 +1441,16 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_clipbridge_core_checksum_method_client_fetch_image() != 64241) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_clipbridge_core_checksum_method_client_fetch_recent() != 60169) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_client_send_clip() != 42893) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_clipbridge_core_checksum_method_client_send_image() != 45764) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_client_stop() != 44720) {
