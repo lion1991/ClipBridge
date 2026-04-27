@@ -15,7 +15,18 @@ struct ContentView: View {
                         onTap: { showPairing = true }
                     )
                     if coordinator.hasPairing {
-                        RecentClipsCard(clips: coordinator.recentClips)
+                        ClipHistoryCard(
+                            title: "最近收到",
+                            hint: "下拉刷新",
+                            emptyMessage: "暂无 — 等待其他设备复制的内容",
+                            clips: coordinator.recentClips
+                        )
+                        ClipHistoryCard(
+                            title: "最近发送",
+                            hint: nil,
+                            emptyMessage: "暂无 — 在本机复制后会出现",
+                            clips: coordinator.sentClips
+                        )
                     }
                     Spacer(minLength: 12)
                     Text("默认中继 · " + DEFAULT_RELAY_URL.replacingOccurrences(of: "wss://", with: ""))
@@ -121,28 +132,37 @@ struct PairingCard: View {
     }
 }
 
-/// Latest 3 inbound clips from other devices, newest first. Tap a row to
-/// copy that clip back into the local pasteboard (handy when something
-/// newer has overwritten it).
-struct RecentClipsCard: View {
+/// Latest 3 clips in one direction (received or sent), newest first. Tap
+/// a row to copy that clip back into the local pasteboard — handy when
+/// something newer has overwritten it, or to re-send a previously-sent
+/// item to other devices.
+struct ClipHistoryCard: View {
+    let title: String
+    /// Optional right-aligned hint shown next to the title. We use it on
+    /// the received card to advertise pull-to-refresh; the sent card
+    /// passes nil.
+    let hint: String?
+    let emptyMessage: String
     let clips: [ClipPayload]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("最近收到")
+                Text(title)
                     .font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("下拉刷新")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+                if let hint = hint {
+                    Text(hint)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 14)
             .padding(.bottom, 10)
 
             if clips.isEmpty {
-                Text("暂无 — 等待其他设备复制的内容")
+                Text(emptyMessage)
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)

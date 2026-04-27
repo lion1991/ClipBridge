@@ -30,6 +30,12 @@ final class BridgeCoordinator: ObservableObject {
     /// history, but for now this just reflects what the main app saw while
     /// it was foreground.
     @Published private(set) var recentClips: [ClipPayload] = []
+    /// Outgoing counterpart: clips this device pushed to the relay via the
+    /// main app's pasteboard polling loop. Same cap and dedup as
+    /// `recentClips`. Doesn't include sends that originate from the
+    /// keyboard extension's own polling (separate process, separate state)
+    /// — bridging those would need an App Group cache, deferred.
+    @Published private(set) var sentClips: [ClipPayload] = []
 
     private static let recentLimit = 3
 
@@ -84,6 +90,7 @@ final class BridgeCoordinator: ObservableObject {
         // Old recents belong to the previous group; clear so the next
         // pairing's first connect populates from a clean slate.
         recentClips = []
+        sentClips = []
     }
 
     /// Manually pull recent clips from the relay's 5-min cache. Used by
@@ -151,8 +158,25 @@ final class BridgeCoordinator: ObservableObject {
         )
         do {
             try client?.sendClip(payload: payload)
+            appendSent(payload)
         } catch {
             DispatchQueue.main.async { self.status = .error("发送失败: \(error)") }
+        }
+    }
+
+    /// Mirror of `appendRecent` for the send direction. Records what we
+    /// just successfully handed to the Rust client so the UI can show the
+    /// last few outbound clips. We intentionally don't trust the relay
+    /// echo for this — relay filters by sender_device_id and never echoes
+    /// our own clips back, so the listener never sees them.
+    private func appendSent(_ payload: ClipPayload) {
+        DispatchQueue.main.async {
+            var combined = self.sentClips
+            if !combined.contains(payload) {
+                combined.append(payload)
+            }
+            combined.sort { $0.ts > $1.ts }
+            self.sentClips = Array(combined.prefix(Self.recentLimit))
         }
     }
 
