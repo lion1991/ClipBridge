@@ -114,6 +114,51 @@ main.view {
   line-height: 1;
 }
 
+/* Dashed-border drop zone for "拖入图片". Doubles as a click target so
+ * the user has a visible, single affordance for "send from disk". */
+.drop-zone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 20px;
+  margin: 6px 0 10px;
+  background: var(--surface-2);
+  border: 1.5px dashed var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 100ms, border-color 100ms;
+  user-select: none;
+}
+
+.drop-zone:hover {
+  background: var(--neutral-bg);
+}
+
+.drop-zone.dragging {
+  background: rgba(37, 99, 235, 0.08);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.drop-zone .drop-icon {
+  font-size: 28px;
+  line-height: 1;
+  opacity: 0.7;
+}
+
+.drop-zone .drop-title {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.drop-zone .drop-sub {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
 /* Image grid for the recent-received / recent-sent sections. */
 .image-grid {
   display: grid;

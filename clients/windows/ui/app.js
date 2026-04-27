@@ -197,14 +197,6 @@ async function handlePickedFiles(files) {
   }
 }
 
-async function sendFromClipboard() {
-  // The bridge already polls and publishes clipboard images automatically.
-  // This button just nudges the user — we trust the listener to fire on
-  // the next clipboard change. If they want an explicit "force send now"
-  // path we can add a Rust command later.
-  toast("剪切板图片会自动同步, 请直接复制图片");
-}
-
 async function saveImage(id) {
   const entry = imageHistory.find((e) => e.id === id);
   if (!entry) {
@@ -338,8 +330,59 @@ async function init() {
     }
   });
 
-  $("btn-pick-image").addEventListener("click", () => pickAndSendImages());
-  $("btn-send-clipboard").addEventListener("click", () => sendFromClipboard());
+  // Drop zone — clickable for the picker, plus HTML5 drag-drop targets.
+  // Tauri 2 normally intercepts drag-drop at the OS layer; we set
+  // dragDropEnabled=false in tauri.conf.json so the standard browser
+  // events fire here with File objects on `dataTransfer.files`.
+  const dropZone = $("drop-zone");
+  dropZone.addEventListener("click", () => pickAndSendImages());
+
+  // dragenter / dragover both must call preventDefault, otherwise drop
+  // never fires (browser defaults to "no drop allowed"). dragleave needs
+  // to be careful because moving over child elements re-fires it; we
+  // count enter/leave with a depth counter to only un-highlight on the
+  // final leave.
+  let dragDepth = 0;
+  ["dragenter", "dragover"].forEach((evt) => {
+    dropZone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      dragDepth++;
+      dropZone.classList.add("dragging");
+    });
+  });
+  dropZone.addEventListener("dragleave", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) dropZone.classList.remove("dragging");
+  });
+  dropZone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepth = 0;
+    dropZone.classList.remove("dragging");
+    const files = Array.from(e.dataTransfer?.files || []).filter((f) =>
+      (f.type || "").startsWith("image/"),
+    );
+    if (files.length === 0) {
+      toast("拖入的不是图片");
+      return;
+    }
+    handlePickedFiles(files);
+  });
+
+  // Block drops on the rest of the document so browser doesn't navigate
+  // to a dropped file's URI when the user misses the zone.
+  ["dragover", "drop"].forEach((evt) => {
+    window.addEventListener(evt, (e) => {
+      // Only block when target isn't our intended drop zone or its
+      // children — preserves textarea drag-paste behavior in 高级选项.
+      if (!dropZone.contains(e.target)) e.preventDefault();
+    });
+  });
+
   $("file-input").addEventListener("change", (e) => {
     handlePickedFiles(Array.from(e.target.files || []));
   });

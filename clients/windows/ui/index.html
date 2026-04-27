@@ -55,11 +55,12 @@
     <main id="view-images" class="view hidden">
       <section class="card">
         <h2>发送图片</h2>
-        <p class="hint">从本地选图发送, 或在「同步」标签下复制图片自动同步。</p>
-        <div class="actions">
-          <button id="btn-pick-image" class="primary">从本地选择…</button>
-          <button id="btn-send-clipboard">从剪切板发送</button>
+        <div id="drop-zone" class="drop-zone">
+          <div class="drop-icon">⤓</div>
+          <div class="drop-title">拖入图片到这里</div>
+          <div class="drop-sub">或点击选择文件 · 支持多张, 最大 32MB / 张</div>
         </div>
+        <p class="hint">在「同步」标签下复制图片也会自动同步。</p>
         <input id="file-input" type="file" accept="image/*" multiple class="hidden" />
       </section>
 
