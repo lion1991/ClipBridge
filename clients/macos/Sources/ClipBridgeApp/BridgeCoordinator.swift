@@ -256,15 +256,19 @@ final class BridgeCoordinator {
         seenHashes.insert(sha256Hex(data))
         let pb = NSPasteboard.general
         pb.clearContents()
-        // Hand AppKit an NSImage so consumers (Preview, Notes, Slack,
-        // Photoshop, …) get whichever pasteboard type they ask for —
-        // PNG, TIFF, or the lazy NSImage rep.
-        if let image = NSImage(data: data) {
-            pb.writeObjects([image])
-        } else {
-            // Non-image bytes we can't decode. Last-resort: stash as PNG so
-            // at least Cmd-V into a file viewer pulls something out.
-            pb.setData(data, forType: .png)
+        // Write raw PNG bytes literally. Going through `writeObjects([NSImage])`
+        // would make the pasteboard hold an NSImage, and the next poll's
+        // `data(forType: .png)` would get an *re-encoded* PNG (different
+        // bytes) — sha256 dedup would miss and we'd republish in a loop,
+        // ping-ponging the same image at 0.5Hz with each end re-encoding.
+        pb.setData(data, forType: .png)
+        // Also synthesize raw TIFF bytes for legacy AppKit consumers that
+        // only accept .tiff. NSBitmapImageRep takes the PNG buffer happily.
+        // Stored as bytes too, so it round-trips the same way as PNG.
+        if let rep = NSBitmapImageRep(data: data),
+           let tiff = rep.representation(using: .tiff, properties: [:])
+        {
+            pb.setData(tiff, forType: .tiff)
         }
         lastChangeCount = pb.changeCount
     }

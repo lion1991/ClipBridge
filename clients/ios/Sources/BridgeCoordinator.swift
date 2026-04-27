@@ -242,9 +242,10 @@ final class BridgeCoordinator: ObservableObject {
         }
         let deviceName = UIDevice.current.name
         let ts = UInt64(Date().timeIntervalSince1970 * 1000)
-        // Cache the UIImage right now so the sent-card thumbnail can show
-        // up immediately, before the upload even starts.
-        ImageThumbCache.shared.store(image.uiImage, forTs: ts)
+        // Cache thumbnail + raw bytes immediately so the sent-card thumbnail
+        // can show up before the upload even starts, and tap-to-paste later
+        // re-uses the exact bytes (no re-encode).
+        ImageThumbCache.shared.store(image: image.uiImage, bytes: image.bytes, forTs: ts)
 
         blobQueue.async { [weak self] in
             guard let self, let client = self.client else { return }
@@ -343,10 +344,17 @@ final class BridgeCoordinator: ObservableObject {
                 throw NSError(domain: "ClipBridge", code: -1,
                               userInfo: [NSLocalizedDescriptionKey: "图片字节解码失败"])
             }
-            ImageThumbCache.shared.store(image, forTs: payload.ts)
+            ImageThumbCache.shared.store(image: image, bytes: bytes, forTs: payload.ts)
             seenHashes.insert(h)
             DispatchQueue.main.async {
-                UIPasteboard.general.image = image
+                // Write raw PNG bytes literally. Setting `pb.image = image`
+                // would make UIPasteboard hold a UIImage; the next poll's
+                // `data(forPasteboardType: "public.png")` would get a
+                // *re-encoded* PNG (different bytes) — sha256 dedup would
+                // miss and we'd republish in a loop, ping-ponging the same
+                // image with each end re-encoding to slightly different
+                // bytes. Storing literal bytes keeps the round-trip exact.
+                UIPasteboard.general.setData(bytes, forPasteboardType: "public.png")
                 self.lastChangeCount = UIPasteboard.general.changeCount
                 self.appendRecent(payload)
             }

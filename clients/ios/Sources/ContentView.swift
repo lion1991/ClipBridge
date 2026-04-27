@@ -236,12 +236,11 @@ struct RecentClipRow: View {
         case .text:
             UIPasteboard.general.string = clip.content
         case .image:
-            // Re-paste from cache. If the thumbnail was evicted (large
-            // image, low-memory device) we silently skip — the user can
-            // still tap the source device's clipboard again. Avoids a
-            // surprise blank-paste after cache pressure.
-            if let img = ImageThumbCache.shared.image(forTs: clip.ts) {
-                UIPasteboard.general.image = img
+            // Paste raw bytes literally so the dedup hash on the next poll
+            // tick still matches what we sent / received. Falls back to
+            // silent no-op if the bytes were evicted under memory pressure.
+            if let bytes = ImageThumbCache.shared.fullData(forTs: clip.ts) {
+                UIPasteboard.general.setData(bytes, forPasteboardType: "public.png")
             }
         }
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -279,7 +278,7 @@ private struct ImageClipBody: View {
 
     @ViewBuilder
     private var thumbnail: some View {
-        if let img = ImageThumbCache.shared.image(forTs: clip.ts) {
+        if let img = ImageThumbCache.shared.thumbnail(forTs: clip.ts) {
             Image(uiImage: img)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
