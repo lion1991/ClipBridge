@@ -336,14 +336,18 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Image counterpart to `publish(text)`. Hash-dedups against
-     * `recentImageHashes` so:
-     *   - We don't republish what we just wrote ourselves on receive
-     *     (`writeImageBytesToClipboard` inserts the hash before setPrimaryClip).
-     *   - Multiple sources (clipboard listener, Shizuku poller) firing for
-     *     the same user copy collapse to one publish.
+     * Image counterpart to `publish(text)`. Two callers:
+     *
+     *   - Clipboard listener / Shizuku poller (clipboard activity) — passes
+     *     `dedup = true` so multiple sources firing for the same copy
+     *     collapse, AND so a re-paste of an image we just received doesn't
+     *     bounce back to the source device.
+     *   - sendImageFromUri (picker / explicit user action) — passes
+     *     `dedup = false` so the user can re-send the same image on
+     *     purpose. Picker doesn't touch the system clipboard so there's
+     *     no echo to suppress.
      */
-    private fun publishImage(outbound: ImagePipeline.Outbound) {
+    private fun publishImage(outbound: ImagePipeline.Outbound, dedup: Boolean = true) {
         if (outbound.bytes.size > ImagePipeline.MAX_IMAGE_BYTES) {
             val mb = outbound.bytes.size / 1024 / 1024
             Log.w(TAG, "image ${mb}MB exceeds ${ImagePipeline.MAX_IMAGE_BYTES} bytes, skipping")
@@ -351,10 +355,20 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         }
         val h = ImagePipeline.pixelHashHex(outbound.bytes)
             ?: ImagePipeline.sha256Hex(outbound.bytes)
-        if (rememberImageHash(h)) {
-            Log.i(TAG, "skip image: matches recent hash")
-            return
+        if (dedup) {
+            if (rememberImageHash(h)) {
+                Log.i(TAG, "skip image: matches recent hash")
+                return
+            }
         }
+        // Explicit sends still record the hash so the immediate clipboard
+        // listener fire (if any) sees it and skips. Without this, a manual
+        // copy of the just-sent image right after the picker would
+        // re-publish via the listener.
+        // Note: rememberImageHash returns true for "already present" but
+        // we don't care about the return value here; we just want it in.
+        if (!dedup) rememberImageHash(h)
+
         val deviceName = android.os.Build.MODEL ?: "Android"
         val ts = System.currentTimeMillis()
         // Surface in the UI history immediately — the upload may take a
@@ -486,7 +500,9 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
                 Log.w(TAG, "sendImageFromUri: outbound was null for $uri")
                 return@launch
             }
-            withContext(Dispatchers.Main) { publishImage(outbound) }
+            // Explicit user action — bypass dedup so re-picking the same
+            // image actually re-sends.
+            withContext(Dispatchers.Main) { publishImage(outbound, dedup = false) }
         }
     }
 

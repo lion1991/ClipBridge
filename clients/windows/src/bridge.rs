@@ -171,18 +171,24 @@ impl Bridge {
         let _ = self.state_tx.send(UiState::Idle);
     }
 
-    /// Public entry point for picker-driven send (file-pick or paste-from
-    /// disk in the UI). Bypasses the clipboard entirely so the user's
-    /// current clipboard contents stay untouched.
+    /// Public entry point for picker / drag-drop driven send. Bypasses
+    /// the clipboard entirely (so the user's current clipboard isn't
+    /// touched) AND bypasses the recent-hashes dedup (an explicit user
+    /// action should re-send the same image on purpose; the dedup is for
+    /// echo prevention on the clipboard-listener path only).
+    ///
+    /// We still insert the hash so that any clipboard-listener fire
+    /// happening to land in the same instant doesn't double-publish.
     pub fn send_image_bytes(&self, bytes: Vec<u8>) -> Result<ImageHistoryEntry, String> {
         let device_name = device_name();
         let png = normalize_to_png(&bytes).ok_or_else(|| "图片解码失败".to_string())?;
         if png.bytes.len() > MAX_IMAGE_BYTES {
             return Err(format!("图片 {}MB 超过 32MB 上限", png.bytes.len() / 1024 / 1024));
         }
-        let h = pixel_hash_hex(&png.bytes).ok_or_else(|| "无法计算像素哈希".to_string())?;
-        if remember_hash(&self.recent_image_hashes, &h) {
-            return Err("最近已发送过相同内容".to_string());
+        if let Some(h) = pixel_hash_hex(&png.bytes) {
+            // Insert (return value intentionally ignored — we publish either
+            // way), but don't gate on the dedup result.
+            let _ = remember_hash(&self.recent_image_hashes, &h);
         }
         let entry = build_history_entry(&png, &device_name, "sent");
         publish_image(
