@@ -71,8 +71,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if coordinator == nil {
             title = "传输:未配对"
         } else {
-            let n = coordinator?.lanPeerCount ?? 0
-            title = n == 0 ? "传输:仅中继" : "传输:局域网 \(n) 设备"
+            let names = (coordinator?.lanPeerNames ?? []).sorted()
+            if names.isEmpty {
+                title = "传输:仅中继"
+            } else {
+                title = "传输:局域网 \(names.count) (\(names.joined(separator: ", ")))"
+            }
         }
         statusItem.menu?.item(at: 1)?.title = title
     }

@@ -195,6 +195,12 @@ final class BridgeCoordinator: ObservableObject {
         client?.lanPeerCount() ?? 0
     }
 
+    /// Names of currently-connected LAN peers. Used to render the menu
+    /// row as "局域网: Mac mini, iPhone" so mesh asymmetry is visible.
+    var lanPeerNames: [String] {
+        client?.lanPeers() ?? []
+    }
+
     func start() {
         guard let key = config.keyData else {
             onStateChange(.error("密钥无效"))
@@ -208,6 +214,7 @@ final class BridgeCoordinator: ObservableObject {
                 groupId: config.groupId,
                 key: key,
                 deviceId: Self.deviceId,
+                deviceName: Self.deviceName,
                 listener: listener
             )
         } catch {
