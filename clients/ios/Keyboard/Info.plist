@@ -25,6 +25,19 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<!--
+	    Keyboard extensions run in their own process and must declare
+	    their own NSLocalNetworkUsageDescription / NSBonjourServices.
+	    They share the device_id with the main app (via App Group), so
+	    the LAN code in the Rust core appends a per-process random
+	    suffix to the mDNS instance name to avoid registration collisions.
+	-->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>键盘在前台时, 用于直连同 Wi-Fi 下的其它 ClipBridge 设备同步剪贴板。</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_clipbridge._tcp</string>
+	</array>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionAttributes</key>

@@ -28,6 +28,10 @@ final class BridgeCoordinator: ObservableObject {
 
     @Published private(set) var status: BridgeStatus = .notPaired
     @Published private(set) var hasPairing: Bool = false
+    /// Number of LAN peers (mDNS-discovered, fully-handshaked) the Rust
+    /// `Client` currently has a direct TCP session to. Polled every 2s
+    /// from `pollTimer` so SwiftUI can render a transport badge.
+    @Published private(set) var lanPeerCount: UInt32 = 0
     /// Most recent inbound clips from other devices, newest first, capped
     /// at `recentLimit`. Lives only in memory — keyboard extension has its
     /// own copy. We could share via App Group later if we want unified
@@ -51,6 +55,10 @@ final class BridgeCoordinator: ObservableObject {
     private var client: Client?
     private var listener: Listener?
     private var pollTimer: Timer?
+    /// Trigger for the iOS Local Network privacy prompt. Without this the
+    /// raw-socket mDNS in the Rust core gets silently blocked. See the
+    /// type's docstring for the full rationale.
+    private let lanPrimer = LocalNetworkPrimer()
 
     /// Most recent ConnectionState we got from the WS. Used to revert
     /// after a transient error (e.g. one BlobNotFound on a stale meta) so
@@ -91,6 +99,10 @@ final class BridgeCoordinator: ObservableObject {
         hasPairing = PairingStore.load() != nil
         status = hasPairing ? .disconnected : .notPaired
         audio.start()
+        // Kick off the local-network permission prompt regardless of
+        // pairing state — without this iOS never shows the dialog and
+        // mDNS discovery silently never works. Cheap to leave running.
+        lanPrimer.start()
     }
 
     func applicationDidBecomeActive() {
@@ -283,8 +295,19 @@ final class BridgeCoordinator: ObservableObject {
 
     private func startPolling() {
         pollTimer?.invalidate()
+        var lanTick = 0
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.checkPasteboard()
+            guard let self else { return }
+            self.checkPasteboard()
+            // LAN peer count changes asynchronously inside the Rust runtime;
+            // poll every other tick (≈2s) which is plenty for a status badge.
+            lanTick += 1
+            if lanTick % 2 == 0 {
+                let n = self.client?.lanPeerCount() ?? 0
+                if n != self.lanPeerCount {
+                    self.lanPeerCount = n
+                }
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer

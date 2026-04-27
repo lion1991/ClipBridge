@@ -27,6 +27,7 @@ final class KeyboardSync {
     private var pollTimer: Timer?
     private var lastChangeCount: Int = UIPasteboard.general.changeCount
     private var isRunning = false
+    private let lanPrimer = LocalNetworkPrimer()
 
     /// Recent SHA-256 hashes of text we've published or written. Same role
     /// as the main app's `seenHashes` — keeps us from re-publishing what
@@ -40,6 +41,11 @@ final class KeyboardSync {
 
     func start() {
         guard !isRunning else { return }
+        // Trigger the local-network grant evaluation in this process. The
+        // keyboard inherits the main app's grant decision, but the OS
+        // still needs to *evaluate* it per process via an Apple Bonjour
+        // API before raw multicast in the Rust core is unblocked.
+        lanPrimer.start()
         guard let cfg = PairingStore.load() else {
             delegate?.keyboardSync(self, didUpdateStatus: "未配对 — 请先在主 App 扫码")
             return
@@ -74,6 +80,7 @@ final class KeyboardSync {
         client?.stop()
         client = nil
         listener = nil
+        lanPrimer.stop()
     }
 
     /// Called by the VC when the user explicitly asks for a sync — eg.

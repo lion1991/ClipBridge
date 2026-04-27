@@ -7,6 +7,11 @@
     <key>com.apple.security.network.client</key>
     <true/>
 
+    <!-- 同主 App。键盘是独立进程,multicast entitlement 也得在这边
+         独立写,否则键盘进程发出的 mDNS 多播被内核静默丢。 -->
+    <key>com.apple.developer.networking.multicast</key>
+    <true/>
+
     <!-- 把扩展也提到 platform-application 一档。
          注:之前一度怀疑这条加上 no-container 会让 pkd 把我们 .appex
          过滤掉,所以临时撤过。撤了也没解决"长按 🌐 看不到我们键盘"的

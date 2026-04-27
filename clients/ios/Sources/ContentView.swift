@@ -22,7 +22,7 @@ struct ContentView: View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 16) {
-                    StatusPill(status: coordinator.status)
+                    StatusPill(status: coordinator.status, lanPeers: coordinator.lanPeerCount)
                     PairingCard(
                         hasPairing: coordinator.hasPairing,
                         onTap: { showPairing = true }
@@ -182,8 +182,19 @@ struct ImageTransferCard: View {
 
 struct StatusPill: View {
     let status: BridgeStatus
+    let lanPeers: UInt32
 
     var body: some View {
+        // Append a transport hint only when actually connected — until
+        // then the user wants to know *why* we're not connected, not
+        // which lane would have been used.
+        let connectedLabel: String = {
+            if lanPeers > 0 {
+                return "已连接 · 同步中 · 局域网 \(lanPeers)"
+            } else {
+                return "已连接 · 同步中 · 仅中继"
+            }
+        }()
         let (icon, label, color): (String, String, Color) = {
             switch status {
             case .notPaired:
@@ -191,7 +202,7 @@ struct StatusPill: View {
             case .connecting:
                 return ("arrow.triangle.2.circlepath", "连接中…", .orange)
             case .connected:
-                return ("checkmark.circle.fill", "已连接 · 同步中", .green)
+                return ("checkmark.circle.fill", connectedLabel, .green)
             case .disconnected:
                 return ("icloud.slash", "已断开,正在重连", .secondary)
             case .error(let msg):

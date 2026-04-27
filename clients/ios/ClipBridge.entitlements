@@ -6,6 +6,15 @@
     <key>com.apple.security.network.client</key>
     <true/>
 
+    <!-- iOS 14+ 起,任何 UDP/IP multicast (包括 mDNS、Bonjour)都需要这条
+         entitlement,否则内核层静默丢包,跟"本地网络"TCC 提示无关。Apple
+         上线前需要 multicast entitlement 申请,sideload 直接写就行,ldid
+         会把它烧进 LC_CODE_SIGNATURE,TrollStore 再签时会保留。
+         没有这条,我们 mdns-sd 跑在 raw socket 上发出的多播包根本出不了
+         设备。 -->
+    <key>com.apple.developer.networking.multicast</key>
+    <true/>
+
     <!-- 让 binary 以 platform-application 运行(以 mobile 用户身份,跟系统
          自带 App 一档)。下面的 paste 私钥只有 platform-application 才会
          被 iOS 认账,否则白写。

@@ -58,6 +58,12 @@ targets:
         # read the photo library — UIImageWriteToSavedPhotosAlbum is the
         # only call that touches it, and iOS gates that on this key.
         NSPhotoLibraryAddUsageDescription: "把收到的图片保存到「照片」。"
+        # LAN peer discovery. iOS 14+ blocks any mDNS query and silently
+        # returns nothing unless both keys are declared. The Bonjour list
+        # must enumerate every service type the app browses or registers.
+        NSLocalNetworkUsageDescription: "用于在同一 Wi-Fi 下发现其它 ClipBridge 设备并直连传输, 比走服务器中继更快。"
+        NSBonjourServices:
+          - _clipbridge._tcp
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.clipbridge.ios
@@ -97,6 +103,11 @@ targets:
       # lives in one place so changes don't drift.
       - path: Sources/ClipbridgeCore
       - path: Sources/PairingConfig.swift
+      # Local-network privacy primer. Same code as the main app — the
+      # keyboard runs in its own process, so its raw-socket mDNS in the
+      # Rust core needs an NWBrowser kicker too to get the system grant
+      # evaluated (and unblock multicast on the keyboard's process).
+      - path: Sources/LocalNetworkPrimer.swift
     info:
       path: Keyboard/Info.plist
       # xcodegen rewrites this plist from `properties:` on every regenerate
@@ -126,6 +137,13 @@ targets:
             RequestsOpenAccess: true
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+        # Keyboard extensions run in their own process and need their own
+        # mDNS declaration. Same service list as the main app — the Rust
+        # core appends a per-process random suffix to the mDNS instance
+        # name so the two registrations don't collide on one device.
+        NSLocalNetworkUsageDescription: "键盘在前台时, 用于直连同 Wi-Fi 下的其它 ClipBridge 设备同步剪贴板。"
+        NSBonjourServices:
+          - _clipbridge._tcp
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.clipbridge.ios.keyboard
