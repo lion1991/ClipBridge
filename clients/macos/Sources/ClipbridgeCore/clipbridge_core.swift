@@ -526,6 +526,15 @@ public protocol ClientProtocol: AnyObject, Sendable {
     
     func fetchRecent() throws 
     
+    /**
+     * Number of LAN peers currently in a fully-handshaked session. The
+     * UI polls this every couple of seconds to render a transport badge
+     * ("LAN: 2 / 仅中继"). 0 means LAN is up but no one's discovered us
+     * yet, *or* the LAN transport failed to start (multicast blocked,
+     * permission denied) and we're relay-only.
+     */
+    func lanPeerCount()  -> UInt32
+    
     func sendClip(payload: ClipPayload) throws 
     
     /**
@@ -630,6 +639,21 @@ open func fetchRecent()throws   {try rustCallWithError(FfiConverterTypeFfiError_
             self.uniffiCloneHandle(),$0
     )
 }
+}
+    
+    /**
+     * Number of LAN peers currently in a fully-handshaked session. The
+     * UI polls this every couple of seconds to render a transport badge
+     * ("LAN: 2 / 仅中继"). 0 means LAN is up but no one's discovered us
+     * yet, *or* the LAN transport failed to start (multicast blocked,
+     * permission denied) and we're relay-only.
+     */
+open func lanPeerCount() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_clipbridge_core_fn_method_client_lan_peer_count(
+            self.uniffiCloneHandle(),$0
+    )
+})
 }
     
 open func sendClip(payload: ClipPayload)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -1445,6 +1469,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_client_fetch_recent() != 60169) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_clipbridge_core_checksum_method_client_lan_peer_count() != 51217) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_client_send_clip() != 42893) {

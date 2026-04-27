@@ -2,6 +2,7 @@ pub mod blob;
 pub mod client;
 pub mod crypto;
 pub mod group;
+pub mod lan;
 pub mod protocol;
 
 pub use blob::{http_base, BlobClient, BlobError};

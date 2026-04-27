@@ -39,6 +39,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 futures-util = "0.3"
 url = "2"
+# LAN peer discovery via mDNS / DNS-SD. Pure-Rust, no system dep —
+# runs its own background thread and exposes a channel-based API.
+mdns-sd = "0.13"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
