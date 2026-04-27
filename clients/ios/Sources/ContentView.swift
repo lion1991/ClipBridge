@@ -191,7 +191,7 @@ struct RecentClipRow: View {
 
     var body: some View {
         Button(action: copy) {
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
                     Text(clip.deviceName)
                         .font(.caption.weight(.medium))
@@ -207,11 +207,7 @@ struct RecentClipRow: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
-                Text(clip.content)
-                    .font(.callout)
-                    .foregroundColor(.primary)
-                    .lineLimit(3)
-                    .multilineTextAlignment(.leading)
+                clipBody
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
@@ -221,8 +217,33 @@ struct RecentClipRow: View {
         .buttonStyle(.plain)
     }
 
+    @ViewBuilder
+    private var clipBody: some View {
+        switch clip.kind {
+        case .text:
+            Text(clip.content)
+                .font(.callout)
+                .foregroundColor(.primary)
+                .lineLimit(3)
+                .multilineTextAlignment(.leading)
+        case .image:
+            ImageClipBody(clip: clip)
+        }
+    }
+
     private func copy() {
-        UIPasteboard.general.string = clip.content
+        switch clip.kind {
+        case .text:
+            UIPasteboard.general.string = clip.content
+        case .image:
+            // Re-paste from cache. If the thumbnail was evicted (large
+            // image, low-memory device) we silently skip — the user can
+            // still tap the source device's clipboard again. Avoids a
+            // surprise blank-paste after cache pressure.
+            if let img = ImageThumbCache.shared.image(forTs: clip.ts) {
+                UIPasteboard.general.image = img
+            }
+        }
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
@@ -231,6 +252,57 @@ struct RecentClipRow: View {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .short
         return formatter.localizedString(for: date, relativeTo: Date())
+    }
+}
+
+/// Image-kind body: small thumbnail + a one-line caption (`640×480 · 124 KB`).
+/// The thumbnail comes from `ImageThumbCache`; if not yet cached (race with
+/// the blob fetch on receive, or evicted under memory pressure) we render a
+/// placeholder with the dimensions still visible so the row never collapses.
+private struct ImageClipBody: View {
+    let clip: ClipPayload
+
+    var body: some View {
+        HStack(spacing: 12) {
+            thumbnail
+            VStack(alignment: .leading, spacing: 2) {
+                Text(caption)
+                    .font(.callout)
+                    .foregroundColor(.primary)
+                Text("图片")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    @ViewBuilder
+    private var thumbnail: some View {
+        if let img = ImageThumbCache.shared.image(forTs: clip.ts) {
+            Image(uiImage: img)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 56, height: 56)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+        } else {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.secondary.opacity(0.15))
+                .frame(width: 56, height: 56)
+                .overlay(
+                    Image(systemName: "photo")
+                        .foregroundColor(.secondary)
+                )
+        }
+    }
+
+    private var caption: String {
+        guard let meta = clip.image else { return "图片" }
+        let kb = max(1, Int(meta.sizeBytes) / 1024)
+        let size = kb >= 1024
+            ? String(format: "%.1f MB", Double(kb) / 1024.0)
+            : "\(kb) KB"
+        return "\(meta.width)×\(meta.height) · \(size)"
     }
 }
 

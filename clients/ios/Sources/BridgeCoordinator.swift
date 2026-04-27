@@ -42,6 +42,11 @@ final class BridgeCoordinator: ObservableObject {
 
     private static let recentLimit = 3
 
+    /// Hard cap on outbound image bytes — must match the relay's default
+    /// `CLIPBRIDGE_BLOB_MAX_BYTES`. Going over fails fast with a status
+    /// message rather than getting silently downscaled.
+    private static let maxImageBytes = 32 * 1024 * 1024
+
     private var client: Client?
     private var listener: Listener?
     private var pollTimer: Timer?
@@ -49,6 +54,11 @@ final class BridgeCoordinator: ObservableObject {
     // so the poll tick skips them. We deliberately don't compare strings —
     // doing so would also block the user from re-copying the same text.
     private var lastChangeCount: Int = UIPasteboard.general.changeCount
+
+    /// Off-main worker for HTTP-bound operations (blob upload / download).
+    /// Serial so a slow upload can't be lapped by the next poll's upload of
+    /// the same clip — also keeps the relay from seeing reordered PUTs.
+    private let blobQueue = DispatchQueue(label: "com.clipbridge.blob", qos: .userInitiated)
 
     private init() {}
 
@@ -171,19 +181,85 @@ final class BridgeCoordinator: ObservableObject {
         guard pb.changeCount != lastChangeCount else { return }
         lastChangeCount = pb.changeCount
 
-        guard let text = pb.string, !text.isEmpty else { return }
+        // Image first — screenshots set both image and text reps, but the
+        // user almost always wants the picture (text rep is usually the
+        // file URL or empty).
+        if let image = readClipboardImage() {
+            sendImage(image)
+            return
+        }
 
+        if let text = pb.string, !text.isEmpty {
+            sendText(text)
+        }
+    }
+
+    private func sendText(_ text: String) {
         let payload = ClipPayload(
             kind: .text,
             content: text,
             deviceName: UIDevice.current.name,
-            ts: UInt64(Date().timeIntervalSince1970 * 1000)
+            ts: UInt64(Date().timeIntervalSince1970 * 1000),
+            image: nil
         )
         do {
             try client?.sendClip(payload: payload)
             appendSent(payload)
         } catch {
             DispatchQueue.main.async { self.status = .error("发送失败: \(error)") }
+        }
+    }
+
+    private func sendImage(_ image: ClipboardImage) {
+        guard image.bytes.count <= Self.maxImageBytes else {
+            let mb = image.bytes.count / 1024 / 1024
+            DispatchQueue.main.async {
+                self.status = .error("图片 \(mb)MB 超过 32MB 上限,未发送")
+            }
+            return
+        }
+        let deviceName = UIDevice.current.name
+        let ts = UInt64(Date().timeIntervalSince1970 * 1000)
+        // Cache the UIImage right now so the sent-card thumbnail can show
+        // up immediately, before the upload even starts.
+        ImageThumbCache.shared.store(image.uiImage, forTs: ts)
+
+        blobQueue.async { [weak self] in
+            guard let self, let client = self.client else { return }
+            do {
+                try client.sendImage(
+                    imageBytes: image.bytes,
+                    mimeType: image.mime,
+                    width: image.width,
+                    height: image.height,
+                    deviceName: deviceName,
+                    ts: ts
+                )
+                // Build a synthetic ClipPayload mirroring what the wire
+                // would carry, so the sent-card UI is consistent with the
+                // received-card. We don't have the real ImageMeta back from
+                // Rust (send_image returns ()), but for the local UI we
+                // only need kind/ts/deviceName + the cached thumbnail.
+                let stub = ClipPayload(
+                    kind: .image,
+                    content: "",
+                    deviceName: deviceName,
+                    ts: ts,
+                    image: ImageMeta(
+                        mimeType: image.mime,
+                        width: image.width,
+                        height: image.height,
+                        sizeBytes: UInt64(image.bytes.count),
+                        sha256Hex: "",   // local-only, never read back
+                        nonceB64: ""
+                    )
+                )
+                self.appendSent(stub)
+            } catch {
+                DispatchQueue.main.async {
+                    self.status = .error("图片发送失败: \(error)")
+                }
+            }
         }
     }
 
@@ -204,13 +280,45 @@ final class BridgeCoordinator: ObservableObject {
     }
 
     fileprivate func handleIncoming(payload: ClipPayload) {
-        DispatchQueue.main.async {
-            guard payload.kind == .text else { return }
-            UIPasteboard.general.string = payload.content
-            // Capture the post-write changeCount so the next poll tick treats
-            // our own write as a no-op instead of re-publishing it.
-            self.lastChangeCount = UIPasteboard.general.changeCount
-            self.appendRecent(payload)
+        switch payload.kind {
+        case .text:
+            DispatchQueue.main.async { self.writeIncomingText(payload) }
+        case .image:
+            guard let meta = payload.image else { return }
+            blobQueue.async { [weak self] in
+                self?.fetchAndPasteImage(payload: payload, meta: meta)
+            }
+        }
+    }
+
+    private func writeIncomingText(_ payload: ClipPayload) {
+        UIPasteboard.general.string = payload.content
+        // Capture the post-write changeCount so the next poll tick treats
+        // our own write as a no-op instead of re-publishing it.
+        lastChangeCount = UIPasteboard.general.changeCount
+        appendRecent(payload)
+    }
+
+    private func fetchAndPasteImage(payload: ClipPayload, meta: ImageMeta) {
+        guard let client = self.client else { return }
+        do {
+            let bytes = try client.fetchImage(meta: meta)
+            // Decode once on the worker thread so SwiftUI doesn't pay the
+            // cost on first display.
+            guard let image = UIImage(data: bytes) else {
+                throw NSError(domain: "ClipBridge", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "图片字节解码失败"])
+            }
+            ImageThumbCache.shared.store(image, forTs: payload.ts)
+            DispatchQueue.main.async {
+                UIPasteboard.general.image = image
+                self.lastChangeCount = UIPasteboard.general.changeCount
+                self.appendRecent(payload)
+            }
+        } catch {
+            DispatchQueue.main.async {
+                self.status = .error("图片接收失败: \(error)")
+            }
         }
     }
 
@@ -255,4 +363,52 @@ private final class Listener: ClipListener, @unchecked Sendable {
     func onState(state: ConnectionState) {
         coordinator?.handleState(state)
     }
+}
+
+private struct ClipboardImage {
+    let bytes: Data
+    let mime: String
+    let width: UInt32
+    let height: UInt32
+    /// Pre-decoded copy used to seed `ImageThumbCache` on the send path so
+    /// the UI doesn't have to re-decode for the thumbnail.
+    let uiImage: UIImage
+}
+
+/// Read whatever image rep is on the pasteboard and normalize to PNG bytes.
+/// Returns nil when no usable image is present (some apps advertise image
+/// types as part of a drag promise without actually providing data).
+private func readClipboardImage() -> ClipboardImage? {
+    let pb = UIPasteboard.general
+
+    // Prefer raw PNG when the pasteboard actually has one — saves a
+    // round-trip through UIImage decoding/re-encoding, which would
+    // otherwise discard color profiles for some screenshots.
+    if let png = pb.data(forPasteboardType: "public.png"),
+       !png.isEmpty,
+       let img = UIImage(data: png)
+    {
+        return ClipboardImage(
+            bytes: png,
+            mime: "image/png",
+            width: UInt32(img.size.width.rounded()),
+            height: UInt32(img.size.height.rounded()),
+            uiImage: img
+        )
+    }
+
+    // Fall back to the high-level image accessor (covers HEIC, JPEG,
+    // synthesized images from drag/drop). Re-encode to PNG so receivers
+    // on Android / Windows don't need a HEIC decoder.
+    if let img = pb.image, let png = img.pngData() {
+        return ClipboardImage(
+            bytes: png,
+            mime: "image/png",
+            width: UInt32(img.size.width.rounded()),
+            height: UInt32(img.size.height.rounded()),
+            uiImage: img
+        )
+    }
+
+    return nil
 }

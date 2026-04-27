@@ -96,7 +96,8 @@ final class KeyboardSync {
             kind: .text,
             content: text,
             deviceName: UIDevice.current.name,
-            ts: UInt64(Date().timeIntervalSince1970 * 1000)
+            ts: UInt64(Date().timeIntervalSince1970 * 1000),
+            image: nil
         )
         try? client?.sendClip(payload: payload)
     }
