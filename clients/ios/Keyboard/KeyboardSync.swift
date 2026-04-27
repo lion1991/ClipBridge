@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import UIKit
 
@@ -26,6 +27,14 @@ final class KeyboardSync {
     private var pollTimer: Timer?
     private var lastChangeCount: Int = UIPasteboard.general.changeCount
     private var isRunning = false
+
+    /// Recent SHA-256 hashes of text we've published or written. Same role
+    /// as the main app's `seenHashes` — keeps us from re-publishing what
+    /// the relay just delivered, and absorbs Universal Clipboard echoes
+    /// when the user copies on Mac and the keyboard is also active here.
+    /// Note: not shared with the main app's set (separate process); cross-
+    /// process coord would need an App Group cache, deferred.
+    private let seenHashes = KbRecentHashes()
 
     // MARK: - Lifecycle
 
@@ -92,6 +101,10 @@ final class KeyboardSync {
 
         guard let text = pb.string, !text.isEmpty else { return }
 
+        let h = kbSha256Hex(text)
+        if seenHashes.contains(h) { return }
+        seenHashes.insert(h)
+
         let payload = ClipPayload(
             kind: .text,
             content: text,
@@ -105,6 +118,7 @@ final class KeyboardSync {
     fileprivate func handleIncoming(_ payload: ClipPayload) {
         DispatchQueue.main.async {
             guard payload.kind == .text else { return }
+            self.seenHashes.insert(kbSha256Hex(payload.content))
             UIPasteboard.general.string = payload.content
             // Same trick as the main app: bump our cursor past our own write
             // so the next poll tick doesn't echo it back to the relay.
@@ -136,4 +150,48 @@ private final class KbListener: ClipListener, @unchecked Sendable {
     init(owner: KeyboardSync) { self.owner = owner }
     func onClip(payload: ClipPayload) { owner?.handleIncoming(payload) }
     func onState(state: ConnectionState) { owner?.handleState(state) }
+}
+
+/// Keyboard-extension copy of the main app's `RecentHashes`. Same shape,
+/// distinct type so it doesn't collide if both files end up linked into
+/// the same target. Lives in this file so the keyboard target stays
+/// minimal — no shared utility module to bring in.
+final class KbRecentHashes {
+    private let capacity: Int
+    private let ttl: TimeInterval
+    private var entries: [(hash: String, addedAt: Date)] = []
+    private let queue = DispatchQueue(label: "com.clipbridge.kb.recent-hashes")
+
+    init(capacity: Int = 32, ttl: TimeInterval = 5 * 60) {
+        self.capacity = capacity
+        self.ttl = ttl
+    }
+
+    func contains(_ hash: String) -> Bool {
+        queue.sync {
+            prune()
+            return entries.contains { $0.hash == hash }
+        }
+    }
+
+    func insert(_ hash: String) {
+        queue.sync {
+            prune()
+            entries.removeAll { $0.hash == hash }
+            entries.append((hash, Date()))
+            if entries.count > capacity {
+                entries.removeFirst(entries.count - capacity)
+            }
+        }
+    }
+
+    private func prune() {
+        let cutoff = Date().addingTimeInterval(-ttl)
+        entries.removeAll { $0.addedAt < cutoff }
+    }
+}
+
+func kbSha256Hex(_ s: String) -> String {
+    let digest = SHA256.hash(data: Data(s.utf8))
+    return digest.map { String(format: "%02x", $0) }.joined()
 }

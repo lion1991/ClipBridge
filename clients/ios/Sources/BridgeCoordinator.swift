@@ -1,4 +1,5 @@
 import Combine
+import CryptoKit
 import UIKit
 // Swift glue from clipbridge_core.swift is compiled into this same target,
 // so the types (Client, ClipPayload, ClipListener, ConnectionState, …) are
@@ -59,6 +60,12 @@ final class BridgeCoordinator: ObservableObject {
     /// Serial so a slow upload can't be lapped by the next poll's upload of
     /// the same clip — also keeps the relay from seeing reordered PUTs.
     private let blobQueue = DispatchQueue(label: "com.clipbridge.blob", qos: .userInitiated)
+
+    /// SHA-256 hashes of recently-seen clipboard content. Inserted on
+    /// publish and on receive-write so the next poll round skips both our
+    /// own echoes and Apple Universal Clipboard duplicates (which arrive
+    /// out-of-band on the same device's UIPasteboard within 1-2s).
+    private let seenHashes = RecentHashes()
 
     private init() {}
 
@@ -178,20 +185,35 @@ final class BridgeCoordinator: ObservableObject {
 
     private func checkPasteboard() {
         let pb = UIPasteboard.general
-        guard pb.changeCount != lastChangeCount else { return }
-        lastChangeCount = pb.changeCount
+        let cc = pb.changeCount
+        guard cc != lastChangeCount else { return }
 
         // Image first — screenshots set both image and text reps, but the
         // user almost always wants the picture (text rep is usually the
         // file URL or empty).
         if let image = readClipboardImage() {
+            lastChangeCount = cc
+            let h = sha256Hex(image.bytes)
+            if seenHashes.contains(h) { return }
+            seenHashes.insert(h)
             sendImage(image)
             return
         }
 
         if let text = pb.string, !text.isEmpty {
+            lastChangeCount = cc
+            let h = sha256Hex(text)
+            if seenHashes.contains(h) { return }
+            seenHashes.insert(h)
             sendText(text)
+            return
         }
+
+        // We saw a new changeCount but couldn't extract anything (likely
+        // background read denial, or a type we don't handle). Don't bump
+        // lastChangeCount — let the next foreground poll try again. The
+        // worst case is busy-polling once per second on an unsupported
+        // pasteboard type, which is harmless.
     }
 
     private func sendText(_ text: String) {
@@ -292,6 +314,7 @@ final class BridgeCoordinator: ObservableObject {
     }
 
     private func writeIncomingText(_ payload: ClipPayload) {
+        seenHashes.insert(sha256Hex(payload.content))
         UIPasteboard.general.string = payload.content
         // Capture the post-write changeCount so the next poll tick treats
         // our own write as a no-op instead of re-publishing it.
@@ -303,6 +326,17 @@ final class BridgeCoordinator: ObservableObject {
         guard let client = self.client else { return }
         do {
             let bytes = try client.fetchImage(meta: meta)
+            let h = sha256Hex(bytes)
+            // If this exact image is already on our pasteboard (e.g. UC
+            // beat us to it), still record the hash so the next poll
+            // doesn't re-publish, but skip the redundant write — we'd
+            // just bump changeCount for nothing and clobber any in-flight
+            // user action on the same content.
+            if seenHashes.contains(h) {
+                seenHashes.insert(h)   // refresh TTL
+                DispatchQueue.main.async { self.appendRecent(payload) }
+                return
+            }
             // Decode once on the worker thread so SwiftUI doesn't pay the
             // cost on first display.
             guard let image = UIImage(data: bytes) else {
@@ -310,6 +344,7 @@ final class BridgeCoordinator: ObservableObject {
                               userInfo: [NSLocalizedDescriptionKey: "图片字节解码失败"])
             }
             ImageThumbCache.shared.store(image, forTs: payload.ts)
+            seenHashes.insert(h)
             DispatchQueue.main.async {
                 UIPasteboard.general.image = image
                 self.lastChangeCount = UIPasteboard.general.changeCount
@@ -373,6 +408,60 @@ private struct ClipboardImage {
     /// Pre-decoded copy used to seed `ImageThumbCache` on the send path so
     /// the UI doesn't have to re-decode for the thumbnail.
     let uiImage: UIImage
+}
+
+/// Bounded TTL set of recently-seen content hashes. Used both to dedup our
+/// own writes (prevent the next poll from re-publishing what we just got
+/// from the relay) and to absorb Apple Universal Clipboard echoes — when
+/// UC syncs the same content Mac↔iPhone in parallel with us, the second
+/// arrival lands on `pb` with the same bytes and we'd otherwise re-publish
+/// it through the relay, creating extra blob traffic and a brief
+/// pasteboard flicker.
+///
+/// Trade-off: re-copying the exact same content within `ttl` is suppressed,
+/// since we can't tell apart "user re-copied to force a re-sync" from "UC
+/// just delivered the same bytes again". 5-min TTL is the compromise.
+final class RecentHashes {
+    private let capacity: Int
+    private let ttl: TimeInterval
+    private var entries: [(hash: String, addedAt: Date)] = []
+    private let queue = DispatchQueue(label: "com.clipbridge.recent-hashes")
+
+    init(capacity: Int = 32, ttl: TimeInterval = 5 * 60) {
+        self.capacity = capacity
+        self.ttl = ttl
+    }
+
+    func contains(_ hash: String) -> Bool {
+        queue.sync {
+            prune()
+            return entries.contains { $0.hash == hash }
+        }
+    }
+
+    func insert(_ hash: String) {
+        queue.sync {
+            prune()
+            entries.removeAll { $0.hash == hash }
+            entries.append((hash, Date()))
+            if entries.count > capacity {
+                entries.removeFirst(entries.count - capacity)
+            }
+        }
+    }
+
+    private func prune() {
+        let cutoff = Date().addingTimeInterval(-ttl)
+        entries.removeAll { $0.addedAt < cutoff }
+    }
+}
+
+func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+func sha256Hex(_ s: String) -> String {
+    sha256Hex(Data(s.utf8))
 }
 
 /// Read whatever image rep is on the pasteboard and normalize to PNG bytes.

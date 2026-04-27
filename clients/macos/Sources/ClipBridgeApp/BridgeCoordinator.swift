@@ -1,5 +1,6 @@
 import AppKit
 import ClipbridgeCore
+import CryptoKit
 
 /// Owns the Rust `Client`, the pasteboard polling timer, and the bridge between
 /// AppKit clipboard events and the Rust core.
@@ -21,6 +22,61 @@ enum BridgeStatus {
 /// message rather than being silently downscaled.
 private let maxImageBytes = 32 * 1024 * 1024
 
+/// Bounded TTL set of recently-seen content hashes. Used both to dedup our
+/// own writes (prevent the next poll from re-publishing what we just got
+/// from the relay) and to absorb Apple Universal Clipboard echoes — when
+/// UC syncs the same image Mac↔iPhone in parallel with us, the second
+/// arrival lands on `pb` with the same bytes and we'd otherwise re-publish
+/// it through the relay (creating extra blob traffic and possibly a brief
+/// pasteboard flicker).
+///
+/// Trade-off: re-copying the exact same content within `ttl` is suppressed.
+/// In practice users re-copy to "force a re-sync", which is exactly what
+/// our changeCount fast-path normally provides — but suppressing that bit
+/// of friction is the deliberate cost of UC coexistence.
+final class RecentHashes {
+    private let capacity: Int
+    private let ttl: TimeInterval
+    private var entries: [(hash: String, addedAt: Date)] = []
+    private let queue = DispatchQueue(label: "com.clipbridge.recent-hashes")
+
+    init(capacity: Int = 32, ttl: TimeInterval = 5 * 60) {
+        self.capacity = capacity
+        self.ttl = ttl
+    }
+
+    func contains(_ hash: String) -> Bool {
+        queue.sync {
+            prune()
+            return entries.contains { $0.hash == hash }
+        }
+    }
+
+    func insert(_ hash: String) {
+        queue.sync {
+            prune()
+            entries.removeAll { $0.hash == hash }
+            entries.append((hash, Date()))
+            if entries.count > capacity {
+                entries.removeFirst(entries.count - capacity)
+            }
+        }
+    }
+
+    private func prune() {
+        let cutoff = Date().addingTimeInterval(-ttl)
+        entries.removeAll { $0.addedAt < cutoff }
+    }
+}
+
+func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+func sha256Hex(_ s: String) -> String {
+    sha256Hex(Data(s.utf8))
+}
+
 final class BridgeCoordinator {
     private let config: PairingConfig
     private let onStateChange: (BridgeStatus) -> Void
@@ -34,6 +90,11 @@ final class BridgeCoordinator {
     /// Serial so a slow upload can't be lapped by the next poll's upload of
     /// the same clip — also keeps the relay from seeing reordered PUTs.
     private let blobQueue = DispatchQueue(label: "com.clipbridge.blob", qos: .userInitiated)
+
+    /// SHA-256 hashes of recently-seen clipboard content. Inserted on
+    /// publish and on receive-write so the next poll round skips both our
+    /// own echoes and Universal Clipboard duplicates.
+    private let seenHashes = RecentHashes()
 
     private static let deviceId: String = {
         let key = "com.clipbridge.device_id"
@@ -99,11 +160,17 @@ final class BridgeCoordinator {
         // Image first: screenshots set both image and text reps, but the
         // user pretty much always wants the picture, not its filename.
         if let image = readClipboardImage() {
+            let h = sha256Hex(image.bytes)
+            if seenHashes.contains(h) { return }
+            seenHashes.insert(h)
             sendImage(image)
             return
         }
 
         if let text = pb.string(forType: .string), !text.isEmpty {
+            let h = sha256Hex(text)
+            if seenHashes.contains(h) { return }
+            seenHashes.insert(h)
             sendText(text)
         }
     }
@@ -164,6 +231,7 @@ final class BridgeCoordinator {
 
     private func writeText(_ text: String) {
         guard !text.isEmpty else { return }
+        seenHashes.insert(sha256Hex(text))
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(text, forType: .string)
@@ -185,6 +253,7 @@ final class BridgeCoordinator {
     }
 
     private func writeImage(_ data: Data) {
+        seenHashes.insert(sha256Hex(data))
         let pb = NSPasteboard.general
         pb.clearContents()
         // Hand AppKit an NSImage so consumers (Preview, Notes, Slack,
