@@ -140,6 +140,63 @@ final class BridgeCoordinator: ObservableObject {
         try? client?.fetchRecent()
     }
 
+    /// Re-paste a previously-seen clip onto the local pasteboard from the
+    /// row tap. Routes through the coordinator (rather than the row poking
+    /// `UIPasteboard` directly) so we can fall back to a blob re-fetch when
+    /// the in-memory cache lost its bytes — and so the write goes through
+    /// the same multi-rep path that receive uses.
+    func pasteFromHistory(_ payload: ClipPayload) {
+        switch payload.kind {
+        case .text:
+            seenHashes.insert(sha256Hex(payload.content))
+            UIPasteboard.general.string = payload.content
+            lastChangeCount = UIPasteboard.general.changeCount
+        case .image:
+            if let bytes = ImageThumbCache.shared.fullData(forTs: payload.ts) {
+                writeImageBytesToPasteboard(bytes)
+                return
+            }
+            // Cache miss (long-running app, jetsam, evicted by newer
+            // clips). Try to refetch from the relay's blob cache — works
+            // for ~5 minutes, the relay's TTL.
+            guard let meta = payload.image, !meta.sha256Hex.isEmpty else {
+                // Sent-side stubs ship with an empty sha (we never get the
+                // real meta back from Rust). Refetching would 400; just
+                // silently no-op like before.
+                return
+            }
+            blobQueue.async { [weak self] in
+                guard let self, let client = self.client else { return }
+                guard let bytes = try? client.fetchImage(meta: meta) else {
+                    DispatchQueue.main.async {
+                        self.status = .error("图片已过期, 请在源设备重新复制")
+                    }
+                    return
+                }
+                if let img = UIImage(data: bytes) {
+                    ImageThumbCache.shared.store(image: img, bytes: bytes, forTs: payload.ts)
+                }
+                DispatchQueue.main.async {
+                    self.writeImageBytesToPasteboard(bytes)
+                }
+            }
+        }
+    }
+
+    /// Single source of truth for writing image bytes to UIPasteboard. Sets
+    /// raw PNG bytes literally (no UIImage round-trip — see fetchAndPaste
+    /// for the reasoning) under both `public.png` and `public.image` so
+    /// receiving apps that strict-match on either UTI find what they want.
+    /// Some IM apps (WeChat, etc.) only check the parent type.
+    private func writeImageBytesToPasteboard(_ bytes: Data) {
+        seenHashes.insert(sha256Hex(bytes))
+        UIPasteboard.general.setItems([[
+            "public.png": bytes,
+            "public.image": bytes,
+        ]])
+        lastChangeCount = UIPasteboard.general.changeCount
+    }
+
     private func startSync(with cfg: PairingConfig) {
         stopSync()
         guard let key = cfg.keyData else {
@@ -345,17 +402,11 @@ final class BridgeCoordinator: ObservableObject {
                               userInfo: [NSLocalizedDescriptionKey: "图片字节解码失败"])
             }
             ImageThumbCache.shared.store(image: image, bytes: bytes, forTs: payload.ts)
-            seenHashes.insert(h)
             DispatchQueue.main.async {
-                // Write raw PNG bytes literally. Setting `pb.image = image`
-                // would make UIPasteboard hold a UIImage; the next poll's
-                // `data(forPasteboardType: "public.png")` would get a
-                // *re-encoded* PNG (different bytes) — sha256 dedup would
-                // miss and we'd republish in a loop, ping-ponging the same
-                // image with each end re-encoding to slightly different
-                // bytes. Storing literal bytes keeps the round-trip exact.
-                UIPasteboard.general.setData(bytes, forPasteboardType: "public.png")
-                self.lastChangeCount = UIPasteboard.general.changeCount
+                // writeImageBytesToPasteboard inserts the hash before
+                // writing — keeps poll dedup tight and centralizes the
+                // multi-rep / setItems policy.
+                self.writeImageBytesToPasteboard(bytes)
                 self.appendRecent(payload)
             }
         } catch {

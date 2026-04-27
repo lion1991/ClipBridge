@@ -188,6 +188,7 @@ struct ClipHistoryCard: View {
 
 struct RecentClipRow: View {
     let clip: ClipPayload
+    @EnvironmentObject var coordinator: BridgeCoordinator
 
     var body: some View {
         Button(action: copy) {
@@ -232,17 +233,10 @@ struct RecentClipRow: View {
     }
 
     private func copy() {
-        switch clip.kind {
-        case .text:
-            UIPasteboard.general.string = clip.content
-        case .image:
-            // Paste raw bytes literally so the dedup hash on the next poll
-            // tick still matches what we sent / received. Falls back to
-            // silent no-op if the bytes were evicted under memory pressure.
-            if let bytes = ImageThumbCache.shared.fullData(forTs: clip.ts) {
-                UIPasteboard.general.setData(bytes, forPasteboardType: "public.png")
-            }
-        }
+        // Route through the coordinator: it handles cache miss (refetch
+        // from relay's blob cache), writes both public.png + public.image
+        // for IM-app compatibility, and updates dedup state in one place.
+        coordinator.pasteFromHistory(clip)
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 

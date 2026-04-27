@@ -2,63 +2,65 @@ import UIKit
 
 /// In-memory cache for the recent-clips cards.
 ///
-/// Keyed by clip timestamp (UInt64 → NSNumber) so both the send and receive
-/// paths can stash a UIImage right when they have the bytes in hand. Two
-/// independent stores per entry:
+/// Keyed by clip timestamp (UInt64) so both the send and receive paths can
+/// stash a UIImage right when they have the bytes in hand. Two parts per
+/// entry:
 ///
-///  - **Thumbnail**: pre-rendered small bitmap used by the row's preview
-///    image. Tiny (≤ a few KB each) so the budget can hold a long history
-///    without NSCache evicting under memory pressure.
-///  - **Full data**: the original PNG bytes for tap-to-paste. Larger (a
-///    full-screen iPhone screenshot is ~14MB decoded, ~150KB compressed),
-///    so we stash the *bytes* not the decoded UIImage — much cheaper, and
-///    the user pays the decode only on tap.
+///  - **Thumbnail**: pre-rendered ≤96pt UIImage for the row preview.
+///  - **Full bytes**: the original PNG `Data` for tap-to-paste fidelity.
 ///
-/// Splitting the two means a flurry of big screenshots can't evict each
-/// other's thumbnails, which previously caused recent rows to render with
-/// the gray placeholder seconds after they appeared.
+/// Storage is a manual LRU dictionary, *not* `NSCache`. NSCache evicts
+/// opaquely under memory pressure regardless of cost limits, which made
+/// tap-to-paste look broken when bytes vanished between receive and tap —
+/// the row's `setData` call became a silent no-op. With a fixed 16-entry
+/// LRU we know exactly how much we hold (a few MB) and that nothing
+/// disappears under us.
 final class ImageThumbCache {
     static let shared = ImageThumbCache()
 
-    /// 96pt at @3x = 288×288 = ~330 KB per entry. 16MB budget = ~50 entries
-    /// of headroom, far more than the 6 rows we ever show.
+    /// Pre-rendered thumbnail max side. 96pt covers the 56pt row preview at
+    /// up to ~1.7x oversampling without retina blur.
     private static let thumbnailMaxSide: CGFloat = 96
+    private static let capacity = 16
 
-    private let thumbnails: NSCache<NSNumber, UIImage> = {
-        let c = NSCache<NSNumber, UIImage>()
-        c.countLimit = 64
-        c.totalCostLimit = 16 * 1024 * 1024
-        return c
-    }()
+    private struct Entry {
+        let thumbnail: UIImage
+        let bytes: Data
+    }
 
-    private let fullData: NSCache<NSNumber, NSData> = {
-        let c = NSCache<NSNumber, NSData>()
-        c.countLimit = 32
-        // 128MB — enough for a handful of full-screen screenshots without
-        // NSCache eagerly evicting them. iOS still discards under real
-        // memory pressure regardless of this limit.
-        c.totalCostLimit = 128 * 1024 * 1024
-        return c
-    }()
+    private let lock = NSLock()
+    private var entries: [UInt64: Entry] = [:]
+    /// Insertion order; oldest first. Updated on every store so the LRU
+    /// drops the longest-untouched entry once we hit `capacity`.
+    private var order: [UInt64] = []
 
     func thumbnail(forTs ts: UInt64) -> UIImage? {
-        thumbnails.object(forKey: NSNumber(value: ts))
+        lock.lock(); defer { lock.unlock() }
+        return entries[ts]?.thumbnail
     }
 
     func fullData(forTs ts: UInt64) -> Data? {
-        fullData.object(forKey: NSNumber(value: ts)) as Data?
+        lock.lock(); defer { lock.unlock() }
+        return entries[ts]?.bytes
     }
 
-    /// Store both representations. `image` is decoded once on the caller's
-    /// thread (presumably already a hot UIImage from the read or fetch
-    /// path) and downscaled to a thumbnail; `bytes` is held verbatim for
-    /// re-paste fidelity.
+    /// Store both reps. `image` is downscaled once on the caller's thread
+    /// so SwiftUI never blocks on a multi-MB decode.
     func store(image: UIImage, bytes: Data, forTs ts: UInt64) {
-        let key = NSNumber(value: ts)
         let thumb = downscale(image, maxSide: Self.thumbnailMaxSide)
-        let thumbCost = Int(thumb.size.width * thumb.size.height * 4 * thumb.scale * thumb.scale)
-        thumbnails.setObject(thumb, forKey: key, cost: thumbCost)
-        fullData.setObject(bytes as NSData, forKey: key, cost: bytes.count)
+        lock.lock(); defer { lock.unlock() }
+        if entries[ts] == nil {
+            order.append(ts)
+        } else {
+            // Refresh recency: move ts to the end of the order list.
+            order.removeAll { $0 == ts }
+            order.append(ts)
+        }
+        entries[ts] = Entry(thumbnail: thumb, bytes: bytes)
+        while order.count > Self.capacity {
+            let oldest = order.removeFirst()
+            entries.removeValue(forKey: oldest)
+        }
     }
 
     private func downscale(_ image: UIImage, maxSide: CGFloat) -> UIImage {
