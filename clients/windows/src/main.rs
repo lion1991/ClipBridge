@@ -135,9 +135,14 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app, event| {
-            if let RunEvent::ExitRequested { api, .. } = event {
-                // Don't auto-quit when last window closes.
-                api.prevent_exit();
+            if let RunEvent::ExitRequested { api, code, .. } = event {
+                // Implicit close (user X-buttoned the last window) → keep
+                // the tray app running. `code` is None in that case.
+                // Explicit `app.exit(N)` from the tray menu → carries
+                // Some(N); let it through so the process actually quits.
+                if code.is_none() {
+                    api.prevent_exit();
+                }
             }
         });
 }
