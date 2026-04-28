@@ -153,10 +153,33 @@ impl From<mdns_sd::Error> for LanError {
 }
 
 /// Live registry of peers we currently have a fully-handshaked LAN session
-/// to, keyed by mDNS instance fullname (so two processes on one device —
-/// e.g. iOS main app + keyboard — count as separate entries). The values
-/// are the human-friendly device names the peers sent in their Hello.
-pub type PeerRegistry = Arc<std::sync::Mutex<HashMap<String, String>>>;
+/// to, keyed by a per-session id (mDNS instance fullname for outbound,
+/// `inbound:{remote_addr}` for inbound) so reconnects from a new source
+/// port don't clobber a still-alive old session's entry. The value is
+/// `(peer_device_id, device_name)`: keep the device id around so UI
+/// getters can dedupe transient overlaps (e.g. peer reconnected before
+/// the old session's idle timeout fired) and intentional same-device
+/// multi-process registrations (iOS main app + keyboard share a did).
+pub type PeerRegistry = Arc<std::sync::Mutex<HashMap<String, (String, String)>>>;
+
+/// Snapshot the registry as a list of display names with one entry per
+/// logical peer (deduped by device_id). Used by the FFI getters that
+/// drive the UI's "局域网: A, B" line — users care about logical peers,
+/// not raw TCP sessions.
+pub fn unique_peer_names(reg: &PeerRegistry) -> Vec<String> {
+    let g = match reg.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for (did, name) in g.values() {
+        if seen.insert(did.clone()) {
+            out.push(name.clone());
+        }
+    }
+    out
+}
 
 /// Information cached from an mDNS `ServiceResolved` event. The reconciler
 /// loop scans this every `RECONNECT_INTERVAL` and re-dials any entry that
@@ -508,11 +531,7 @@ impl LanNode {
     /// both Mac and iOS but Mac and iOS only see Android → we know
     /// the missing edge is Mac↔iOS).
     pub fn peer_names(&self) -> Vec<String> {
-        let g = match self.peers.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        g.values().cloned().collect()
+        unique_peer_names(&self.peers)
     }
 }
 
@@ -533,10 +552,16 @@ struct PeerSessionGuard {
     key: String,
 }
 impl PeerSessionGuard {
-    fn new(count: Arc<AtomicUsize>, peers: PeerRegistry, key: String, name: String) -> Self {
+    fn new(
+        count: Arc<AtomicUsize>,
+        peers: PeerRegistry,
+        key: String,
+        peer_did: String,
+        name: String,
+    ) -> Self {
         count.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut g) = peers.lock() {
-            g.insert(key.clone(), name);
+            g.insert(key.clone(), (peer_did, name));
         }
         Self { count, peers, key }
     }
@@ -666,7 +691,13 @@ async fn run_peer(
     // Only bump the public counter / registry once we have a real
     // handshake. Drop happens automatically when this function returns
     // or panics, so the count and the name list stay consistent.
-    let _peer_guard = PeerSessionGuard::new(peer_count, peers, registry_key, display_name.clone());
+    let _peer_guard = PeerSessionGuard::new(
+        peer_count,
+        peers,
+        registry_key,
+        peer_did.clone(),
+        display_name.clone(),
+    );
     tracing::info!(%addr, peer = %display_name, "lan peer up");
 
     // Single select! for outbound writes (clips + ping), inbound reads,

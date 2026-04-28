@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::blob::{BlobClient, BlobError};
 use crate::crypto::{decrypt, encrypt, sha256_hex, KEY_LEN, NONCE_LEN};
-use crate::lan::{IncomingLanClip, LanNode, PeerRegistry};
+use crate::lan::{unique_peer_names, IncomingLanClip, LanNode, PeerRegistry};
 use crate::protocol::{ClientMessage, ClipKind, ClipPayload, ImageMeta, ServerMessage};
 
 /// Rustls 0.23 refuses to pick a crypto provider on its own when more than
@@ -276,17 +276,15 @@ impl Client {
         self.shared.lan_peers.load(Ordering::Relaxed) as u32
     }
 
-    /// Snapshot of currently-connected peers' device names. Order is not
-    /// stable across calls (HashMap iteration). Empty vec = no LAN peers
+    /// Snapshot of currently-connected peers' device names, one entry per
+    /// logical peer (deduped on device_id so a reconnect transient or an
+    /// iOS app+keyboard pair doesn't surface twice). Order is not stable
+    /// across calls (HashMap iteration). Empty vec = no LAN peers
     /// (relay-only). UI uses this to render the actual peer list, which
     /// makes mesh asymmetry obvious — if Mac shows ["Android"] and
     /// Android shows ["Mac", "iPhone"], the missing edge is Mac↔iPhone.
     pub fn lan_peers(&self) -> Vec<String> {
-        let g = match self.shared.lan_peer_names.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        g.values().cloned().collect()
+        unique_peer_names(&self.shared.lan_peer_names)
     }
 
     /// Signal the worker thread to disconnect and wait for it to finish.

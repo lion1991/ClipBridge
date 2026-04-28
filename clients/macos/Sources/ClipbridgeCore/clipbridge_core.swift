@@ -536,8 +536,10 @@ public protocol ClientProtocol: AnyObject, Sendable {
     func lanPeerCount()  -> UInt32
     
     /**
-     * Snapshot of currently-connected peers' device names. Order is not
-     * stable across calls (HashMap iteration). Empty vec = no LAN peers
+     * Snapshot of currently-connected peers' device names, one entry per
+     * logical peer (deduped on device_id so a reconnect transient or an
+     * iOS app+keyboard pair doesn't surface twice). Order is not stable
+     * across calls (HashMap iteration). Empty vec = no LAN peers
      * (relay-only). UI uses this to render the actual peer list, which
      * makes mesh asymmetry obvious — if Mac shows ["Android"] and
      * Android shows ["Mac", "iPhone"], the missing edge is Mac↔iPhone.
@@ -672,8 +674,10 @@ open func lanPeerCount() -> UInt32  {
 }
     
     /**
-     * Snapshot of currently-connected peers' device names. Order is not
-     * stable across calls (HashMap iteration). Empty vec = no LAN peers
+     * Snapshot of currently-connected peers' device names, one entry per
+     * logical peer (deduped on device_id so a reconnect transient or an
+     * iOS app+keyboard pair doesn't surface twice). Order is not stable
+     * across calls (HashMap iteration). Empty vec = no LAN peers
      * (relay-only). UI uses this to render the actual peer list, which
      * makes mesh asymmetry obvious — if Mac shows ["Android"] and
      * Android shows ["Mac", "iPhone"], the missing edge is Mac↔iPhone.
@@ -1529,7 +1533,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_clipbridge_core_checksum_method_client_lan_peer_count() != 51217) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_clipbridge_core_checksum_method_client_lan_peers() != 35633) {
+    if (uniffi_clipbridge_core_checksum_method_client_lan_peers() != 17374) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_client_send_clip() != 42893) {
