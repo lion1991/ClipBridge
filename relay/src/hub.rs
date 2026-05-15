@@ -56,19 +56,25 @@ impl Hub {
         self.conn_seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Get the group, creating it on first touch. Uses dashmap's per-key
+    /// `entry` (which holds the shard write lock across the check and the
+    /// insert) rather than a `contains_key` + `insert` pair: the latter is
+    /// a TOCTOU race under a multi-threaded runtime — two connections for a
+    /// not-yet-existing group could both insert, the second replacing the
+    /// first `Group` and orphaning its broadcast channel + recent-cache, so
+    /// a subscriber on the losing channel never receives publishes. The
+    /// production relay is single-threaded (`current_thread`) so it never
+    /// hit this, but it's a real correctness bug under any multi-threaded
+    /// deployment and the multi-thread integration tests flaked on it.
     fn entry(&self, group_id: &str) -> dashmap::mapref::one::RefMut<'_, String, Group> {
-        if !self.inner.contains_key(group_id) {
+        self.inner.entry(group_id.to_string()).or_insert_with(|| {
             let (tx, _) = broadcast::channel(BROADCAST_CAP);
-            self.inner.insert(
-                group_id.to_string(),
-                Group {
-                    tx,
-                    cache: parking_lot_compat::Mutex::new(VecDeque::with_capacity(RECENT_CAP)),
-                    presence: parking_lot_compat::Mutex::new(HashMap::new()),
-                },
-            );
-        }
-        self.inner.get_mut(group_id).expect("just inserted")
+            Group {
+                tx,
+                cache: parking_lot_compat::Mutex::new(VecDeque::with_capacity(RECENT_CAP)),
+                presence: parking_lot_compat::Mutex::new(HashMap::new()),
+            }
+        })
     }
 
     pub fn subscribe(&self, group_id: &str) -> broadcast::Receiver<RecentClip> {
