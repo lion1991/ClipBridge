@@ -118,6 +118,13 @@ async fn handle_socket(socket: WebSocket, hub: Hub, egress: std::net::IpAddr) {
                         // and notifies the rest that we joined. `LanPeers`
                         // only ever reaches connections that reach here, so
                         // old clients (which never send this) are unaffected.
+                        tracing::info!(
+                            device_id = %joined_device_id,
+                            %egress,
+                            candidate_count = candidates.len(),
+                            candidates = ?candidates,
+                            "lan advertise received"
+                        );
                         rv_group = Some(group_id.clone());
                         hub.rendezvous_upsert(
                             &group_id,

@@ -22,6 +22,20 @@ use tokio::sync::mpsc;
 use crate::clipboard_listener::ClipboardListener;
 use crate::pairing::{PairingConfig, Store};
 
+#[cfg(any(windows, test))]
+use std::path::Path;
+
+#[cfg(windows)]
+use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
+
+#[cfg(windows)]
+use windows::Win32::{
+    System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    },
+    UI::Shell::{DragQueryFileW, HDROP},
+};
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum UiState {
@@ -509,6 +523,10 @@ struct NormalizedPng {
 /// PNG encoding fails (rare, but arboard hands us non-stride RGBA so a
 /// malformed buffer would).
 fn read_clipboard_image() -> Option<NormalizedPng> {
+    read_clipboard_bitmap_image().or_else(read_clipboard_image_file)
+}
+
+fn read_clipboard_bitmap_image() -> Option<NormalizedPng> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
     let img = clipboard.get_image().ok()?;
     let width = img.width as u32;
@@ -523,6 +541,105 @@ fn read_clipboard_image() -> Option<NormalizedPng> {
         width,
         height,
     })
+}
+
+#[cfg(windows)]
+fn read_clipboard_image_file() -> Option<NormalizedPng> {
+    normalize_first_image_file(clipboard_file_paths_from_hdrop()?.iter())
+}
+
+#[cfg(not(windows))]
+fn read_clipboard_image_file() -> Option<NormalizedPng> {
+    None
+}
+
+#[cfg(windows)]
+fn normalize_first_image_file<'a, I>(paths: I) -> Option<NormalizedPng>
+where
+    I: IntoIterator<Item = &'a PathBuf>,
+{
+    paths
+        .into_iter()
+        .find_map(|path| normalize_image_file_at_path(path.as_path()))
+}
+
+#[cfg(any(windows, test))]
+fn normalize_image_file_at_path(path: &Path) -> Option<NormalizedPng> {
+    if !is_supported_clipboard_image_file(path) {
+        return None;
+    }
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_IMAGE_BYTES as u64 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    normalize_to_png(&bytes)
+}
+
+#[cfg(any(windows, test))]
+fn is_supported_clipboard_image_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg"))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+struct ClipboardGuard;
+
+#[cfg(windows)]
+impl ClipboardGuard {
+    fn open() -> Option<Self> {
+        unsafe { OpenClipboard(None).ok()? };
+        Some(Self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ClipboardGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseClipboard();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn clipboard_file_paths_from_hdrop() -> Option<Vec<PathBuf>> {
+    const CF_HDROP_FORMAT: u32 = 15;
+
+    let _guard = ClipboardGuard::open()?;
+    unsafe {
+        IsClipboardFormatAvailable(CF_HDROP_FORMAT).ok()?;
+        let handle = GetClipboardData(CF_HDROP_FORMAT).ok()?;
+        let hdrop = HDROP(handle.0);
+        if hdrop.is_invalid() {
+            return None;
+        }
+
+        let count = DragQueryFileW(hdrop, u32::MAX, None);
+        if count == 0 {
+            return None;
+        }
+
+        let mut paths = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let len = DragQueryFileW(hdrop, index, None);
+            if len == 0 {
+                continue;
+            }
+            let mut buffer = vec![0u16; len as usize + 1];
+            let written = DragQueryFileW(hdrop, index, Some(&mut buffer));
+            if written == 0 {
+                continue;
+            }
+            paths.push(PathBuf::from(OsString::from_wide(
+                &buffer[..written as usize],
+            )));
+        }
+
+        (!paths.is_empty()).then_some(paths)
+    }
 }
 
 /// Decode arbitrary image bytes (PNG/JPEG/etc.) → re-encode as PNG. Used
@@ -621,6 +738,49 @@ fn device_name() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Windows".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, path::PathBuf};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "clipbridge-windows-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = ImageBuffer::from_pixel(width, height, Rgba([42u8, 90, 210, 255]));
+        let mut png = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .expect("encode test png");
+        png
+    }
+
+    #[test]
+    fn normalizes_copied_png_file_from_path() {
+        let dir = temp_dir("png-file");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("copied.png");
+        let original = png_bytes(3, 2);
+        fs::write(&path, &original).expect("write png");
+
+        let png = normalize_image_file_at_path(&path).expect("image file should decode");
+
+        assert_eq!(png.mime, "image/png");
+        assert_eq!((png.width, png.height), (3, 2));
+        assert_eq!(png.bytes, original);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 struct BridgeListener {

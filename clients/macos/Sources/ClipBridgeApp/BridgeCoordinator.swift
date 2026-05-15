@@ -1,6 +1,7 @@
 import AppKit
 import ClipbridgeCore
 import CryptoKit
+import UniformTypeIdentifiers
 
 /// Owns the Rust `Client`, the pasteboard polling timer, and the bridge between
 /// AppKit clipboard events and the Rust core.
@@ -129,6 +130,7 @@ final class BridgeCoordinator: ObservableObject {
     private var pollTimer: Timer?
 
     private var lastChangeCount: Int = NSPasteboard.general.changeCount
+    private var pasteboardImageScanInFlight = false
 
     /// Off-main worker for HTTP-bound operations (blob upload / download).
     /// Serial so a slow upload can't be lapped by the next poll's upload of
@@ -243,8 +245,8 @@ final class BridgeCoordinator: ObservableObject {
 
     private func checkPasteboard() {
         let pb = NSPasteboard.general
-        guard pb.changeCount != lastChangeCount else { return }
-        lastChangeCount = pb.changeCount
+        let changeCount = pb.changeCount
+        guard changeCount != lastChangeCount else { return }
 
         // Apple Universal Clipboard echo guard. We've just sent or
         // received a clip via ClipBridge; UC is independently delivering
@@ -252,27 +254,59 @@ final class BridgeCoordinator: ObservableObject {
         // Reading + publishing now would either bounce our own clip back
         // to the source device (visible as a duplicate row) or cycle
         // through repeated re-encodings. Skip the read entirely.
-        if Date() < quietPasteboardUntil { return }
-
-        // Image first: screenshots set both image and text reps, but the
-        // user pretty much always wants the picture, not its filename.
-        if let image = readClipboardImage() {
-            // Pixel hash, not byte hash — see `imagePixelHashHex` for why.
-            // Falls back to byte hash if decode somehow fails (kept just so
-            // the dedup path never silently lets the same bytes through).
-            let h = imagePixelHashHex(image.bytes) ?? sha256Hex(image.bytes)
-            if seenHashes.contains(h) { return }
-            seenHashes.insert(h)
-            sendImage(image)
+        if Date() < quietPasteboardUntil {
+            lastChangeCount = changeCount
             return
         }
 
-        if let text = pb.string(forType: .string), !text.isEmpty {
-            let h = sha256Hex(text)
-            if seenHashes.contains(h) { return }
-            seenHashes.insert(h)
-            sendText(text)
+        // Image first: screenshots set both image and text reps, but the
+        // user pretty much always wants the picture, not its filename.
+        //
+        // Decoding TIFF/PNG and computing the pixel hash can take tens or
+        // hundreds of milliseconds for large screenshots or Universal
+        // Clipboard-promised data. Keep that work off the AppKit thread so
+        // the menu-bar app does not beachball during the 0.5Hz poll.
+        let types = pb.types ?? []
+        if types.contains(.png) || types.contains(.tiff) {
+            guard !pasteboardImageScanInFlight else { return }
+            lastChangeCount = changeCount
+            processPasteboardImageAsync(changeCount: changeCount)
+            return
         }
+
+        lastChangeCount = changeCount
+        if let text = pb.string(forType: .string), !text.isEmpty {
+            processPasteboardText(text)
+        }
+    }
+
+    private func processPasteboardImageAsync(changeCount: Int) {
+        pasteboardImageScanInFlight = true
+        blobQueue.async { [weak self] in
+            let image = readClipboardImage()
+            let hash = image.map { imagePixelHashHex($0.bytes) ?? sha256Hex($0.bytes) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.pasteboardImageScanInFlight = false
+                guard NSPasteboard.general.changeCount == changeCount else { return }
+                guard let image, let hash else {
+                    if let text = NSPasteboard.general.string(forType: .string), !text.isEmpty {
+                        self.processPasteboardText(text)
+                    }
+                    return
+                }
+                if self.seenHashes.contains(hash) { return }
+                self.seenHashes.insert(hash)
+                self.sendImage(image)
+            }
+        }
+    }
+
+    private func processPasteboardText(_ text: String) {
+        let h = sha256Hex(text)
+        if seenHashes.contains(h) { return }
+        seenHashes.insert(h)
+        sendText(text)
     }
 
     private func sendText(_ text: String) {
@@ -299,28 +333,10 @@ final class BridgeCoordinator: ObservableObject {
     func sendImageFromFile(at url: URL) {
         do {
             let bytes = try Data(contentsOf: url)
-            guard let image = NSImage(data: bytes) else {
+            guard let clip = clipboardImage(from: bytes, sourceExtension: url.pathExtension) else {
                 onStateChange(.error("无法解码 \(url.lastPathComponent)"))
                 return
             }
-            // Re-encode to PNG so receivers don't need a HEIC/TIFF/etc
-            // decoder. Skip when the source is already PNG to avoid a
-            // pointless decode→encode round trip that changes bytes.
-            let (pngBytes, mime): (Data, String) = {
-                if url.pathExtension.lowercased() == "png" { return (bytes, "image/png") }
-                if let rep = NSBitmapImageRep(data: bytes),
-                   let png = rep.representation(using: .png, properties: [:])
-                {
-                    return (png, "image/png")
-                }
-                return (bytes, "application/octet-stream")
-            }()
-            let clip = ClipboardImage(
-                bytes: pngBytes,
-                mime: mime,
-                width: UInt32(image.size.width.rounded()),
-                height: UInt32(image.size.height.rounded())
-            )
             sendImage(clip)
         } catch {
             onStateChange(.error("读取失败:\(error.localizedDescription)"))
@@ -392,7 +408,8 @@ final class BridgeCoordinator: ObservableObject {
         guard let client = self.client else { return }
         do {
             let bytes = try client.fetchImage(meta: meta)
-            let h = imagePixelHashHex(bytes) ?? sha256Hex(bytes)
+            let pixelHash = imagePixelHashHex(bytes)
+            let h = pixelHash ?? sha256Hex(bytes)
             // Same content already on our pasteboard / in our history — skip
             // the write and the history append. Catches the UC bounce-back
             // where iPhone re-encoded our image and broadcast it back.
@@ -409,8 +426,9 @@ final class BridgeCoordinator: ObservableObject {
                 deviceName: payload.deviceName,
                 ts: payload.ts
             )
+            let tiff = tiffRep(from: bytes)
             DispatchQueue.main.async {
-                self.writeImage(bytes)
+                self.applyImageToPasteboard(png: bytes, tiff: tiff, pixelHash: pixelHash)
                 self.appendReceived(entry)
             }
             // Auto-save outside the main queue — file I/O is sync and we
@@ -419,10 +437,6 @@ final class BridgeCoordinator: ObservableObject {
         } catch {
             showTransientError("图片接收失败: \(friendlyErrorMessage(error))")
         }
-    }
-
-    private func writeImage(_ data: Data) {
-        applyImageToPasteboard(png: data, tiff: tiffRep(from: data))
     }
 
     /// Re-place a history entry's image on the system pasteboard for a
@@ -438,9 +452,10 @@ final class BridgeCoordinator: ObservableObject {
     ///     other device, possibly looping via Universal Clipboard).
     func rePasteImageToClipboard(_ data: Data) {
         blobQueue.async { [weak self] in
+            let pixelHash = imagePixelHashHex(data)
             let tiff = self?.tiffRep(from: data)
             DispatchQueue.main.async {
-                self?.applyImageToPasteboard(png: data, tiff: tiff)
+                self?.applyImageToPasteboard(png: data, tiff: tiff, pixelHash: pixelHash)
             }
         }
     }
@@ -456,13 +471,13 @@ final class BridgeCoordinator: ObservableObject {
 
     /// Guarded pasteboard write shared by inbound delivery and manual
     /// re-paste. Must be called on the main thread.
-    private func applyImageToPasteboard(png data: Data, tiff: Data?) {
+    private func applyImageToPasteboard(png data: Data, tiff: Data?, pixelHash: String?) {
         // Insert the pixel hash so the next poll's pixel-hash check still
         // matches — and falls through to byte hash as a belt-and-suspenders
         // for the case where the same bytes literally come back (no UC
         // re-encoding) and the receive path's pixel-hash already sat in
         // the set.
-        if let ph = imagePixelHashHex(data) { seenHashes.insert(ph) }
+        if let pixelHash { seenHashes.insert(pixelHash) }
         seenHashes.insert(sha256Hex(data))
         let pb = NSPasteboard.general
         pb.clearContents()
@@ -636,6 +651,8 @@ private struct ClipboardImage {
     let height: UInt32
 }
 
+private let filenamesPasteboardType = NSPasteboard.PasteboardType("NSFilenamesPboardType")
+
 /// Read whatever image rep is on the pasteboard and normalize to PNG bytes.
 /// Returns nil when no usable image is present, even if PNG/TIFF types are
 /// advertised but empty (some apps register types as part of a drag promise
@@ -643,6 +660,13 @@ private struct ClipboardImage {
 private func readClipboardImage() -> ClipboardImage? {
     let pb = NSPasteboard.general
     let types = pb.types ?? []
+
+    // Finder file-copy pasteboards often include both `public.file-url` and
+    // `public.png`. The PNG can be the Finder document icon preview rather
+    // than the actual file bytes, so prefer the real file URL when present.
+    if let fromFile = readImageFileFromPasteboard(pb, types: types) {
+        return fromFile
+    }
 
     var pngData: Data?
     if types.contains(.png), let data = pb.data(forType: .png), !data.isEmpty {
@@ -659,11 +683,71 @@ private func readClipboardImage() -> ClipboardImage? {
         pngData = png
     }
 
-    guard let data = pngData, let image = NSImage(data: data) else { return nil }
+    guard let data = pngData else { return nil }
+    return clipboardImage(from: data, sourceExtension: "png")
+}
+
+private func readImageFileFromPasteboard(
+    _ pb: NSPasteboard,
+    types: [NSPasteboard.PasteboardType]
+) -> ClipboardImage? {
+    var urls: [URL] = []
+
+    if types.contains(.fileURL),
+       let s = pb.string(forType: .fileURL),
+       let url = URL(string: s),
+       url.isFileURL {
+        urls.append(url)
+    }
+
+    if let items = pb.pasteboardItems {
+        for item in items {
+            guard let s = item.string(forType: .fileURL),
+                  let url = URL(string: s),
+                  url.isFileURL else { continue }
+            urls.append(url)
+        }
+    }
+
+    if let paths = pb.propertyList(forType: filenamesPasteboardType) as? [String] {
+        urls.append(contentsOf: paths.map { URL(fileURLWithPath: $0) })
+    }
+
+    var seen = Set<String>()
+    for url in urls where seen.insert(url.path).inserted {
+        guard let type = UTType(filenameExtension: url.pathExtension),
+              type.conforms(to: .image),
+              let data = try? Data(contentsOf: url),
+              let image = clipboardImage(from: data, sourceExtension: url.pathExtension) else {
+            continue
+        }
+        return image
+    }
+
+    return nil
+}
+
+private func clipboardImage(from data: Data, sourceExtension: String?) -> ClipboardImage? {
+    guard let image = NSImage(data: data) else { return nil }
+    let normalized: (bytes: Data, mime: String) = {
+        if sourceExtension?.lowercased() == "png" {
+            return (data, "image/png")
+        }
+        if let rep = NSBitmapImageRep(data: data),
+           let png = rep.representation(using: .png, properties: [:]) {
+            return (png, "image/png")
+        }
+        if let tiff = image.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            return (png, "image/png")
+        }
+        return (data, "application/octet-stream")
+    }()
     let size = image.size
     return ClipboardImage(
-        bytes: data,
-        mime: "image/png",
+        bytes: normalized.bytes,
+        mime: normalized.mime,
         width: UInt32(size.width.rounded()),
         height: UInt32(size.height.rounded())
     )
