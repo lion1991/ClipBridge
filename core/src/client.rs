@@ -11,7 +11,10 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::blob::{BlobClient, BlobError};
 use crate::crypto::{decrypt, encrypt, sha256_hex, KEY_LEN, NONCE_LEN};
-use crate::lan::{unique_peer_names, IncomingLanClip, LanNode, PeerRegistry};
+use crate::lan::{
+    lan_fetch_blob, unique_peer_names, BlobCache, IncomingLanClip, LanNode, PeerAddrs, PeerRegistry,
+    SharedBlobCache,
+};
 use crate::protocol::{ClientMessage, ClipKind, ClipPayload, ImageMeta, ServerMessage};
 
 /// Rustls 0.23 refuses to pick a crypto provider on its own when more than
@@ -107,7 +110,19 @@ pub struct Client {
 struct Shared {
     key: [u8; KEY_LEN],
     group_id: String,
+    device_id: String,
+    device_name: String,
     blob: BlobClient,
+    /// Ciphertext we've recently sent or fetched, content-addressed by
+    /// sha256(ciphertext). Lets `fetch_image` pull image bytes straight
+    /// from a LAN peer instead of round-tripping the relay, and lets this
+    /// device re-serve to other peers. Shared with the LAN node so its
+    /// blob-serve task reads the same store.
+    blob_cache: SharedBlobCache,
+    /// mDNS instance → dialable addresses for every resolved group peer,
+    /// populated by the LAN node from mDNS. `fetch_image` iterates its
+    /// values to find a peer to pull image bytes from.
+    peer_addrs: PeerAddrs,
     /// Number of LAN peers currently in a fully-handshaked session.
     /// Updated by the per-peer task in `lan.rs`; read here for the
     /// `lan_peer_count()` getter the UI polls.
@@ -153,12 +168,19 @@ impl Client {
         let lan_peers = Arc::new(AtomicUsize::new(0));
         let lan_peer_names: PeerRegistry =
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let blob_cache = BlobCache::new();
+        let peer_addrs: PeerAddrs =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let shared = Arc::new(Shared {
             key: key_arr,
             group_id: group_id.clone(),
+            device_id: device_id.clone(),
+            device_name: device_name.clone(),
             blob,
             lan_peers: lan_peers.clone(),
             lan_peer_names: lan_peer_names.clone(),
+            blob_cache: blob_cache.clone(),
+            peer_addrs: peer_addrs.clone(),
         });
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
@@ -181,6 +203,8 @@ impl Client {
                     cmd_rx,
                     lan_peers,
                     lan_peer_names,
+                    blob_cache,
+                    peer_addrs,
                 ));
             })
             .map_err(|e| FfiError::Internal {
@@ -221,6 +245,13 @@ impl Client {
         let plaintext_len = image_bytes.len() as u64;
         let (ciphertext, nonce) = encrypt(&self.shared.key, &image_bytes).map_err(ClientError::from)?;
         let sha = sha256_hex(&ciphertext);
+        // Seed the LAN cache so co-LAN peers can pull these bytes from us
+        // directly instead of round-tripping the relay. We still upload to
+        // the relay below — non-LAN peers, late joiners and the relay's
+        // recent-cache all depend on it.
+        self.shared
+            .blob_cache
+            .insert(sha.clone(), Arc::new(ciphertext.clone()));
         self.shared
             .blob
             .upload(&self.shared.group_id, &sha, ciphertext)
@@ -258,12 +289,57 @@ impl Client {
             ))
             .into());
         }
+        // LAN-first: if a peer is in a live session, try pulling the bytes
+        // straight off the local network. Address comes from the mDNS-fed
+        // map; we attempt peers one at a time so a `BlobMiss` from one
+        // still lets us try the next. Any failure falls through to the
+        // relay path below — the optimization is invisible to callers.
+        if self.shared.lan_peers.load(Ordering::Relaxed) > 0 {
+            // Ciphertext ≈ plaintext + AEAD tag; cap with slack so a
+            // buggy/hostile peer can't stream us unbounded memory. sha256
+            // is verified before we trust the bytes regardless.
+            let max_bytes = (meta.size_bytes as usize).saturating_add(1024);
+            let peers: Vec<Vec<std::net::SocketAddr>> = self
+                .shared
+                .peer_addrs
+                .lock()
+                .map(|g| g.values().cloned().collect())
+                .unwrap_or_default();
+            for candidates in peers {
+                let Some(ciphertext) = lan_fetch_blob(
+                    candidates,
+                    self.shared.key,
+                    self.shared.device_id.clone(),
+                    self.shared.device_name.clone(),
+                    meta.sha256_hex.clone(),
+                    max_bytes,
+                ) else {
+                    continue;
+                };
+                if sha256_hex(&ciphertext) != meta.sha256_hex {
+                    continue; // corrupted/mismatched — try next peer, then relay
+                }
+                if let Ok(plain) = decrypt(&self.shared.key, &nonce, &ciphertext) {
+                    // Re-seed our cache so we can serve the next peer too.
+                    self.shared
+                        .blob_cache
+                        .insert(meta.sha256_hex.clone(), Arc::new(ciphertext));
+                    return Ok(plain);
+                }
+            }
+        }
+
         let ciphertext = self
             .shared
             .blob
             .download(&self.shared.group_id, &meta.sha256_hex)
             .map_err(ClientError::from)?;
         let plain = decrypt(&self.shared.key, &nonce, &ciphertext).map_err(ClientError::from)?;
+        // Seed the cache from the relay download too, so a device that
+        // only had relay reach can still hand the bytes to LAN peers.
+        self.shared
+            .blob_cache
+            .insert(meta.sha256_hex.clone(), Arc::new(ciphertext));
         Ok(plain)
     }
 
@@ -315,6 +391,8 @@ async fn run(
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     lan_peers: Arc<AtomicUsize>,
     lan_peer_names: PeerRegistry,
+    blob_cache: SharedBlobCache,
+    peer_addrs: PeerAddrs,
 ) {
     // Receive-side dedup. The same (sender_device_id, ts) pair may arrive
     // both from the relay WS and from a LAN peer; whichever lands first
@@ -334,6 +412,8 @@ async fn run(
         lan_in_tx,
         lan_peers,
         lan_peer_names,
+        blob_cache,
+        peer_addrs,
     )
     .await
     {

@@ -16,7 +16,7 @@
 //! isolation, multicast filtering, peers on different SSIDs) the relay
 //! path keeps working unchanged — LAN failures are silent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -53,6 +53,17 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 /// peers. mDNS only emits `ServiceResolved` once per service unless the
 /// records change, so without this loop a TCP drop never reconnects.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+/// Raw bytes per `BlobChunk` before base64 + JSON + AEAD framing. 512 KiB
+/// inflates to ~700 KiB base64, comfortably under `FRAME_MAX` once the
+/// envelope is added. Blob bytes ride a *dedicated* short-lived TCP
+/// connection so this never head-of-line-blocks clipboard frames.
+const BLOB_CHUNK: usize = 512 * 1024;
+/// Bounds on the in-memory ciphertext cache that backs LAN blob serving.
+/// Keyed by sha256(ciphertext) — same address the relay blob store uses —
+/// so a peer can re-serve an image it sent or recently fetched without the
+/// bytes ever touching the relay. Evict oldest until both caps hold.
+const BLOB_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const BLOB_CACHE_MAX_ENTRIES: usize = 32;
 
 /// One-line wire message for the LAN socket. Goes through AEAD before
 /// hitting the wire, so the same `LanMessage` discriminant doubles as the
@@ -81,6 +92,26 @@ enum LanMessage {
     /// this variant fail JSON parse and we drop them, which is fine —
     /// they'd reconnect on the next mDNS event with a matching version.
     Ping,
+    /// Sent by a blob requester as its first post-Hello frame on a
+    /// *dedicated* connection (never on the shared control link). Asks the
+    /// peer to stream the ciphertext it has cached under `sha256_hex`
+    /// (= sha256 of the relay-blob ciphertext, the universal image
+    /// address). Old peers that don't know this variant fail JSON parse
+    /// and drop only that throwaway connection — the requester then falls
+    /// back to the relay, so the optimization degrades safely.
+    BlobRequest { sha256_hex: String },
+    /// One slice of the requested ciphertext. `last == true` marks the
+    /// final chunk (an empty `data` with `last` is valid for a 0-byte
+    /// blob, though images never are).
+    BlobChunk {
+        #[serde(with = "b64")]
+        data: Vec<u8>,
+        last: bool,
+    },
+    /// The serving peer doesn't have `sha256_hex` cached. Requester aborts
+    /// immediately and falls back to the relay rather than waiting out a
+    /// timeout.
+    BlobMiss { sha256_hex: String },
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +126,84 @@ struct OutgoingLan {
     sender_device_id: String,
     ts: u64,
     payload: ClipPayload,
+}
+
+/// Base64 codec for the `BlobChunk::data` field. serde_json would otherwise
+/// render a `Vec<u8>` as a JSON array of integers (~4x blowup); base64 is
+/// ~1.34x and the frame budget is sized around it. Mirrors the helper in
+/// `protocol.rs` (kept local to avoid widening that module's visibility).
+mod b64 {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&B64.encode(v))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s: String = Deserialize::deserialize(d)?;
+        B64.decode(s.as_bytes()).map_err(serde::de::Error::custom)
+    }
+}
+
+/// mDNS instance `fullname` → dialable addresses for every group peer
+/// resolved, in *both* directions (unlike `known_peers`, which the
+/// control-link tiebreak only populates on the larger-id side). The
+/// blob-fetch path is symmetric — a receiver pulls bytes from whoever has
+/// them regardless of who dials the control link — so it needs addresses
+/// cached on every node. Keyed by fullname (not did) so a device's
+/// multiple processes stay distinct and `ServiceRemoved` can purge the
+/// exact instance that went away.
+pub type PeerAddrs = Arc<std::sync::Mutex<HashMap<String, Vec<SocketAddr>>>>;
+
+/// Bounded in-memory cache of group-key ciphertext keyed by
+/// sha256(ciphertext) — the same address the relay blob endpoint uses.
+/// Populated when this device sends an image (so it can serve LAN peers
+/// without the relay) and when it fetches one (so it can re-serve to the
+/// next peer, spreading load across the mesh). Eviction is oldest-first
+/// until both the byte and entry caps hold.
+pub struct BlobCache {
+    inner: std::sync::Mutex<BlobCacheInner>,
+}
+
+struct BlobCacheInner {
+    map: HashMap<String, Arc<Vec<u8>>>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+pub type SharedBlobCache = Arc<BlobCache>;
+
+impl BlobCache {
+    pub fn new() -> SharedBlobCache {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(BlobCacheInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                bytes: 0,
+            }),
+        })
+    }
+
+    pub fn get(&self, sha256_hex: &str) -> Option<Arc<Vec<u8>>> {
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.map.get(sha256_hex).cloned()
+    }
+
+    pub fn insert(&self, sha256_hex: String, data: Arc<Vec<u8>>) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if g.map.contains_key(&sha256_hex) {
+            return; // content-addressed: same key ⇒ identical bytes
+        }
+        g.bytes += data.len();
+        g.order.push_back(sha256_hex.clone());
+        g.map.insert(sha256_hex, data);
+        while g.bytes > BLOB_CACHE_MAX_BYTES || g.map.len() > BLOB_CACHE_MAX_ENTRIES {
+            let Some(old) = g.order.pop_front() else { break };
+            if let Some(v) = g.map.remove(&old) {
+                g.bytes -= v.len();
+            }
+        }
+    }
 }
 
 /// 16-hex-char fingerprint of `group_id` for the TXT record. We never put
@@ -234,6 +343,8 @@ impl LanNode {
         inbound: mpsc::UnboundedSender<IncomingLanClip>,
         peer_count: Arc<AtomicUsize>,
         peers: PeerRegistry,
+        blob_cache: SharedBlobCache,
+        peer_addrs: PeerAddrs,
     ) -> Result<Self, LanError> {
         let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
         let port = listener.local_addr()?.port();
@@ -316,6 +427,7 @@ impl LanNode {
             let out_tx = out_tx.clone();
             let peer_count = peer_count.clone();
             let peers = peers.clone();
+            let blob_cache = blob_cache.clone();
             tokio::spawn(async move {
                 loop {
                     let (stream, addr) = match listener.accept().await {
@@ -333,6 +445,7 @@ impl LanNode {
                     let out_rx = out_tx.subscribe();
                     let peer_count = peer_count.clone();
                     let peers = peers.clone();
+                    let blob_cache = blob_cache.clone();
                     let registry_key = format!("inbound:{addr}");
                     tokio::spawn(async move {
                         if let Err(e) = run_peer(
@@ -346,6 +459,7 @@ impl LanNode {
                             None,
                             peer_count,
                             peers,
+                            blob_cache,
                             registry_key,
                         )
                         .await
@@ -365,6 +479,7 @@ impl LanNode {
             let device_id = device_id.clone();
             let fingerprint = fingerprint.clone();
             let known_peers = known_peers.clone();
+            let peer_addrs = peer_addrs.clone();
             tokio::spawn(async move {
                 let mut event_rx = event_rx;
                 while let Some(event) = event_rx.recv().await {
@@ -377,13 +492,6 @@ impl LanNode {
                                 continue;
                             }
                             if peer_did.is_empty() {
-                                continue;
-                            }
-                            // Lexicographic tiebreak: only the side with the
-                            // larger device_id initiates. Equal ids (same
-                            // physical device — iOS main app vs keyboard)
-                            // also short-circuit here.
-                            if device_id.as_str() <= peer_did {
                                 continue;
                             }
                             let port = info.get_port();
@@ -407,6 +515,26 @@ impl LanNode {
                                 continue;
                             }
                             let fullname = info.get_fullname().to_string();
+                            // Cache addresses on *both* sides regardless of
+                            // the control-link tiebreak below: the blob
+                            // fetcher dials whoever has the bytes, which can
+                            // be the side that never initiates the control
+                            // connection. Keyed by the mDNS instance
+                            // `fullname` (not `did`) so the same device's
+                            // multiple processes (iOS app + keyboard share a
+                            // did) stay distinct entries, and so a
+                            // `ServiceRemoved` — which only carries the
+                            // fullname — can purge the right one.
+                            if let Ok(mut a) = peer_addrs.lock() {
+                                a.insert(fullname.clone(), candidates.clone());
+                            }
+                            // Lexicographic tiebreak: only the side with the
+                            // larger device_id initiates the *control* link.
+                            // Equal ids (same physical device — iOS main app
+                            // vs keyboard) also short-circuit here.
+                            if device_id.as_str() <= peer_did {
+                                continue;
+                            }
                             let mut g = known_peers.lock().await;
                             g.insert(
                                 fullname,
@@ -419,8 +547,13 @@ impl LanNode {
                         ServiceEvent::ServiceRemoved(_, fullname) => {
                             // mDNS TTL expired with no re-announcement —
                             // peer is presumed gone. Stop reconnect retries
-                            // until they show up again.
+                            // and drop its cached blob-fetch addresses so
+                            // `fetch_image` doesn't burn a dial timeout on a
+                            // stale instance before falling back to relay.
                             known_peers.lock().await.remove(&fullname);
+                            if let Ok(mut a) = peer_addrs.lock() {
+                                a.remove(&fullname);
+                            }
                         }
                         _ => {}
                     }
@@ -443,6 +576,7 @@ impl LanNode {
             let peer_count = peer_count.clone();
             let peers = peers.clone();
             let known_peers = known_peers.clone();
+            let blob_cache = blob_cache.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(RECONNECT_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -472,6 +606,7 @@ impl LanNode {
                         let outbound_peers = outbound_peers.clone();
                         let peer_count = peer_count.clone();
                         let peers_for_run = peers.clone();
+                        let blob_cache = blob_cache.clone();
                         let registry_key = fullname.clone();
                         let peer_did_owned = kp.peer_did.clone();
                         let candidates = kp.candidates.clone();
@@ -486,6 +621,7 @@ impl LanNode {
                                 peer_did_owned,
                                 peer_count,
                                 peers_for_run,
+                                blob_cache,
                                 registry_key,
                             )
                             .await;
@@ -590,6 +726,7 @@ async fn dial_and_run(
     expected_peer: String,
     peer_count: Arc<AtomicUsize>,
     peers: PeerRegistry,
+    blob_cache: SharedBlobCache,
     registry_key: String,
 ) -> Result<(), LanError> {
     let mut connected: Option<(TcpStream, SocketAddr)> = None;
@@ -620,6 +757,7 @@ async fn dial_and_run(
         Some(expected_peer),
         peer_count,
         peers,
+        blob_cache,
         registry_key,
     )
     .await
@@ -638,6 +776,7 @@ async fn run_peer(
     expected_peer: Option<String>,
     peer_count: Arc<AtomicUsize>,
     peers: PeerRegistry,
+    blob_cache: SharedBlobCache,
     registry_key: String,
 ) -> Result<(), LanError> {
     let _ = stream.set_nodelay(true);
@@ -681,6 +820,28 @@ async fn run_peer(
     if peer_did == self_device_id {
         return Ok(()); // self-connect (shouldn't happen, but cheap to guard)
     }
+
+    // Classify this connection. A blob requester sends `BlobRequest` as its
+    // first post-Hello frame; a control peer sends nothing on its own until
+    // its first ping. We send an immediate Ping so a *new* control peer can
+    // be classified (and registered) within an RTT instead of waiting out
+    // PING_INTERVAL; a blob connection's BlobRequest still wins the race.
+    // Timeout ⇒ assume control peer (an old build that doesn't immediate-
+    // ping — costs a few seconds of registration lag during rollout only).
+    // Serving a blob here never touches the peer registry/count: it's a
+    // throwaway connection, not a mesh edge.
+    write_frame(&mut writer, &key, &LanMessage::Ping).await?;
+    let pending: Option<LanMessage> =
+        match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader, &key)).await {
+            Ok(Ok(Some(LanMessage::BlobRequest { sha256_hex }))) => {
+                return serve_blob(&mut writer, &key, &blob_cache, &sha256_hex).await;
+            }
+            Ok(Ok(Some(other))) => Some(other),
+            Ok(Ok(None)) => return Ok(()), // peer closed right after Hello
+            Ok(Err(e)) => return Err(e),
+            Err(_) => None, // timed out: treat as a (possibly old) control peer
+        };
+
     // Fall back to a short device_id snippet if the peer is on an older
     // build that doesn't send `device_name` (Hello field is `default`).
     let display_name = if peer_name.trim().is_empty() {
@@ -708,6 +869,29 @@ async fn run_peer(
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ping_interval.tick().await; // burn the immediate first tick
     let mut last_seen = tokio::time::Instant::now();
+
+    // The classify read above may have already consumed the peer's first
+    // real frame (typically its immediate Ping, or a clip that beat it).
+    // Process it before the select loop so it isn't dropped.
+    if let Some(first) = pending {
+        match first {
+            LanMessage::Clip {
+                sender_device_id,
+                ts,
+                payload,
+            } => {
+                let _ = inbound.send(IncomingLanClip {
+                    sender_device_id,
+                    ts,
+                    payload,
+                });
+            }
+            // Blob frames only ever belong on a dedicated connection; a
+            // control peer emitting them is buggy/hostile — ignore.
+            _ => {}
+        }
+    }
+
     loop {
         let idle_deadline = last_seen + IDLE_TIMEOUT;
         tokio::select! {
@@ -769,11 +953,172 @@ async fn run_peer(
                     Some(LanMessage::Ping) => {
                         // Already touched last_seen above; nothing more.
                     }
+                    Some(LanMessage::BlobRequest { .. })
+                    | Some(LanMessage::BlobChunk { .. })
+                    | Some(LanMessage::BlobMiss { .. }) => {
+                        // Blob traffic only ever rides a dedicated, freshly
+                        // classified connection (see above). Seeing it on an
+                        // established control link means a buggy/old/hostile
+                        // peer — ignore rather than tear down clip sync.
+                    }
                     None => return Ok(()),
                 }
             }
         }
     }
+}
+
+/// Stream the cached ciphertext for `sha256_hex` as `BlobChunk` frames, or
+/// a single `BlobMiss` if we don't have it. Runs on a dedicated throwaway
+/// connection so chunking here never head-of-line-blocks clipboard frames.
+async fn serve_blob<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    key: &[u8; KEY_LEN],
+    cache: &SharedBlobCache,
+    sha256_hex: &str,
+) -> Result<(), LanError> {
+    let Some(bytes) = cache.get(sha256_hex) else {
+        return write_frame(
+            w,
+            key,
+            &LanMessage::BlobMiss {
+                sha256_hex: sha256_hex.to_string(),
+            },
+        )
+        .await;
+    };
+    let total = bytes.len();
+    if total == 0 {
+        return write_frame(
+            w,
+            key,
+            &LanMessage::BlobChunk {
+                data: Vec::new(),
+                last: true,
+            },
+        )
+        .await;
+    }
+    let mut off = 0;
+    while off < total {
+        let end = (off + BLOB_CHUNK).min(total);
+        write_frame(
+            w,
+            key,
+            &LanMessage::BlobChunk {
+                data: bytes[off..end].to_vec(),
+                last: end == total,
+            },
+        )
+        .await?;
+        off = end;
+    }
+    Ok(())
+}
+
+/// Dial a peer on a fresh connection, Hello, ask for `sha256_hex`, and
+/// accumulate the streamed ciphertext. Returns `None` (→ caller falls back
+/// to the relay) on any dial/handshake/timeout failure, a `BlobMiss`, or if
+/// the stream exceeds `max_bytes` (cheap guard against a buggy/hostile
+/// peer; the caller still verifies sha256 before trusting the bytes).
+async fn fetch_blob(
+    candidates: &[SocketAddr],
+    key: &[u8; KEY_LEN],
+    self_device_id: &str,
+    self_device_name: &str,
+    sha256_hex: &str,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    let mut stream = None;
+    for cand in candidates {
+        if let Ok(Ok(s)) =
+            tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(cand)).await
+        {
+            stream = Some(s);
+            break;
+        }
+    }
+    let stream = stream?;
+    let _ = stream.set_nodelay(true);
+    let (mut reader, mut writer) = stream.into_split();
+
+    write_frame(
+        &mut writer,
+        key,
+        &LanMessage::Hello {
+            device_id: self_device_id.to_string(),
+            version: PROTO_VERSION,
+            device_name: self_device_name.to_string(),
+        },
+    )
+    .await
+    .ok()?;
+    write_frame(
+        &mut writer,
+        key,
+        &LanMessage::BlobRequest {
+            sha256_hex: sha256_hex.to_string(),
+        },
+    )
+    .await
+    .ok()?;
+
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), read_frame(&mut reader, key)).await {
+            Ok(Ok(Some(LanMessage::BlobChunk { data, last }))) => {
+                buf.extend_from_slice(&data);
+                if buf.len() > max_bytes {
+                    return None;
+                }
+                if last {
+                    return Some(buf);
+                }
+            }
+            Ok(Ok(Some(LanMessage::BlobMiss { .. }))) => return None,
+            // The serving side immediate-pings before classifying our
+            // request, and may echo a Hello; skip non-blob frames.
+            Ok(Ok(Some(LanMessage::Ping)))
+            | Ok(Ok(Some(LanMessage::Hello { .. })))
+            | Ok(Ok(Some(LanMessage::Clip { .. }))) => continue,
+            Ok(Ok(Some(LanMessage::BlobRequest { .. }))) => return None,
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return None,
+        }
+    }
+}
+
+/// Sync wrapper over [`fetch_blob`] for the FFI `fetch_image` path, which
+/// runs on the host's calling thread outside any tokio runtime. Mirrors
+/// `blob.rs`'s per-call thread + current-thread runtime trampoline so it
+/// can't panic with "runtime in runtime".
+pub fn lan_fetch_blob(
+    candidates: Vec<SocketAddr>,
+    key: [u8; KEY_LEN],
+    self_device_id: String,
+    self_device_name: String,
+    sha256_hex: String,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    if candidates.is_empty() {
+        return None;
+    }
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        rt.block_on(fetch_blob(
+            &candidates,
+            &key,
+            &self_device_id,
+            &self_device_name,
+            &sha256_hex,
+            max_bytes,
+        ))
+    })
+    .join()
+    .ok()
+    .flatten()
 }
 
 /// Wire frame: `len:u32 BE | nonce:12 | ciphertext` where `len` covers
@@ -889,6 +1234,108 @@ mod tests {
         assert!(r.is_err());
     }
 
+    #[test]
+    fn blob_cache_evicts_oldest_by_count() {
+        let c = BlobCache::new();
+        for i in 0..(BLOB_CACHE_MAX_ENTRIES + 3) {
+            c.insert(format!("k{i}"), Arc::new(vec![0u8; 8]));
+        }
+        // Oldest keys evicted, newest retained.
+        assert!(c.get("k0").is_none());
+        assert!(c
+            .get(&format!("k{}", BLOB_CACHE_MAX_ENTRIES + 2))
+            .is_some());
+    }
+
+    #[test]
+    fn blob_cache_dedups_same_key() {
+        let c = BlobCache::new();
+        c.insert("k".into(), Arc::new(vec![1, 2, 3]));
+        c.insert("k".into(), Arc::new(vec![9, 9, 9, 9])); // ignored: content-addressed
+        assert_eq!(*c.get("k").unwrap(), vec![1, 2, 3]);
+    }
+
+    /// `fetch_blob` over a real localhost socket against a hand-rolled
+    /// server that speaks just enough of the protocol (`read Hello` →
+    /// `read BlobRequest` → `serve_blob`). Multi-chunk payload exercises
+    /// the chunk loop. No mDNS, no multicast — safe in sandboxed CI.
+    #[tokio::test]
+    async fn blob_round_trip_multi_chunk() {
+        let key = [7u8; KEY_LEN];
+        let sha = "deadbeef".to_string();
+        let payload = vec![0xABu8; BLOB_CHUNK + BLOB_CHUNK / 2 + 17];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cache = BlobCache::new();
+        cache.insert(sha.clone(), Arc::new(payload.clone()));
+
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = s.into_split();
+            // Requester sends Hello then BlobRequest.
+            let _ = read_frame(&mut r, &key).await.unwrap().unwrap();
+            match read_frame(&mut r, &key).await.unwrap().unwrap() {
+                LanMessage::BlobRequest { sha256_hex } => {
+                    serve_blob(&mut w, &key, &cache, &sha256_hex).await.unwrap();
+                }
+                _ => panic!("expected BlobRequest"),
+            }
+        });
+
+        let got = fetch_blob(&[addr], &key, "me", "me-name", &sha, payload.len() + 1024).await;
+        assert_eq!(got, Some(payload));
+    }
+
+    #[tokio::test]
+    async fn blob_miss_returns_none() {
+        let key = [3u8; KEY_LEN];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cache = BlobCache::new(); // empty → BlobMiss
+
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = s.into_split();
+            let _ = read_frame(&mut r, &key).await.unwrap().unwrap();
+            match read_frame(&mut r, &key).await.unwrap().unwrap() {
+                LanMessage::BlobRequest { sha256_hex } => {
+                    serve_blob(&mut w, &key, &cache, &sha256_hex).await.unwrap();
+                }
+                _ => panic!("expected BlobRequest"),
+            }
+        });
+
+        let got = fetch_blob(&[addr], &key, "me", "me-name", "nope", 4096).await;
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn blob_fetch_aborts_when_over_max_bytes() {
+        let key = [5u8; KEY_LEN];
+        let sha = "cafe".to_string();
+        let payload = vec![1u8; BLOB_CHUNK * 2];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cache = BlobCache::new();
+        cache.insert(sha.clone(), Arc::new(payload));
+
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = s.into_split();
+            let _ = read_frame(&mut r, &key).await.unwrap().unwrap();
+            if let LanMessage::BlobRequest { sha256_hex } =
+                read_frame(&mut r, &key).await.unwrap().unwrap()
+            {
+                let _ = serve_blob(&mut w, &key, &cache, &sha256_hex).await;
+            }
+        });
+
+        // Cap below the payload size → fetch must bail (→ relay fallback).
+        let got = fetch_blob(&[addr], &key, "me", "me-name", &sha, BLOB_CHUNK).await;
+        assert_eq!(got, None);
+    }
+
     /// Two nodes on localhost discover each other via mDNS and exchange
     /// one clip. Marked `#[ignore]` because:
     ///   - macOS requires per-binary "Local Network" privacy permission;
@@ -928,6 +1375,8 @@ mod tests {
             a_tx,
             count_a,
             peers_a,
+            BlobCache::new(),
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
         )
         .await
         .expect("spawn A");
@@ -939,6 +1388,8 @@ mod tests {
             b_tx,
             count_b,
             peers_b,
+            BlobCache::new(),
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
         )
         .await
         .expect("spawn B");
