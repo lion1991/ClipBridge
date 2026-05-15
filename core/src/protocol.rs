@@ -20,6 +20,19 @@ pub enum ClientMessage {
     },
     /// Pull recently cached clips (used by iOS keyboard on activation).
     FetchRecent { group_id: GroupId },
+    /// Opt in to relay-assisted LAN rendezvous and advertise this device's
+    /// dialable LAN candidates (`ip:port` strings, private addresses only).
+    ///
+    /// Sending this is what marks a connection as rendezvous-capable: the
+    /// relay only ever pushes `ServerMessage::LanPeers` to connections that
+    /// sent at least one `LanAdvertise`. Old clients never send it and so
+    /// never receive the new server message — keeping mixed fleets safe.
+    /// Re-send to refresh candidates (e.g. after a network change).
+    LanAdvertise {
+        group_id: GroupId,
+        device_id: String,
+        candidates: Vec<String>,
+    },
 }
 
 /// Wire messages from relay to client.
@@ -37,6 +50,22 @@ pub enum ServerMessage {
     },
     Recent { clips: Vec<RecentClip> },
     Error { reason: String },
+    /// Current set of *other* rendezvous-capable peers in this group that
+    /// share our egress IP (i.e. very likely on the same LAN). Pushed only
+    /// to connections that sent `ClientMessage::LanAdvertise`, on join and
+    /// on every membership change. This is a full snapshot, not a delta:
+    /// the receiver replaces its relay-learned candidate set wholesale, so
+    /// a departed peer simply stops appearing. An empty list means "no LAN
+    /// peers right now" and should purge any relay-learned candidates.
+    LanPeers { peers: Vec<LanPeer> },
+}
+
+/// One rendezvous peer entry inside `ServerMessage::LanPeers`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanPeer {
+    pub device_id: String,
+    /// Dialable `ip:port` candidates the peer advertised.
+    pub candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,5 +191,50 @@ mod tests {
         let back: ClipPayload = serde_json::from_str(&s).unwrap();
         assert_eq!(back.kind, ClipKind::Image);
         assert_eq!(back.image.as_ref().unwrap().width, 1920);
+    }
+
+    #[test]
+    fn lan_advertise_round_trip() {
+        let m = ClientMessage::LanAdvertise {
+            group_id: "g1".into(),
+            device_id: "dev-a".into(),
+            candidates: vec!["192.168.1.5:54321".into(), "10.0.0.2:54321".into()],
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"type\":\"lan_advertise\""));
+        let back: ClientMessage = serde_json::from_str(&s).unwrap();
+        match back {
+            ClientMessage::LanAdvertise { candidates, .. } => assert_eq!(candidates.len(), 2),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn lan_peers_round_trip() {
+        let m = ServerMessage::LanPeers {
+            peers: vec![LanPeer {
+                device_id: "dev-b".into(),
+                candidates: vec!["192.168.1.9:60000".into()],
+            }],
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"type\":\"lan_peers\""));
+        let back: ServerMessage = serde_json::from_str(&s).unwrap();
+        match back {
+            ServerMessage::LanPeers { peers } => {
+                assert_eq!(peers[0].device_id, "dev-b");
+                assert_eq!(peers[0].candidates, vec!["192.168.1.9:60000".to_string()]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// An old client that doesn't know `LanPeers` must not be sent it — but
+    /// if it ever is, document that serde rejects unknown tagged variants
+    /// (this is *why* the relay gates the push on `LanAdvertise`).
+    #[test]
+    fn unknown_server_variant_is_rejected() {
+        let json = r#"{"type":"some_future_message","x":1}"#;
+        assert!(serde_json::from_str::<ServerMessage>(json).is_err());
     }
 }

@@ -26,5 +26,15 @@ async fn main() {
 
     tracing::info!(%addr, "clipbridge-relay listening");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
-    axum::serve(listener, router).await.expect("serve");
+    // `into_make_service_with_connect_info` is what makes the peer socket
+    // address available to the ws handler (`ConnectInfo<SocketAddr>`) — we
+    // group rendezvous peers by their egress IP. The relay is exposed
+    // directly (no reverse proxy) so the socket peer IP is the real client
+    // egress; no X-Forwarded-For handling needed.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("serve");
 }

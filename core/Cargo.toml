@@ -42,6 +42,10 @@ url = "2"
 # LAN peer discovery via mDNS / DNS-SD. Pure-Rust, no system dep —
 # runs its own background thread and exposes a channel-based API.
 mdns-sd = "0.13"
+# Enumerate local interface IPs to advertise as relay-assisted LAN
+# rendezvous candidates. Same version mdns-sd already pulls in
+# transitively, so this adds no extra compilation cost.
+if-addrs = "0.13"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

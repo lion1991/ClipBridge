@@ -15,7 +15,12 @@ async fn spawn_relay() -> SocketAddr {
     let blobs = BlobStore::new(8 * 1024 * 1024, Duration::from_secs(60), 4 * 1024 * 1024);
     let router = app(Hub::new(), blobs);
     tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     // Tiny pause to ensure the listener is accepting; usually not needed but
     // protects against very fast test machines hitting connect-before-accept.
@@ -207,4 +212,129 @@ async fn fetch_recent_returns_cached_clips() {
     assert_eq!(clips.len(), 2);
     let plain0 = clipbridge_core::decrypt(&key, &clips[0].nonce, &clips[0].ciphertext).unwrap();
     assert_eq!(plain0, b"clip-0");
+}
+
+/// Wait for the next `LanPeers` push, skipping any other server messages
+/// (e.g. the `Joined` ack). Returns `None` on timeout.
+async fn next_lan_peers<S>(ws: &mut S, within: Duration) -> Option<Vec<clipbridge_core::protocol::LanPeer>>
+where
+    S: futures_util::StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    tokio::time::timeout(within, async {
+        loop {
+            if let ServerMessage::LanPeers { peers } = next_server_msg(ws).await {
+                return peers;
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+#[tokio::test]
+async fn rendezvous_introduces_same_egress_peers() {
+    let addr = spawn_relay().await;
+    let mut a = connect(addr).await;
+    let mut b = connect(addr).await;
+    let group_id = "rv-group".to_string();
+
+    for (ws, did) in [(&mut a, "A"), (&mut b, "B")] {
+        send_json(
+            ws,
+            &ClientMessage::Join {
+                group_id: group_id.clone(),
+                device_id: did.into(),
+            },
+        )
+        .await;
+    }
+    matches!(next_server_msg(&mut a).await, ServerMessage::Joined { .. });
+    matches!(next_server_msg(&mut b).await, ServerMessage::Joined { .. });
+
+    // A opts into rendezvous first: it's alone, so the snapshot is empty.
+    send_json(
+        &mut a,
+        &ClientMessage::LanAdvertise {
+            group_id: group_id.clone(),
+            device_id: "A".into(),
+            candidates: vec!["192.168.1.10:5000".into()],
+        },
+    )
+    .await;
+    assert_eq!(
+        next_lan_peers(&mut a, Duration::from_secs(2)).await.unwrap(),
+        vec![]
+    );
+
+    // B opts in from the same egress IP (loopback) — B should immediately
+    // learn A, and A should be re-pushed a snapshot now containing B.
+    send_json(
+        &mut b,
+        &ClientMessage::LanAdvertise {
+            group_id: group_id.clone(),
+            device_id: "B".into(),
+            candidates: vec!["192.168.1.11:6000".into()],
+        },
+    )
+    .await;
+
+    let b_sees = next_lan_peers(&mut b, Duration::from_secs(2)).await.unwrap();
+    assert_eq!(b_sees.len(), 1);
+    assert_eq!(b_sees[0].device_id, "A");
+    assert_eq!(b_sees[0].candidates, vec!["192.168.1.10:5000".to_string()]);
+
+    let a_sees = next_lan_peers(&mut a, Duration::from_secs(2)).await.unwrap();
+    assert_eq!(a_sees.len(), 1);
+    assert_eq!(a_sees[0].device_id, "B");
+}
+
+/// Mixed-fleet safety: a client that never sends `LanAdvertise` (an old
+/// build) must never be pushed a `LanPeers` message, even when a new
+/// rendezvous-capable peer joins the same group and egress.
+#[tokio::test]
+async fn old_client_never_receives_lan_peers() {
+    let addr = spawn_relay().await;
+    let mut old = connect(addr).await;
+    let mut newc = connect(addr).await;
+    let group_id = "mixed-fleet".to_string();
+
+    for (ws, did) in [(&mut old, "old"), (&mut newc, "new")] {
+        send_json(
+            ws,
+            &ClientMessage::Join {
+                group_id: group_id.clone(),
+                device_id: did.into(),
+            },
+        )
+        .await;
+    }
+    matches!(next_server_msg(&mut old).await, ServerMessage::Joined { .. });
+    matches!(next_server_msg(&mut newc).await, ServerMessage::Joined { .. });
+
+    // The new client opts in; the old one stays silent (as an old build
+    // would — it doesn't know the message exists).
+    send_json(
+        &mut newc,
+        &ClientMessage::LanAdvertise {
+            group_id: group_id.clone(),
+            device_id: "new".into(),
+            candidates: vec!["192.168.1.20:7000".into()],
+        },
+    )
+    .await;
+    // The new client itself gets a (self-only, empty) snapshot — proving
+    // the relay is alive and processed the advertise.
+    assert_eq!(
+        next_lan_peers(&mut newc, Duration::from_secs(2)).await.unwrap(),
+        vec![]
+    );
+
+    // The old connection must NOT have been pushed anything.
+    assert!(
+        next_lan_peers(&mut old, Duration::from_millis(500))
+            .await
+            .is_none(),
+        "old client must never receive LanPeers"
+    );
 }

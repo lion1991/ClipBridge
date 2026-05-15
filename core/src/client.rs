@@ -525,6 +525,25 @@ async fn session(
     ws.send(Message::Text(serde_json::to_string(&fetch)?.into()))
         .await?;
 
+    // Opt into relay-assisted LAN rendezvous: tell the relay our dialable
+    // private candidates so it can introduce us to same-LAN group peers
+    // without waiting on mDNS. Sending this is also what marks the
+    // connection rendezvous-capable — old relays just reply with an error
+    // we ignore, and never push us `LanPeers`. Skipped entirely if the LAN
+    // node didn't start (multicast/socket blocked) or has no private IPs.
+    if let Some(lan) = lan {
+        let candidates = lan.advertise_candidates();
+        if !candidates.is_empty() {
+            let adv = ClientMessage::LanAdvertise {
+                group_id: group_id.to_string(),
+                device_id: device_id.to_string(),
+                candidates,
+            };
+            ws.send(Message::Text(serde_json::to_string(&adv)?.into()))
+                .await?;
+        }
+    }
+
     listener.on_state(ConnectionState::Connected);
 
     // Heartbeat: ping every 30s, force-reconnect if no inbound frame for 60s.
@@ -591,7 +610,16 @@ async fn session(
                 match frame {
                     Message::Text(t) => {
                         let parsed: ServerMessage = serde_json::from_str(&t)?;
-                        handle_server(parsed, key, device_id, listener, dedup);
+                        // Rendezvous updates need the LAN node (not in
+                        // `handle_server`'s reach), and a full snapshot
+                        // each time, so intercept before dispatch.
+                        if let ServerMessage::LanPeers { peers } = parsed {
+                            if let Some(lan) = lan {
+                                lan.ingest_relay_peers(peers).await;
+                            }
+                        } else {
+                            handle_server(parsed, key, device_id, listener, dedup);
+                        }
                     }
                     Message::Ping(p) => {
                         ws.send(Message::Pong(p)).await?;
@@ -653,6 +681,8 @@ fn handle_server(
         ServerMessage::Error { reason } => {
             listener.on_state(ConnectionState::Error { message: reason });
         }
+        // Intercepted in `session()` before dispatch (needs the LAN node).
+        ServerMessage::LanPeers { .. } => {}
     }
 }
 

@@ -247,6 +247,46 @@ fn is_v6_link_local(v6: &Ipv6Addr) -> bool {
     o[0] == 0xfe && (o[1] & 0xc0) == 0x80
 }
 
+/// True for addresses worth advertising to the relay as LAN rendezvous
+/// candidates: RFC1918 private IPv4, IPv4 link-local (169.254/16), and
+/// IPv6 ULA (`fc00::/7`). Public addresses are deliberately withheld — the
+/// relay only ever learns private space (the privacy bound the user
+/// accepted). IPv6 link-local is excluded for the same reason
+/// `is_unroutable` drops it: it needs a `%scope` we can't carry across the
+/// relay path.
+fn is_advertisable_private(a: &IpAddr) -> bool {
+    match a {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => (v6.octets()[0] & 0xfe) == 0xfc,
+    }
+}
+
+/// Enumerate this host's advertisable private interface addresses as
+/// `ip:port` strings for `ClientMessage::LanAdvertise`. Loopback,
+/// public, and link-local-v6 addresses are filtered out. Returns empty
+/// (rather than erroring) if interface enumeration fails — the caller
+/// just skips advertising and relies on mDNS / relay.
+pub fn local_private_candidates(port: u16) -> Vec<String> {
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for iface in ifaces {
+        if iface.is_loopback() {
+            continue;
+        }
+        let ip = iface.ip();
+        if !is_advertisable_private(&ip) {
+            continue;
+        }
+        let s = SocketAddr::new(ip, port).to_string();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LanError {
     #[error("io: {0}")]
@@ -324,6 +364,21 @@ pub struct LanNode {
     /// Forwarder thread that bridges flume's sync receiver to a tokio
     /// channel. Joined when its event_tx closes (i.e. when daemon drops).
     _forwarder: Option<JoinHandle<()>>,
+    /// TCP port the LAN listener is bound to. Advertised to the relay so
+    /// rendezvous peers learn where to dial us.
+    port: u16,
+    /// This device's id, kept for the control-link tiebreak when ingesting
+    /// relay-learned peers (mirrors the mDNS discover path's tiebreak).
+    self_device_id: String,
+    /// The same `known_peers` map the mDNS discover loop feeds and the
+    /// reconciler dials from. `ingest_relay_peers` writes relay-learned
+    /// entries here under a `relay:` key namespace so they get dialed
+    /// exactly like mDNS-discovered peers.
+    known_peers: Arc<Mutex<HashMap<String, KnownPeer>>>,
+    /// The same map `fetch_image` reads for blob-fetch addresses. Relay-
+    /// learned entries are added/removed here too so LAN image pull works
+    /// for peers found via the relay, not just via mDNS.
+    peer_addrs: PeerAddrs,
 }
 
 impl LanNode {
@@ -641,7 +696,40 @@ impl LanNode {
             peers,
             _daemon: daemon,
             _forwarder: forwarder,
+            port,
+            self_device_id: device_id,
+            known_peers,
+            peer_addrs,
         })
+    }
+
+    /// Port the LAN TCP listener is bound to.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// This host's advertisable private candidates for `LanAdvertise`.
+    pub fn advertise_candidates(&self) -> Vec<String> {
+        local_private_candidates(self.port)
+    }
+
+    /// Merge a relay-pushed peer snapshot into the same `known_peers` /
+    /// `peer_addrs` maps the mDNS path feeds, so relay-discovered peers get
+    /// dialed and blob-fetched exactly like mDNS ones.
+    ///
+    /// `LanPeers` is a *full snapshot*: every previously relay-learned
+    /// entry (the `relay:` key namespace) absent from `peers` is purged, so
+    /// a departed peer simply stops being dialed — the relay analogue of
+    /// mDNS `ServiceRemoved`. mDNS-keyed entries (instance fullnames) are
+    /// left untouched. Peers already known via mDNS are skipped for the
+    /// control link to avoid a duplicate reciprocal connection.
+    pub async fn ingest_relay_peers(&self, peers: Vec<crate::protocol::LanPeer>) {
+        // Take the tokio lock first (the only `.await`), then the sync
+        // peer_addrs lock — never hold the std mutex across an await.
+        let mut known = self.known_peers.lock().await;
+        if let Ok(mut a) = self.peer_addrs.lock() {
+            apply_relay_snapshot(&self.self_device_id, peers, &mut a, &mut known);
+        }
     }
 
     /// Push a clip to every currently-connected peer. Lossy by design: if
@@ -708,6 +796,70 @@ impl Drop for PeerSessionGuard {
         if let Ok(mut g) = self.peers.lock() {
             g.remove(&self.key);
         }
+    }
+}
+
+/// Pure core of `LanNode::ingest_relay_peers`, split out so the snapshot
+/// semantics can be unit-tested without spawning an mDNS daemon.
+///
+/// Replaces the entire `relay:` key namespace in both maps with `peers`:
+/// `peer_addrs` gets every parsed peer (the blob fetcher dials whoever has
+/// the bytes regardless of the control-link tiebreak); `known_peers` gets
+/// only peers we should *initiate* the control link to — i.e. our
+/// device_id is lexicographically greater (same tiebreak as the mDNS
+/// path) and the peer isn't already covered by an mDNS entry. Non-`relay:`
+/// keys (mDNS instance fullnames) are left untouched.
+fn apply_relay_snapshot(
+    self_device_id: &str,
+    peers: Vec<crate::protocol::LanPeer>,
+    peer_addrs: &mut HashMap<String, Vec<SocketAddr>>,
+    known_peers: &mut HashMap<String, KnownPeer>,
+) {
+    // device_id -> dialable candidates, parsed & filtered.
+    let mut desired: Vec<(String, Vec<SocketAddr>)> = Vec::new();
+    for p in peers {
+        if p.device_id == self_device_id {
+            continue; // never rendezvous with ourselves
+        }
+        let mut cands: Vec<SocketAddr> = Vec::new();
+        for s in &p.candidates {
+            if let Ok(sa) = s.parse::<SocketAddr>() {
+                if !is_unroutable(&sa.ip()) && !cands.contains(&sa) {
+                    cands.push(sa);
+                }
+            }
+        }
+        cands.sort_by_key(|sa| match sa.ip() {
+            IpAddr::V4(_) => 0,
+            IpAddr::V6(_) => 1,
+        });
+        if !cands.is_empty() {
+            desired.push((p.device_id, cands));
+        }
+    }
+
+    peer_addrs.retain(|k, _| !k.starts_with("relay:"));
+    for (did, cands) in &desired {
+        peer_addrs.insert(format!("relay:{did}"), cands.clone());
+    }
+
+    known_peers.retain(|k, _| !k.starts_with("relay:"));
+    let mdns_dids: std::collections::HashSet<String> =
+        known_peers.values().map(|kp| kp.peer_did.clone()).collect();
+    for (peer_did, cands) in desired {
+        if self_device_id <= peer_did.as_str() {
+            continue;
+        }
+        if mdns_dids.contains(&peer_did) {
+            continue; // mDNS already covers this peer's control link
+        }
+        known_peers.insert(
+            format!("relay:{peer_did}"),
+            KnownPeer {
+                peer_did,
+                candidates: cands,
+            },
+        );
     }
 }
 
@@ -1253,6 +1405,137 @@ mod tests {
         c.insert("k".into(), Arc::new(vec![1, 2, 3]));
         c.insert("k".into(), Arc::new(vec![9, 9, 9, 9])); // ignored: content-addressed
         assert_eq!(*c.get("k").unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn advertisable_private_classification() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+        assert!(is_advertisable_private(&v4(192, 168, 1, 5))); // RFC1918
+        assert!(is_advertisable_private(&v4(10, 0, 0, 1)));
+        assert!(is_advertisable_private(&v4(172, 16, 9, 9)));
+        assert!(is_advertisable_private(&v4(169, 254, 3, 3))); // link-local v4
+        assert!(!is_advertisable_private(&v4(8, 8, 8, 8))); // public withheld
+        assert!(is_advertisable_private(&IpAddr::V6(Ipv6Addr::new(
+            0xfd00, 0, 0, 0, 0, 0, 0, 1
+        )))); // ULA
+        assert!(!is_advertisable_private(&IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        )))); // link-local v6 excluded (needs %scope)
+    }
+
+    #[test]
+    fn local_candidates_are_private_and_carry_port() {
+        // Machine-dependent set, but every entry must parse, be private,
+        // and carry the requested port.
+        for s in local_private_candidates(54321) {
+            let sa: SocketAddr = s.parse().expect("parses as ip:port");
+            assert_eq!(sa.port(), 54321);
+            assert!(is_advertisable_private(&sa.ip()), "{sa} not private");
+            assert!(!sa.ip().is_loopback());
+        }
+    }
+
+    fn lp(did: &str, cands: &[&str]) -> crate::protocol::LanPeer {
+        crate::protocol::LanPeer {
+            device_id: did.into(),
+            candidates: cands.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn relay_snapshot_tiebreak_and_peer_addrs() {
+        let mut pa: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+        let mut kp: HashMap<String, KnownPeer> = HashMap::new();
+
+        // self = "dev-m". Peer "dev-a" < self -> we initiate (in
+        // known_peers). Peer "dev-z" > self -> they initiate (NOT in
+        // known_peers) but still in peer_addrs for blob pull.
+        apply_relay_snapshot(
+            "dev-m",
+            vec![
+                lp("dev-a", &["192.168.1.2:5000"]),
+                lp("dev-z", &["192.168.1.9:6000"]),
+                lp("dev-m", &["192.168.1.1:4000"]), // ourselves: dropped
+            ],
+            &mut pa,
+            &mut kp,
+        );
+
+        assert!(pa.contains_key("relay:dev-a"));
+        assert!(pa.contains_key("relay:dev-z"));
+        assert!(!pa.contains_key("relay:dev-m"));
+        assert!(kp.contains_key("relay:dev-a"), "smaller peer: we dial");
+        assert!(
+            !kp.contains_key("relay:dev-z"),
+            "larger peer dials us, not in known_peers"
+        );
+    }
+
+    #[test]
+    fn relay_snapshot_purges_departed_and_keeps_mdns() {
+        let mut pa: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+        let mut kp: HashMap<String, KnownPeer> = HashMap::new();
+        // Pre-existing mDNS entry (non-relay key) must survive.
+        kp.insert(
+            "Mac._clipbridge._tcp.local.".into(),
+            KnownPeer {
+                peer_did: "dev-mdns".into(),
+                candidates: vec!["192.168.1.50:7000".parse().unwrap()],
+            },
+        );
+        pa.insert(
+            "Mac._clipbridge._tcp.local.".into(),
+            vec!["192.168.1.50:7000".parse().unwrap()],
+        );
+
+        apply_relay_snapshot("dev-m", vec![lp("dev-a", &["192.168.1.2:5000"])], &mut pa, &mut kp);
+        assert!(kp.contains_key("relay:dev-a"));
+        assert!(kp.contains_key("Mac._clipbridge._tcp.local."));
+
+        // Next snapshot no longer lists dev-a -> its relay entry is purged,
+        // mDNS entry still untouched.
+        apply_relay_snapshot("dev-m", vec![], &mut pa, &mut kp);
+        assert!(!kp.contains_key("relay:dev-a"), "departed peer purged");
+        assert!(!pa.contains_key("relay:dev-a"));
+        assert!(kp.contains_key("Mac._clipbridge._tcp.local."), "mDNS survives");
+        assert!(pa.contains_key("Mac._clipbridge._tcp.local."));
+    }
+
+    #[test]
+    fn relay_snapshot_skips_peer_already_known_via_mdns() {
+        let mut pa: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+        let mut kp: HashMap<String, KnownPeer> = HashMap::new();
+        kp.insert(
+            "A._clipbridge._tcp.local.".into(),
+            KnownPeer {
+                peer_did: "dev-a".into(),
+                candidates: vec!["192.168.1.2:5000".parse().unwrap()],
+            },
+        );
+        // dev-a < self so normally we'd add it, but mDNS already covers
+        // its control link -> no duplicate relay: entry in known_peers.
+        apply_relay_snapshot("dev-m", vec![lp("dev-a", &["192.168.1.2:9999"])], &mut pa, &mut kp);
+        assert!(!kp.contains_key("relay:dev-a"), "mDNS-covered peer skipped");
+        // peer_addrs still gets it (blob fetch is tiebreak-independent).
+        assert!(pa.contains_key("relay:dev-a"));
+    }
+
+    #[test]
+    fn relay_snapshot_drops_unroutable_and_unparseable() {
+        let mut pa: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+        let mut kp: HashMap<String, KnownPeer> = HashMap::new();
+        apply_relay_snapshot(
+            "dev-m",
+            vec![
+                lp("dev-a", &["not-an-addr", "[fe80::1]:5000"]), // both rejected
+                lp("dev-b", &["garbage"]),
+            ],
+            &mut pa,
+            &mut kp,
+        );
+        assert!(pa.is_empty(), "no usable candidates -> nothing added");
+        assert!(kp.is_empty());
     }
 
     /// `fetch_blob` over a real localhost socket against a hand-rolled

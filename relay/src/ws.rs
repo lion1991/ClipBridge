@@ -1,28 +1,41 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        ConnectInfo, State,
     },
     response::IntoResponse,
 };
-use clipbridge_core::protocol::{ClientMessage, RecentClip, ServerMessage};
+use clipbridge_core::protocol::{ClientMessage, LanPeer, RecentClip, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
 
 use crate::hub::Hub;
 
-pub async fn ws_handler(ws: WebSocketUpgrade, State(hub): State<Hub>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, hub))
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(hub): State<Hub>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, hub, peer.ip()))
 }
 
-async fn handle_socket(socket: WebSocket, hub: Hub) {
+async fn handle_socket(socket: WebSocket, hub: Hub, egress: std::net::IpAddr) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Per-connection state
     let mut group: Option<String> = None;
     let mut device_id: Option<String> = None;
     let mut rx: Option<tokio::sync::broadcast::Receiver<RecentClip>> = None;
+
+    // Rendezvous state. `rv_group` is set once the client opts in via
+    // `LanAdvertise`; it's what we use to deregister on disconnect. The
+    // mailbox carries per-connection `LanPeers` snapshots pushed by the
+    // hub whenever this egress group's membership changes.
+    let conn_id = hub.next_conn_id();
+    let mut rv_group: Option<String> = None;
+    let (rv_tx, mut rv_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<LanPeer>>();
 
     // Keep idle connections from accumulating: ping every 30s, drop the
     // socket if no inbound frame for 60s.
@@ -85,6 +98,24 @@ async fn handle_socket(socket: WebSocket, hub: Hub) {
                         let reply = ServerMessage::Recent { clips };
                         let _ = ws_tx.send(Message::Text(serde_json::to_string(&reply).unwrap())).await;
                     }
+                    Ok(ClientMessage::LanAdvertise { group_id, device_id: did, candidates }) => {
+                        // Opt in to relay-assisted rendezvous. Register (or
+                        // refresh, if re-sent after a network change) under
+                        // this connection's egress IP; the hub immediately
+                        // pushes us whatever same-LAN peers already exist
+                        // and notifies the rest that we joined. `LanPeers`
+                        // only ever reaches connections that reach here, so
+                        // old clients (which never send this) are unaffected.
+                        rv_group = Some(group_id.clone());
+                        hub.rendezvous_upsert(
+                            &group_id,
+                            egress,
+                            conn_id,
+                            did,
+                            candidates,
+                            rv_tx.clone(),
+                        );
+                    }
                     Err(e) => {
                         let reply = ServerMessage::Error { reason: format!("bad message: {e}") };
                         let _ = ws_tx.send(Message::Text(serde_json::to_string(&reply).unwrap())).await;
@@ -110,6 +141,18 @@ async fn handle_socket(socket: WebSocket, hub: Hub) {
                 };
                 let _ = ws_tx.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
             }
+            // Rendezvous snapshot pushed by the hub (membership changed).
+            rv = rv_rx.recv() => {
+                let Some(peers) = rv else { continue };
+                let msg = ServerMessage::LanPeers { peers };
+                let _ = ws_tx.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+            }
         }
+    }
+
+    // Socket closed: drop our rendezvous slot so same-LAN peers stop being
+    // told to dial us and purge our stale candidates.
+    if let Some(g) = rv_group {
+        hub.rendezvous_remove(&g, egress, conn_id);
     }
 }

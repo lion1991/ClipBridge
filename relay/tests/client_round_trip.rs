@@ -12,7 +12,12 @@ async fn spawn_relay() -> SocketAddr {
     let blobs = BlobStore::new(8 * 1024 * 1024, Duration::from_secs(60), 4 * 1024 * 1024);
     let router = app(Hub::new(), blobs);
     tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
     addr
@@ -54,6 +59,7 @@ async fn two_clients_round_trip_through_relay() {
         group_id.clone(),
         key.clone(),
         "device-A".into(),
+        "Device A".into(),
         cap_a.clone(),
     )
     .unwrap();
@@ -62,6 +68,7 @@ async fn two_clients_round_trip_through_relay() {
         group_id.clone(),
         key.clone(),
         "device-B".into(),
+        "Device B".into(),
         cap_b.clone(),
     )
     .unwrap();
@@ -130,6 +137,7 @@ async fn image_round_trip_through_blob_store() {
         group_id.clone(),
         key.clone(),
         "device-A".into(),
+        "Device A".into(),
         cap_a.clone(),
     )
     .unwrap();
@@ -138,6 +146,7 @@ async fn image_round_trip_through_blob_store() {
         group_id.clone(),
         key.clone(),
         "device-B".into(),
+        "Device B".into(),
         cap_b.clone(),
     )
     .unwrap();
