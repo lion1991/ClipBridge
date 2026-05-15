@@ -422,6 +422,41 @@ final class BridgeCoordinator: ObservableObject {
     }
 
     private func writeImage(_ data: Data) {
+        applyImageToPasteboard(png: data, tiff: tiffRep(from: data))
+    }
+
+    /// Re-place a history entry's image on the system pasteboard for a
+    /// manual ⌘V (the "再粘贴" button). This must route through the
+    /// coordinator rather than a raw pasteboard write in the view:
+    ///
+    ///  1. The TIFF re-encode (`NSBitmapImageRep` → uncompressed TIFF) is
+    ///     heavy and, done synchronously on the SwiftUI button action, would
+    ///     freeze the whole app on large images. We do it on `blobQueue`.
+    ///  2. Without the seenHashes / lastChangeCount / quiet-window guards
+    ///     below, the 0.5Hz poll would treat the re-paste as a fresh local
+    ///     copy and re-send the image to every peer (duplicate rows on the
+    ///     other device, possibly looping via Universal Clipboard).
+    func rePasteImageToClipboard(_ data: Data) {
+        blobQueue.async { [weak self] in
+            let tiff = self?.tiffRep(from: data)
+            DispatchQueue.main.async {
+                self?.applyImageToPasteboard(png: data, tiff: tiff)
+            }
+        }
+    }
+
+    /// PNG bytes → uncompressed TIFF bytes for legacy AppKit consumers that
+    /// only accept `.tiff`. `nil` if the buffer won't decode. Decoding +
+    /// re-encoding here is the expensive part; keep callers off the main
+    /// thread for anything user-sized.
+    private func tiffRep(from png: Data) -> Data? {
+        guard let rep = NSBitmapImageRep(data: png) else { return nil }
+        return rep.representation(using: .tiff, properties: [:])
+    }
+
+    /// Guarded pasteboard write shared by inbound delivery and manual
+    /// re-paste. Must be called on the main thread.
+    private func applyImageToPasteboard(png data: Data, tiff: Data?) {
         // Insert the pixel hash so the next poll's pixel-hash check still
         // matches — and falls through to byte hash as a belt-and-suspenders
         // for the case where the same bytes literally come back (no UC
@@ -437,14 +472,7 @@ final class BridgeCoordinator: ObservableObject {
         // bytes) — sha256 dedup would miss and we'd republish in a loop,
         // ping-ponging the same image at 0.5Hz with each end re-encoding.
         pb.setData(data, forType: .png)
-        // Also synthesize raw TIFF bytes for legacy AppKit consumers that
-        // only accept .tiff. NSBitmapImageRep takes the PNG buffer happily.
-        // Stored as bytes too, so it round-trips the same way as PNG.
-        if let rep = NSBitmapImageRep(data: data),
-           let tiff = rep.representation(using: .tiff, properties: [:])
-        {
-            pb.setData(tiff, forType: .tiff)
-        }
+        if let tiff { pb.setData(tiff, forType: .tiff) }
         lastChangeCount = pb.changeCount
         enterQuietWindow()
     }
