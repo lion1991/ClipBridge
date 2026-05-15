@@ -154,16 +154,23 @@ fn push_egress(p: &HashMap<IpAddr, HashMap<u64, RvConn>>, egress: IpAddr) {
         return;
     };
     for (&cid, c) in conns.iter() {
-        let mut by_did: HashMap<&str, &Vec<String>> = HashMap::new();
+        let mut by_did: HashMap<&str, (u64, &Vec<String>)> = HashMap::new();
         for (&oid, oc) in conns.iter() {
             if oid == cid {
                 continue;
             }
-            by_did.insert(oc.device_id.as_str(), &oc.candidates);
+            by_did
+                .entry(oc.device_id.as_str())
+                .and_modify(|latest| {
+                    if oid > latest.0 {
+                        *latest = (oid, &oc.candidates);
+                    }
+                })
+                .or_insert((oid, &oc.candidates));
         }
         let peers: Vec<LanPeer> = by_did
             .into_iter()
-            .map(|(did, cands)| LanPeer {
+            .map(|(did, (_, cands))| LanPeer {
                 device_id: did.to_string(),
                 candidates: cands.clone(),
             })
@@ -239,22 +246,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peers_deduped_by_device_id() {
+    async fn peers_deduped_by_device_id_uses_highest_conn_id_candidates() {
         let hub = Hub::new();
         let egress = ip(1);
         let (obs_tx, mut obs_rx) = mpsc::unbounded_channel();
         hub.rendezvous_upsert("g", egress, 1, "obs".into(), vec!["o:1".into()], obs_tx);
         let _ = obs_rx.recv().await;
-        // Same device_id "D" reconnects on a second conn id; the observer
-        // must see exactly one entry for D (latest candidates win).
-        let (d1_tx, _d1_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert("g", egress, 2, "D".into(), vec!["old:1".into()], d1_tx);
-        let _ = obs_rx.recv().await;
-        let (d2_tx, _d2_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert("g", egress, 3, "D".into(), vec!["new:2".into()], d2_tx);
+
+        // Same device_id "D" reconnects on a later conn id; the observer
+        // must see exactly one entry for D and it must use the highest
+        // conn_id's candidates, independent of HashMap iteration order.
+        for conn_id in 2..130 {
+            let (d_tx, _d_rx) = mpsc::unbounded_channel();
+            hub.rendezvous_upsert(
+                "g",
+                egress,
+                conn_id,
+                "D".into(),
+                vec![format!("old:{conn_id}")],
+                d_tx,
+            );
+            let _ = obs_rx.recv().await;
+        }
+
+        let (d_tx, _d_rx) = mpsc::unbounded_channel();
+        hub.rendezvous_upsert("g", egress, 130, "D".into(), vec!["new:130".into()], d_tx);
         let snap = obs_rx.recv().await.unwrap();
         let d_entries: Vec<_> = snap.iter().filter(|p| p.device_id == "D").collect();
         assert_eq!(d_entries.len(), 1, "duplicate device_id must collapse");
+        assert_eq!(d_entries[0].candidates, vec!["new:130".to_string()]);
     }
 }
 

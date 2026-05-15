@@ -232,6 +232,70 @@ where
     .ok()
 }
 
+async fn expect_error<S>(ws: &mut S, expected: &str)
+where
+    S: futures_util::StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    let reply = tokio::time::timeout(Duration::from_secs(2), next_server_msg(ws))
+        .await
+        .expect("relay did not reply with an error");
+    let ServerMessage::Error { reason } = reply else {
+        panic!("expected Error({expected}), got {reply:?}");
+    };
+    assert_eq!(reason, expected);
+}
+
+#[tokio::test]
+async fn lan_advertise_requires_joined_group_and_device() {
+    let addr = spawn_relay().await;
+    let mut ws = connect(addr).await;
+    let group_id = "rv-auth-group".to_string();
+
+    send_json(
+        &mut ws,
+        &ClientMessage::LanAdvertise {
+            group_id: group_id.clone(),
+            device_id: "intruder".into(),
+            candidates: vec!["192.168.1.200:5000".into()],
+        },
+    )
+    .await;
+    expect_error(&mut ws, "join first").await;
+
+    send_json(
+        &mut ws,
+        &ClientMessage::Join {
+            group_id: group_id.clone(),
+            device_id: "joined-device".into(),
+        },
+    )
+    .await;
+    matches!(next_server_msg(&mut ws).await, ServerMessage::Joined { .. });
+
+    send_json(
+        &mut ws,
+        &ClientMessage::LanAdvertise {
+            group_id: "other-group".into(),
+            device_id: "joined-device".into(),
+            candidates: vec!["192.168.1.201:5000".into()],
+        },
+    )
+    .await;
+    expect_error(&mut ws, "group mismatch").await;
+
+    send_json(
+        &mut ws,
+        &ClientMessage::LanAdvertise {
+            group_id,
+            device_id: "different-device".into(),
+            candidates: vec!["192.168.1.202:5000".into()],
+        },
+    )
+    .await;
+    expect_error(&mut ws, "device mismatch").await;
+}
+
 #[tokio::test]
 async fn rendezvous_introduces_same_egress_peers() {
     let addr = spawn_relay().await;

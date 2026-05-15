@@ -508,6 +508,7 @@ async fn session(
     let url = format!("{normalized}/ws");
     tracing::info!(%url, "connecting");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
+    let mut lan_advertise_error_pending = false;
 
     let join = ClientMessage::Join {
         group_id: group_id.to_string(),
@@ -541,6 +542,7 @@ async fn session(
             };
             ws.send(Message::Text(serde_json::to_string(&adv)?.into()))
                 .await?;
+            lan_advertise_error_pending = true;
         }
     }
 
@@ -614,11 +616,19 @@ async fn session(
                         // `handle_server`'s reach), and a full snapshot
                         // each time, so intercept before dispatch.
                         if let ServerMessage::LanPeers { peers } = parsed {
+                            lan_advertise_error_pending = false;
                             if let Some(lan) = lan {
                                 lan.ingest_relay_peers(peers).await;
                             }
                         } else {
-                            handle_server(parsed, key, device_id, listener, dedup);
+                            handle_server(
+                                parsed,
+                                key,
+                                device_id,
+                                listener,
+                                dedup,
+                                &mut lan_advertise_error_pending,
+                            );
                         }
                     }
                     Message::Ping(p) => {
@@ -638,6 +648,7 @@ fn handle_server(
     device_id: &str,
     listener: &Arc<dyn ClipListener>,
     dedup: &Arc<Mutex<DedupCache>>,
+    lan_advertise_error_pending: &mut bool,
 ) {
     match msg {
         ServerMessage::Joined { .. } => {}
@@ -679,11 +690,27 @@ fn handle_server(
             }
         }
         ServerMessage::Error { reason } => {
+            if *lan_advertise_error_pending {
+                *lan_advertise_error_pending = false;
+                if is_lan_advertise_compat_error(&reason) {
+                    tracing::debug!(
+                        %reason,
+                        "ignoring optional LanAdvertise compatibility error from old relay"
+                    );
+                    return;
+                }
+            }
             listener.on_state(ConnectionState::Error { message: reason });
         }
         // Intercepted in `session()` before dispatch (needs the LAN node).
         ServerMessage::LanPeers { .. } => {}
     }
+}
+
+fn is_lan_advertise_compat_error(reason: &str) -> bool {
+    reason.contains("bad message:")
+        && reason.contains("unknown variant")
+        && reason.contains("lan_advertise")
 }
 
 /// Tiny LRU-ish cache to drop duplicate `(sender_device_id, ts)` deliveries.
@@ -752,5 +779,71 @@ mod tests {
         assert!(d.insert("A", 2));
         assert!(d.insert("A", 3)); // evicts (A,1)
         assert!(d.insert("A", 1)); // re-insert allowed because evicted
+    }
+
+    #[derive(Default)]
+    struct CaptureListener {
+        states: Mutex<Vec<String>>,
+    }
+
+    impl ClipListener for CaptureListener {
+        fn on_clip(&self, _payload: ClipPayload) {}
+
+        fn on_state(&self, state: ConnectionState) {
+            let label = match state {
+                ConnectionState::Connecting => "connecting".to_string(),
+                ConnectionState::Connected => "connected".to_string(),
+                ConnectionState::Disconnected => "disconnected".to_string(),
+                ConnectionState::Error { message } => format!("error:{message}"),
+            };
+            self.states.lock().unwrap().push(label);
+        }
+    }
+
+    #[test]
+    fn handle_server_suppresses_pending_lan_advertise_compat_error() {
+        let capture = Arc::new(CaptureListener::default());
+        let listener: Arc<dyn ClipListener> = capture.clone();
+        let dedup = Arc::new(Mutex::new(DedupCache::new(8, Duration::from_secs(60))));
+        let mut lan_advertise_error_pending = true;
+
+        handle_server(
+            ServerMessage::Error {
+                reason: "bad message: unknown variant `lan_advertise`, expected one of `join`, `publish`, `fetch_recent`".into(),
+            },
+            &[0; KEY_LEN],
+            "device",
+            &listener,
+            &dedup,
+            &mut lan_advertise_error_pending,
+        );
+
+        assert!(capture.states.lock().unwrap().is_empty());
+        assert!(!lan_advertise_error_pending);
+    }
+
+    #[test]
+    fn handle_server_reports_non_compat_error_while_lan_advertise_pending() {
+        let capture = Arc::new(CaptureListener::default());
+        let listener: Arc<dyn ClipListener> = capture.clone();
+        let dedup = Arc::new(Mutex::new(DedupCache::new(8, Duration::from_secs(60))));
+        let mut lan_advertise_error_pending = true;
+
+        handle_server(
+            ServerMessage::Error {
+                reason: "group mismatch".into(),
+            },
+            &[0; KEY_LEN],
+            "device",
+            &listener,
+            &dedup,
+            &mut lan_advertise_error_pending,
+        );
+
+        assert_eq!(
+            capture.states.lock().unwrap().as_slice(),
+            ["error:group mismatch"]
+        );
+        assert!(!lan_advertise_error_pending);
     }
 }

@@ -99,6 +99,18 @@ async fn handle_socket(socket: WebSocket, hub: Hub, egress: std::net::IpAddr) {
                         let _ = ws_tx.send(Message::Text(serde_json::to_string(&reply).unwrap())).await;
                     }
                     Ok(ClientMessage::LanAdvertise { group_id, device_id: did, candidates }) => {
+                        let Some(joined_device_id) = device_id.clone() else {
+                            let _ = ws_tx.send(Message::Text(serde_json::to_string(&ServerMessage::Error { reason: "join first".into() }).unwrap())).await;
+                            continue;
+                        };
+                        if group.as_deref() != Some(group_id.as_str()) {
+                            let _ = ws_tx.send(Message::Text(serde_json::to_string(&ServerMessage::Error { reason: "group mismatch".into() }).unwrap())).await;
+                            continue;
+                        }
+                        if did != joined_device_id {
+                            let _ = ws_tx.send(Message::Text(serde_json::to_string(&ServerMessage::Error { reason: "device mismatch".into() }).unwrap())).await;
+                            continue;
+                        }
                         // Opt in to relay-assisted rendezvous. Register (or
                         // refresh, if re-sent after a network change) under
                         // this connection's egress IP; the hub immediately
@@ -111,7 +123,7 @@ async fn handle_socket(socket: WebSocket, hub: Hub, egress: std::net::IpAddr) {
                             &group_id,
                             egress,
                             conn_id,
-                            did,
+                            joined_device_id,
                             candidates,
                             rv_tx.clone(),
                         );
