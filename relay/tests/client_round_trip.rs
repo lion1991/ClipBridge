@@ -116,7 +116,10 @@ async fn two_clients_round_trip_through_relay() {
     assert_eq!(received.kind, ClipKind::Text);
 
     // A must not have echoed its own clip.
-    assert!(cap_a.clips.lock().unwrap().is_empty(), "A received its own echo");
+    assert!(
+        cap_a.clips.lock().unwrap().is_empty(),
+        "A received its own echo"
+    );
 
     client_a.stop();
     client_b.stop();

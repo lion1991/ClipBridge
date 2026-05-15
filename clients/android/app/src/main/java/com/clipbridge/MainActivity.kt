@@ -32,6 +32,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -40,6 +42,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -435,7 +438,12 @@ private fun SyncTabContent(
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        ConnectionPill(state = connState, paired = isPaired, asEnabled = asEnabled, lanPeerNames = lanPeerNames)
+        ConnectionStatusBlock(
+            state = connState,
+            paired = isPaired,
+            asEnabled = asEnabled,
+            lanPeerNames = lanPeerNames,
+        )
         ScanHero(paired = isPaired, onScan = onScan)
         StatusSection(
             shizukuState = shizukuState,
@@ -548,6 +556,62 @@ private fun ImagesTabContent(
  * pairing / accessibility-enabled flags so the user always sees the most
  * actionable status.
  */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ConnectionStatusBlock(
+    state: UiConnState,
+    paired: Boolean,
+    asEnabled: Boolean,
+    lanPeerNames: List<String>,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        ConnectionPill(
+            state = state,
+            paired = paired,
+            asEnabled = asEnabled,
+            lanPeerNames = lanPeerNames,
+        )
+        if (paired && asEnabled && state is UiConnState.Connected && lanPeerNames.isNotEmpty()) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        "局域网终端",
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        lanPeerNames.distinct().forEach { name ->
+                            Surface(
+                                shape = RoundedCornerShape(999.dp),
+                                color = MaterialTheme.colorScheme.surface,
+                                contentColor = MaterialTheme.colorScheme.onSurface,
+                            ) {
+                                Text(
+                                    text = name,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    modifier = Modifier
+                                        .widthIn(max = 220.dp)
+                                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun ConnectionPill(
     state: UiConnState,
@@ -566,11 +630,7 @@ private fun ConnectionPill(
     // Only worth surfacing the transport hint once we're actually connected
     // — before that the user cares about why pairing/connection isn't up,
     // not which transport will be used when it does.
-    val transportSuffix = if (paired && asEnabled && state is UiConnState.Connected) {
-        if (lanPeerNames.isNotEmpty()) {
-            " · 局域网 ${lanPeerNames.size} (${lanPeerNames.joinToString(", ")})"
-        } else " · 仅中继"
-    } else ""
+    val transportSuffix = connectionTransportSuffix(paired, asEnabled, state, lanPeerNames)
     val pill = when {
         !asEnabled -> Pill("无障碍未启用", Icons.Filled.Warning, cs.errorContainer, cs.onErrorContainer)
         !paired -> Pill("未配对", Icons.Filled.LinkOff, cs.surfaceVariant, cs.onSurfaceVariant)
@@ -606,6 +666,22 @@ private fun ConnectionPill(
                 overflow = TextOverflow.Ellipsis,
             )
         }
+    }
+}
+
+internal fun connectionTransportSuffix(
+    paired: Boolean,
+    asEnabled: Boolean,
+    state: UiConnState,
+    lanPeerNames: List<String>,
+): String {
+    if (!paired || !asEnabled || state !is UiConnState.Connected) {
+        return ""
+    }
+    return if (lanPeerNames.isNotEmpty()) {
+        " · 局域网 ${lanPeerNames.size} 台"
+    } else {
+        " · 仅中继"
     }
 }
 

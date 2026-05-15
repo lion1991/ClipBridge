@@ -12,10 +12,12 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::blob::{BlobClient, BlobError};
 use crate::crypto::{decrypt, encrypt, sha256_hex, KEY_LEN, NONCE_LEN};
 use crate::lan::{
-    lan_fetch_blob, unique_peer_names, BlobCache, IncomingLanClip, LanNode, PeerAddrs, PeerRegistry,
-    SharedBlobCache,
+    lan_fetch_blob, unique_peer_names, BlobCache, IncomingLanClip, LanNode, PeerAddrs,
+    PeerRegistry, SharedBlobCache,
 };
-use crate::protocol::{ClientMessage, ClipKind, ClipPayload, ImageMeta, ServerMessage};
+use crate::protocol::{
+    ClientMessage, ClipKind, ClipPayload, ImageMeta, LanCandidate, ServerMessage,
+};
 
 /// Rustls 0.23 refuses to pick a crypto provider on its own when more than
 /// one (or none) is enabled across the dependency graph. We control this
@@ -243,7 +245,8 @@ impl Client {
         ts: u64,
     ) -> Result<(), FfiError> {
         let plaintext_len = image_bytes.len() as u64;
-        let (ciphertext, nonce) = encrypt(&self.shared.key, &image_bytes).map_err(ClientError::from)?;
+        let (ciphertext, nonce) =
+            encrypt(&self.shared.key, &image_bytes).map_err(ClientError::from)?;
         let sha = sha256_hex(&ciphertext);
         // Seed the LAN cache so co-LAN peers can pull these bytes from us
         // directly instead of round-tripping the relay. We still upload to
@@ -487,6 +490,21 @@ enum SessionExit {
     Reconnect,
 }
 
+const LAN_ADVERTISE_REFRESH_EVERY: Duration = Duration::from_secs(5);
+
+fn normalize_lan_candidate_networks(mut candidates: Vec<LanCandidate>) -> Vec<LanCandidate> {
+    candidates.sort_by(|a, b| a.addr.cmp(&b.addr).then(a.prefix_len.cmp(&b.prefix_len)));
+    candidates.dedup_by(|a, b| a.addr == b.addr && a.prefix_len == b.prefix_len);
+    candidates
+}
+
+fn lan_advertise_refresh_needed(last: Option<&[LanCandidate]>, current: &[LanCandidate]) -> bool {
+    match last {
+        Some(last) => last != current,
+        None => !current.is_empty(),
+    }
+}
+
 async fn session(
     relay_url: &str,
     group_id: &str,
@@ -509,6 +527,8 @@ async fn session(
     tracing::info!(%url, "connecting");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
     let mut lan_advertise_error_pending = false;
+    let mut lan_advertise_disabled = false;
+    let mut last_lan_advertise: Option<Vec<LanCandidate>> = None;
 
     let join = ClientMessage::Join {
         group_id: group_id.to_string(),
@@ -533,16 +553,20 @@ async fn session(
     // we ignore, and never push us `LanPeers`. Skipped entirely if the LAN
     // node didn't start (multicast/socket blocked) or has no private IPs.
     if let Some(lan) = lan {
-        let candidates = lan.advertise_candidates();
+        let candidate_networks =
+            normalize_lan_candidate_networks(lan.advertise_candidate_networks());
+        let candidates: Vec<String> = candidate_networks.iter().map(|c| c.addr.clone()).collect();
         if !candidates.is_empty() {
             let adv = ClientMessage::LanAdvertise {
                 group_id: group_id.to_string(),
                 device_id: device_id.to_string(),
                 candidates,
+                candidate_networks: candidate_networks.clone(),
             };
             ws.send(Message::Text(serde_json::to_string(&adv)?.into()))
                 .await?;
             lan_advertise_error_pending = true;
+            last_lan_advertise = Some(candidate_networks);
         }
     }
 
@@ -556,6 +580,9 @@ async fn session(
     let mut ping_interval = tokio::time::interval(PING_EVERY);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ping_interval.tick().await; // consume the immediate first tick
+    let mut lan_advertise_interval = tokio::time::interval(LAN_ADVERTISE_REFRESH_EVERY);
+    lan_advertise_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    lan_advertise_interval.tick().await; // consume the immediate first tick
     let mut last_seen = tokio::time::Instant::now();
 
     loop {
@@ -568,6 +595,28 @@ async fn session(
             }
             _ = ping_interval.tick() => {
                 ws.send(Message::Ping(Vec::new().into())).await?;
+            }
+            _ = lan_advertise_interval.tick(), if lan.is_some() && !lan_advertise_disabled => {
+                if let Some(lan) = lan {
+                    let candidate_networks =
+                        normalize_lan_candidate_networks(lan.advertise_candidate_networks());
+                    if lan_advertise_refresh_needed(
+                        last_lan_advertise.as_deref(),
+                        &candidate_networks,
+                    ) {
+                        let candidates: Vec<String> =
+                            candidate_networks.iter().map(|c| c.addr.clone()).collect();
+                        let adv = ClientMessage::LanAdvertise {
+                            group_id: group_id.to_string(),
+                            device_id: device_id.to_string(),
+                            candidates,
+                            candidate_networks: candidate_networks.clone(),
+                        };
+                        ws.send(Message::Text(serde_json::to_string(&adv)?.into())).await?;
+                        lan_advertise_error_pending = true;
+                        last_lan_advertise = Some(candidate_networks);
+                    }
+                }
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else {
@@ -628,6 +677,7 @@ async fn session(
                                 listener,
                                 dedup,
                                 &mut lan_advertise_error_pending,
+                                &mut lan_advertise_disabled,
                             );
                         }
                     }
@@ -649,6 +699,7 @@ fn handle_server(
     listener: &Arc<dyn ClipListener>,
     dedup: &Arc<Mutex<DedupCache>>,
     lan_advertise_error_pending: &mut bool,
+    lan_advertise_disabled: &mut bool,
 ) {
     match msg {
         ServerMessage::Joined { .. } => {}
@@ -693,6 +744,7 @@ fn handle_server(
             if *lan_advertise_error_pending {
                 *lan_advertise_error_pending = false;
                 if is_lan_advertise_compat_error(&reason) {
+                    *lan_advertise_disabled = true;
                     tracing::debug!(
                         %reason,
                         "ignoring optional LanAdvertise compatibility error from old relay"
@@ -744,11 +796,7 @@ impl DedupCache {
                 break;
             }
         }
-        if self
-            .entries
-            .iter()
-            .any(|(s, t, _)| s == sender && *t == ts)
-        {
+        if self.entries.iter().any(|(s, t, _)| s == sender && *t == ts) {
             return false;
         }
         if self.entries.len() == self.capacity {
@@ -806,6 +854,7 @@ mod tests {
         let listener: Arc<dyn ClipListener> = capture.clone();
         let dedup = Arc::new(Mutex::new(DedupCache::new(8, Duration::from_secs(60))));
         let mut lan_advertise_error_pending = true;
+        let mut lan_advertise_disabled = false;
 
         handle_server(
             ServerMessage::Error {
@@ -816,10 +865,12 @@ mod tests {
             &listener,
             &dedup,
             &mut lan_advertise_error_pending,
+            &mut lan_advertise_disabled,
         );
 
         assert!(capture.states.lock().unwrap().is_empty());
         assert!(!lan_advertise_error_pending);
+        assert!(lan_advertise_disabled);
     }
 
     #[test]
@@ -828,6 +879,7 @@ mod tests {
         let listener: Arc<dyn ClipListener> = capture.clone();
         let dedup = Arc::new(Mutex::new(DedupCache::new(8, Duration::from_secs(60))));
         let mut lan_advertise_error_pending = true;
+        let mut lan_advertise_disabled = false;
 
         handle_server(
             ServerMessage::Error {
@@ -838,6 +890,7 @@ mod tests {
             &listener,
             &dedup,
             &mut lan_advertise_error_pending,
+            &mut lan_advertise_disabled,
         );
 
         assert_eq!(
@@ -845,5 +898,39 @@ mod tests {
             ["error:group mismatch"]
         );
         assert!(!lan_advertise_error_pending);
+        assert!(!lan_advertise_disabled);
+    }
+
+    fn lc(addr: &str, prefix_len: u8) -> crate::protocol::LanCandidate {
+        crate::protocol::LanCandidate {
+            addr: addr.into(),
+            prefix_len,
+        }
+    }
+
+    #[test]
+    fn lan_advertise_refresh_detects_real_candidate_changes_only() {
+        let first = normalize_lan_candidate_networks(vec![
+            lc("192.168.1.10:5000", 24),
+            lc("10.0.0.2:5000", 24),
+        ]);
+        let reordered_duplicate = normalize_lan_candidate_networks(vec![
+            lc("10.0.0.2:5000", 24),
+            lc("192.168.1.10:5000", 24),
+            lc("192.168.1.10:5000", 24),
+        ]);
+        let changed = normalize_lan_candidate_networks(vec![
+            lc("192.168.2.10:5000", 24),
+            lc("10.0.0.2:5000", 24),
+        ]);
+
+        assert!(lan_advertise_refresh_needed(None, &first));
+        assert!(!lan_advertise_refresh_needed(
+            Some(&first),
+            &reordered_duplicate
+        ));
+        assert!(lan_advertise_refresh_needed(Some(&first), &changed));
+        assert!(lan_advertise_refresh_needed(Some(&first), &[]));
+        assert!(!lan_advertise_refresh_needed(None, &[]));
     }
 }

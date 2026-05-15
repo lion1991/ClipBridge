@@ -1,6 +1,6 @@
 use std::{
-    collections::{HashMap, VecDeque},
-    net::IpAddr,
+    collections::{HashMap, HashSet, VecDeque},
+    net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -8,13 +8,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clipbridge_core::protocol::{LanPeer, RecentClip};
+use clipbridge_core::protocol::{LanCandidate, LanPeer, RecentClip};
 use dashmap::DashMap;
 use tokio::sync::{broadcast, mpsc};
 
 const RECENT_CAP: usize = 3;
 const RECENT_TTL: Duration = Duration::from_secs(5 * 60);
 const BROADCAST_CAP: usize = 32;
+pub(crate) const MAX_LAN_CANDIDATES: usize = 32;
 
 #[derive(Clone)]
 pub struct Hub {
@@ -28,6 +29,7 @@ pub struct Hub {
 struct RvConn {
     device_id: String,
     candidates: Vec<String>,
+    candidate_networks: Vec<LanCandidate>,
     /// Per-connection mailbox. The connection's ws task drains this and
     /// writes each snapshot out as `ServerMessage::LanPeers`.
     tx: mpsc::UnboundedSender<Vec<LanPeer>>,
@@ -113,6 +115,7 @@ impl Hub {
         conn_id: u64,
         device_id: String,
         candidates: Vec<String>,
+        candidate_networks: Vec<LanCandidate>,
         tx: mpsc::UnboundedSender<Vec<LanPeer>>,
     ) {
         let group = self.entry(group_id);
@@ -122,6 +125,7 @@ impl Hub {
             RvConn {
                 device_id,
                 candidates,
+                candidate_networks,
                 tx,
             },
         );
@@ -154,7 +158,7 @@ fn push_egress(p: &HashMap<IpAddr, HashMap<u64, RvConn>>, egress: IpAddr) {
         return;
     };
     for (&cid, c) in conns.iter() {
-        let mut by_did: HashMap<&str, (u64, &Vec<String>)> = HashMap::new();
+        let mut by_did: HashMap<&str, (u64, &RvConn)> = HashMap::new();
         for (&oid, oc) in conns.iter() {
             if oid == cid {
                 continue;
@@ -163,21 +167,145 @@ fn push_egress(p: &HashMap<IpAddr, HashMap<u64, RvConn>>, egress: IpAddr) {
                 .entry(oc.device_id.as_str())
                 .and_modify(|latest| {
                     if oid > latest.0 {
-                        *latest = (oid, &oc.candidates);
+                        *latest = (oid, oc);
                     }
                 })
-                .or_insert((oid, &oc.candidates));
+                .or_insert((oid, oc));
         }
         let peers: Vec<LanPeer> = by_did
             .into_iter()
-            .map(|(did, (_, cands))| LanPeer {
-                device_id: did.to_string(),
-                candidates: cands.clone(),
+            .filter_map(|(did, (_, peer))| {
+                let candidates = candidates_for_receiver(c, peer);
+                (!candidates.is_empty()).then_some(LanPeer {
+                    device_id: did.to_string(),
+                    candidates,
+                })
             })
             .collect();
         // Receiver gone just means that conn's task already exited; the
         // next remove() will clean its slot.
         let _ = c.tx.send(peers);
+    }
+}
+
+pub(crate) fn sanitize_lan_advertise(
+    candidates: Vec<String>,
+    candidate_networks: Vec<LanCandidate>,
+) -> (Vec<String>, Vec<LanCandidate>) {
+    let mut sanitized_candidates = Vec::new();
+    let mut seen_candidates = HashSet::new();
+    for candidate in candidates {
+        if sanitized_candidates.len() >= MAX_LAN_CANDIDATES {
+            break;
+        }
+        let Ok(addr) = candidate.parse::<SocketAddr>() else {
+            continue;
+        };
+        if !is_relay_lan_candidate_ip(&addr.ip()) {
+            continue;
+        }
+        let normalized = addr.to_string();
+        if seen_candidates.insert(normalized.clone()) {
+            sanitized_candidates.push(normalized);
+        }
+    }
+
+    let accepted: HashSet<&str> = sanitized_candidates.iter().map(String::as_str).collect();
+    let mut sanitized_networks = Vec::new();
+    let mut seen_networks = HashSet::new();
+    for candidate in candidate_networks {
+        if sanitized_networks.len() >= MAX_LAN_CANDIDATES {
+            break;
+        }
+        let Ok(addr) = candidate.addr.parse::<SocketAddr>() else {
+            continue;
+        };
+        let normalized = addr.to_string();
+        if !accepted.contains(normalized.as_str())
+            || !valid_prefix_len(&addr.ip(), candidate.prefix_len)
+            || !seen_networks.insert(normalized.clone())
+        {
+            continue;
+        }
+        sanitized_networks.push(LanCandidate {
+            addr: normalized,
+            prefix_len: candidate.prefix_len,
+        });
+    }
+
+    (sanitized_candidates, sanitized_networks)
+}
+
+fn is_relay_lan_candidate_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => (v6.octets()[0] & 0xfe) == 0xfc,
+    }
+}
+
+fn valid_prefix_len(ip: &IpAddr, prefix_len: u8) -> bool {
+    match ip {
+        IpAddr::V4(_) => prefix_len <= 32,
+        IpAddr::V6(_) => prefix_len <= 128,
+    }
+}
+
+fn candidates_for_receiver(receiver: &RvConn, peer: &RvConn) -> Vec<String> {
+    if receiver.candidate_networks.is_empty() || peer.candidate_networks.is_empty() {
+        return peer.candidates.clone();
+    }
+    let mut out = Vec::new();
+    for candidate in &peer.candidate_networks {
+        if peer
+            .candidates
+            .iter()
+            .any(|legacy| legacy == &candidate.addr)
+            && receiver
+                .candidate_networks
+                .iter()
+                .any(|receiver_candidate| mutual_subnet(receiver_candidate, candidate))
+            && !out.contains(&candidate.addr)
+        {
+            out.push(candidate.addr.clone());
+        }
+    }
+    out
+}
+
+fn mutual_subnet(a: &LanCandidate, b: &LanCandidate) -> bool {
+    let Some(a_addr) = parse_candidate_addr(&a.addr) else {
+        return false;
+    };
+    let Some(b_addr) = parse_candidate_addr(&b.addr) else {
+        return false;
+    };
+    ip_in_prefix(b_addr.ip(), a_addr.ip(), a.prefix_len)
+        && ip_in_prefix(a_addr.ip(), b_addr.ip(), b.prefix_len)
+}
+
+fn parse_candidate_addr(addr: &str) -> Option<SocketAddr> {
+    addr.parse().ok()
+}
+
+fn ip_in_prefix(target: IpAddr, network_ip: IpAddr, prefix_len: u8) -> bool {
+    match (target, network_ip) {
+        (IpAddr::V4(target), IpAddr::V4(network_ip)) if prefix_len <= 32 => {
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            (u32::from(target) & mask) == (u32::from(network_ip) & mask)
+        }
+        (IpAddr::V6(target), IpAddr::V6(network_ip)) if prefix_len <= 128 => {
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
+            (u128::from(target) & mask) == (u128::from(network_ip) & mask)
+        }
+        _ => false,
     }
 }
 
@@ -197,12 +325,28 @@ mod tests {
 
         // A joins first — no peers yet.
         let (a_tx, mut a_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert("g", egress, 1, "A".into(), vec!["1.1.1.1:10".into()], a_tx);
+        hub.rendezvous_upsert(
+            "g",
+            egress,
+            1,
+            "A".into(),
+            vec!["1.1.1.1:10".into()],
+            vec![],
+            a_tx,
+        );
         assert_eq!(a_rx.recv().await.unwrap().len(), 0);
 
         // B joins same egress — B learns A immediately, A is re-notified.
         let (b_tx, mut b_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert("g", egress, 2, "B".into(), vec!["2.2.2.2:20".into()], b_tx);
+        hub.rendezvous_upsert(
+            "g",
+            egress,
+            2,
+            "B".into(),
+            vec!["2.2.2.2:20".into()],
+            vec![],
+            b_tx,
+        );
 
         let b_sees = b_rx.recv().await.unwrap();
         assert_eq!(b_sees.len(), 1);
@@ -219,13 +363,16 @@ mod tests {
         let hub = Hub::new();
         let (a_tx, mut a_rx) = mpsc::unbounded_channel();
         let (b_tx, mut b_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert("g", ip(1), 1, "A".into(), vec!["a:1".into()], a_tx);
+        hub.rendezvous_upsert("g", ip(1), 1, "A".into(), vec!["a:1".into()], vec![], a_tx);
         let _ = a_rx.recv().await;
         // B is on a different egress IP — must not see A and must not
         // trigger a push to A.
-        hub.rendezvous_upsert("g", ip(2), 2, "B".into(), vec!["b:2".into()], b_tx);
+        hub.rendezvous_upsert("g", ip(2), 2, "B".into(), vec!["b:2".into()], vec![], b_tx);
         assert_eq!(b_rx.recv().await.unwrap().len(), 0);
-        assert!(a_rx.try_recv().is_err(), "A should not be notified about a different-egress peer");
+        assert!(
+            a_rx.try_recv().is_err(),
+            "A should not be notified about a different-egress peer"
+        );
     }
 
     #[tokio::test]
@@ -234,9 +381,9 @@ mod tests {
         let egress = ip(1);
         let (a_tx, mut a_rx) = mpsc::unbounded_channel();
         let (b_tx, mut b_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert("g", egress, 1, "A".into(), vec!["a:1".into()], a_tx);
+        hub.rendezvous_upsert("g", egress, 1, "A".into(), vec!["a:1".into()], vec![], a_tx);
         let _ = a_rx.recv().await;
-        hub.rendezvous_upsert("g", egress, 2, "B".into(), vec!["b:2".into()], b_tx);
+        hub.rendezvous_upsert("g", egress, 2, "B".into(), vec!["b:2".into()], vec![], b_tx);
         let _ = a_rx.recv().await; // A learns B
         let _ = b_rx.recv().await;
 
@@ -250,7 +397,15 @@ mod tests {
         let hub = Hub::new();
         let egress = ip(1);
         let (obs_tx, mut obs_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert("g", egress, 1, "obs".into(), vec!["o:1".into()], obs_tx);
+        hub.rendezvous_upsert(
+            "g",
+            egress,
+            1,
+            "obs".into(),
+            vec!["o:1".into()],
+            vec![],
+            obs_tx,
+        );
         let _ = obs_rx.recv().await;
 
         // Same device_id "D" reconnects on a later conn id; the observer
@@ -264,17 +419,110 @@ mod tests {
                 conn_id,
                 "D".into(),
                 vec![format!("old:{conn_id}")],
+                vec![],
                 d_tx,
             );
             let _ = obs_rx.recv().await;
         }
 
         let (d_tx, _d_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert("g", egress, 130, "D".into(), vec!["new:130".into()], d_tx);
+        hub.rendezvous_upsert(
+            "g",
+            egress,
+            130,
+            "D".into(),
+            vec!["new:130".into()],
+            vec![],
+            d_tx,
+        );
         let snap = obs_rx.recv().await.unwrap();
         let d_entries: Vec<_> = snap.iter().filter(|p| p.device_id == "D").collect();
         assert_eq!(d_entries.len(), 1, "duplicate device_id must collapse");
         assert_eq!(d_entries[0].candidates, vec!["new:130".to_string()]);
+    }
+
+    fn lc(addr: &str, prefix_len: u8) -> LanCandidate {
+        LanCandidate {
+            addr: addr.into(),
+            prefix_len,
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_networks_filter_to_mutual_subnets() {
+        let hub = Hub::new();
+        let egress = ip(1);
+        let (a_tx, mut a_rx) = mpsc::unbounded_channel();
+        let (b_tx, mut b_rx) = mpsc::unbounded_channel();
+
+        hub.rendezvous_upsert(
+            "g",
+            egress,
+            1,
+            "A".into(),
+            vec!["192.168.1.10:5000".into(), "10.211.55.2:5000".into()],
+            vec![lc("192.168.1.10:5000", 24), lc("10.211.55.2:5000", 24)],
+            a_tx,
+        );
+        let _ = a_rx.recv().await;
+        hub.rendezvous_upsert(
+            "g",
+            egress,
+            2,
+            "B".into(),
+            vec!["192.168.1.11:6000".into(), "10.37.129.2:6000".into()],
+            vec![lc("192.168.1.11:6000", 24), lc("10.37.129.2:6000", 24)],
+            b_tx,
+        );
+
+        let b_sees = b_rx.recv().await.unwrap();
+        assert_eq!(b_sees[0].candidates, vec!["192.168.1.10:5000".to_string()]);
+        let a_sees = a_rx.recv().await.unwrap();
+        assert_eq!(a_sees[0].candidates, vec!["192.168.1.11:6000".to_string()]);
+    }
+
+    #[test]
+    fn sanitize_lan_advertise_bounds_and_validates_candidates() {
+        let mut candidates = vec![
+            "not-a-socket".to_string(),
+            "8.8.8.8:53".to_string(),
+            "192.168.1.1:5000".to_string(),
+            "192.168.1.1:5000".to_string(),
+        ];
+        for host in 2..=40 {
+            candidates.push(format!("192.168.1.{host}:5000"));
+        }
+        let mut candidate_networks: Vec<LanCandidate> =
+            candidates.iter().map(|addr| lc(addr, 24)).collect();
+        candidate_networks.push(lc("192.168.1.2:5000", 40));
+        candidate_networks.push(lc("192.168.1.250:5000", 24));
+        candidate_networks.push(lc("[fd00::1]:5000", 129));
+
+        let (candidates, candidate_networks) =
+            sanitize_lan_advertise(candidates, candidate_networks);
+
+        assert_eq!(candidates.len(), MAX_LAN_CANDIDATES);
+        assert_eq!(candidates[0], "192.168.1.1:5000");
+        assert!(!candidates.contains(&"8.8.8.8:53".to_string()));
+        assert_eq!(
+            candidates
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            candidates.len()
+        );
+        assert!(candidate_networks
+            .iter()
+            .all(|candidate| candidates.contains(&candidate.addr)));
+        assert!(!candidate_networks
+            .iter()
+            .any(|candidate| candidate.addr == "192.168.1.250:5000"));
+        assert!(!candidate_networks
+            .iter()
+            .any(|candidate| candidate.prefix_len > 32 && !candidate.addr.starts_with('[')));
+        assert!(!candidate_networks
+            .iter()
+            .any(|candidate| candidate.prefix_len > 128 && candidate.addr.starts_with('[')));
     }
 }
 

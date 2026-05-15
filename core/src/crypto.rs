@@ -39,7 +39,10 @@ pub enum CryptoError {
     NonceLen(usize),
 }
 
-pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<(Vec<u8>, [u8; NONCE_LEN]), CryptoError> {
+pub fn encrypt(
+    key: &[u8; KEY_LEN],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, [u8; NONCE_LEN]), CryptoError> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);

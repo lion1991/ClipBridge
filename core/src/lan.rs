@@ -29,10 +29,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
 use crate::crypto::{decrypt, encrypt, KEY_LEN, NONCE_LEN};
-use crate::protocol::ClipPayload;
+use crate::protocol::{ClipPayload, LanCandidate};
 
 const SERVICE_TYPE: &str = "_clipbridge._tcp.local.";
 const PROTO_VERSION: u32 = 1;
@@ -53,6 +53,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 /// peers. mDNS only emits `ServiceResolved` once per service unless the
 /// records change, so without this loop a TCP drop never reconnects.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+const DIAL_TIMEOUT: Duration = Duration::from_secs(1);
 /// Raw bytes per `BlobChunk` before base64 + JSON + AEAD framing. 512 KiB
 /// inflates to ~700 KiB base64, comfortably under `FRAME_MAX` once the
 /// envelope is added. Blob bytes ride a *dedicated* short-lived TCP
@@ -198,7 +199,9 @@ impl BlobCache {
         g.order.push_back(sha256_hex.clone());
         g.map.insert(sha256_hex, data);
         while g.bytes > BLOB_CACHE_MAX_BYTES || g.map.len() > BLOB_CACHE_MAX_ENTRIES {
-            let Some(old) = g.order.pop_front() else { break };
+            let Some(old) = g.order.pop_front() else {
+                break;
+            };
             if let Some(v) = g.map.remove(&old) {
                 g.bytes -= v.len();
             }
@@ -261,30 +264,109 @@ fn is_advertisable_private(a: &IpAddr) -> bool {
     }
 }
 
+#[derive(Debug, Clone)]
+struct LocalNetwork {
+    ip: IpAddr,
+    netmask: IpAddr,
+    prefix_len: u8,
+}
+
+fn local_private_networks() -> Vec<LocalNetwork> {
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for iface in ifaces {
+        if iface.is_loopback() {
+            continue;
+        }
+        match iface.addr {
+            if_addrs::IfAddr::V4(v4) => {
+                let ip = IpAddr::V4(v4.ip);
+                if is_advertisable_private(&ip) {
+                    out.push(LocalNetwork {
+                        ip,
+                        netmask: IpAddr::V4(v4.netmask),
+                        prefix_len: v4.prefixlen,
+                    });
+                }
+            }
+            if_addrs::IfAddr::V6(v6) => {
+                let ip = IpAddr::V6(v6.ip);
+                if is_advertisable_private(&ip) {
+                    out.push(LocalNetwork {
+                        ip,
+                        netmask: IpAddr::V6(v6.netmask),
+                        prefix_len: v6.prefixlen,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+fn same_subnet(candidate: &IpAddr, local: &LocalNetwork) -> bool {
+    match (candidate, &local.ip, &local.netmask) {
+        (IpAddr::V4(candidate), IpAddr::V4(local_ip), IpAddr::V4(mask)) => {
+            (u32::from(*candidate) & u32::from(*mask)) == (u32::from(*local_ip) & u32::from(*mask))
+        }
+        (IpAddr::V6(candidate), IpAddr::V6(local_ip), IpAddr::V6(mask)) => {
+            (u128::from(*candidate) & u128::from(*mask))
+                == (u128::from(*local_ip) & u128::from(*mask))
+        }
+        _ => false,
+    }
+}
+
+fn sort_candidates_for_dial(candidates: &mut [SocketAddr], local_networks: &[LocalNetwork]) {
+    candidates.sort_by_key(|sa| {
+        let same_subnet_rank = if local_networks
+            .iter()
+            .any(|local| same_subnet(&sa.ip(), local))
+        {
+            0
+        } else {
+            1
+        };
+        let family_rank = match sa.ip() {
+            IpAddr::V4(_) => 0,
+            IpAddr::V6(_) => 1,
+        };
+        (same_subnet_rank, family_rank)
+    });
+}
+
 /// Enumerate this host's advertisable private interface addresses as
 /// `ip:port` strings for `ClientMessage::LanAdvertise`. Loopback,
 /// public, and link-local-v6 addresses are filtered out. Returns empty
 /// (rather than erroring) if interface enumeration fails — the caller
 /// just skips advertising and relies on mDNS / relay.
 pub fn local_private_candidates(port: u16) -> Vec<String> {
-    let Ok(ifaces) = if_addrs::get_if_addrs() else {
-        return Vec::new();
-    };
+    local_private_candidate_networks(port)
+        .into_iter()
+        .map(|c| c.addr)
+        .collect()
+}
+
+/// Same candidates as `local_private_candidates`, annotated with each
+/// interface prefix so a new relay can drop VPN/virtual candidates that
+/// cannot be on the receiver's subnet. Kept additive on the wire: old
+/// relays ignore this field and still use the string-only `candidates`.
+pub fn local_private_candidate_networks(port: u16) -> Vec<LanCandidate> {
     let mut out: Vec<String> = Vec::new();
-    for iface in ifaces {
-        if iface.is_loopback() {
-            continue;
-        }
-        let ip = iface.ip();
-        if !is_advertisable_private(&ip) {
-            continue;
-        }
-        let s = SocketAddr::new(ip, port).to_string();
+    let mut candidates: Vec<LanCandidate> = Vec::new();
+    for local in local_private_networks() {
+        let s = SocketAddr::new(local.ip, port).to_string();
         if !out.contains(&s) {
-            out.push(s);
+            out.push(s.clone());
+            candidates.push(LanCandidate {
+                addr: s,
+                prefix_len: local.prefix_len,
+            });
         }
     }
-    out
+    candidates
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -379,6 +461,9 @@ pub struct LanNode {
     /// learned entries are added/removed here too so LAN image pull works
     /// for peers found via the relay, not just via mDNS.
     peer_addrs: PeerAddrs,
+    /// Wakes the reconciler immediately when relay/mDNS learns a new peer.
+    /// Without this, startup can sit relay-only until the next 5s tick.
+    reconcile_notify: Arc<Notify>,
 }
 
 impl LanNode {
@@ -422,18 +507,14 @@ impl LanNode {
         // so seeing the same logical device under two instances is fine.
         let mut suffix = [0u8; 4];
         rand::thread_rng().fill_bytes(&mut suffix);
-        let suffix = format!("{:02x}{:02x}{:02x}{:02x}", suffix[0], suffix[1], suffix[2], suffix[3]);
+        let suffix = format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            suffix[0], suffix[1], suffix[2], suffix[3]
+        );
         let instance = format!("{}-{}", short_id(&device_id), suffix);
         let hostname = format!("clipbridge-{}.local.", instance);
-        let service = ServiceInfo::new(
-            SERVICE_TYPE,
-            &instance,
-            &hostname,
-            "",
-            port,
-            Some(props),
-        )?
-        .enable_addr_auto();
+        let service = ServiceInfo::new(SERVICE_TYPE, &instance, &hostname, "", port, Some(props))?
+            .enable_addr_auto();
         daemon.register(service)?;
 
         let browse_rx = daemon.browse(SERVICE_TYPE)?;
@@ -469,6 +550,7 @@ impl LanNode {
         // for an unchanged service.
         let known_peers: Arc<Mutex<HashMap<String, KnownPeer>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let reconcile_notify = Arc::new(Notify::new());
 
         // Accept loop: inbound connections from peers that found us first.
         // Inbound peers don't have a known mDNS fullname (we didn't dial
@@ -535,6 +617,7 @@ impl LanNode {
             let fingerprint = fingerprint.clone();
             let known_peers = known_peers.clone();
             let peer_addrs = peer_addrs.clone();
+            let reconcile_notify = reconcile_notify.clone();
             tokio::spawn(async move {
                 let mut event_rx = event_rx;
                 while let Some(event) = event_rx.recv().await {
@@ -550,6 +633,7 @@ impl LanNode {
                                 continue;
                             }
                             let port = info.get_port();
+                            let local_networks = local_private_networks();
                             // mDNS gives us a HashSet of addresses with
                             // unstable iteration order. iOS in particular
                             // publishes IPv6 link-local on awdl0/utun that
@@ -562,10 +646,7 @@ impl LanNode {
                                 .filter(|a| !is_unroutable(a))
                                 .map(|a| SocketAddr::new(a, port))
                                 .collect();
-                            candidates.sort_by_key(|sa| match sa.ip() {
-                                IpAddr::V4(_) => 0,
-                                IpAddr::V6(_) => 1,
-                            });
+                            sort_candidates_for_dial(&mut candidates, &local_networks);
                             if candidates.is_empty() {
                                 continue;
                             }
@@ -598,6 +679,7 @@ impl LanNode {
                                     candidates,
                                 },
                             );
+                            reconcile_notify.notify_one();
                         }
                         ServiceEvent::ServiceRemoved(_, fullname) => {
                             // mDNS TTL expired with no re-announcement —
@@ -632,12 +714,16 @@ impl LanNode {
             let peers = peers.clone();
             let known_peers = known_peers.clone();
             let blob_cache = blob_cache.clone();
+            let reconcile_notify = reconcile_notify.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(RECONNECT_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 interval.tick().await; // burn the immediate first tick
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = reconcile_notify.notified() => {}
+                    }
                     let snapshot: Vec<(String, KnownPeer)> = {
                         let g = known_peers.lock().await;
                         g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
@@ -700,6 +786,7 @@ impl LanNode {
             self_device_id: device_id,
             known_peers,
             peer_addrs,
+            reconcile_notify,
         })
     }
 
@@ -711,6 +798,12 @@ impl LanNode {
     /// This host's advertisable private candidates for `LanAdvertise`.
     pub fn advertise_candidates(&self) -> Vec<String> {
         local_private_candidates(self.port)
+    }
+
+    /// This host's advertisable private candidates with interface prefix
+    /// metadata for relay-side subnet filtering.
+    pub fn advertise_candidate_networks(&self) -> Vec<LanCandidate> {
+        local_private_candidate_networks(self.port)
     }
 
     /// Merge a relay-pushed peer snapshot into the same `known_peers` /
@@ -730,6 +823,7 @@ impl LanNode {
         if let Ok(mut a) = self.peer_addrs.lock() {
             apply_relay_snapshot(&self.self_device_id, peers, &mut a, &mut known);
         }
+        self.reconcile_notify.notify_one();
     }
 
     /// Push a clip to every currently-connected peer. Lossy by design: if
@@ -763,7 +857,11 @@ impl LanNode {
 /// an mDNS instance label / hostname, and short enough to keep DNS happy
 /// (instance names cap at 63 bytes per RFC 6763).
 fn short_id(device_id: &str) -> String {
-    let s: String = device_id.chars().filter(|c| c.is_ascii_alphanumeric()).take(12).collect();
+    let s: String = device_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(12)
+        .collect();
     s.to_lowercase()
 }
 
@@ -817,6 +915,7 @@ fn apply_relay_snapshot(
 ) {
     // device_id -> dialable candidates, parsed & filtered.
     let mut desired: Vec<(String, Vec<SocketAddr>)> = Vec::new();
+    let local_networks = local_private_networks();
     for p in peers {
         if p.device_id == self_device_id {
             continue; // never rendezvous with ourselves
@@ -829,10 +928,7 @@ fn apply_relay_snapshot(
                 }
             }
         }
-        cands.sort_by_key(|sa| match sa.ip() {
-            IpAddr::V4(_) => 0,
-            IpAddr::V6(_) => 1,
-        });
+        sort_candidates_for_dial(&mut cands, &local_networks);
         if !cands.is_empty() {
             desired.push((p.device_id, cands));
         }
@@ -883,7 +979,7 @@ async fn dial_and_run(
 ) -> Result<(), LanError> {
     let mut connected: Option<(TcpStream, SocketAddr)> = None;
     for cand in &candidates {
-        match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(cand)).await {
+        match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(cand)).await {
             Ok(Ok(s)) => {
                 connected = Some((s, *cand));
                 break;
@@ -943,21 +1039,26 @@ async fn run_peer(
     write_frame(&mut writer, &key, &hello).await?;
 
     // Read the peer's Hello to learn its device_id and friendly name.
-    let (peer_did, peer_name) = match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader, &key)).await {
-        Ok(Ok(Some(LanMessage::Hello { device_id, device_name, .. }))) => (device_id, device_name),
-        Ok(Ok(Some(_))) => {
-            return Err(LanError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "first frame was not Hello",
-            )));
-        }
-        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
-            return Err(LanError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "hello handshake failed",
-            )));
-        }
-    };
+    let (peer_did, peer_name) =
+        match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader, &key)).await {
+            Ok(Ok(Some(LanMessage::Hello {
+                device_id,
+                device_name,
+                ..
+            }))) => (device_id, device_name),
+            Ok(Ok(Some(_))) => {
+                return Err(LanError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "first frame was not Hello",
+                )));
+            }
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                return Err(LanError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "hello handshake failed",
+                )));
+            }
+        };
     if let Some(expected) = expected_peer {
         // We initiated this connection because mDNS told us peer_did was
         // at this address. If the actual handshake says otherwise, bail —
@@ -1183,9 +1284,7 @@ async fn fetch_blob(
 ) -> Option<Vec<u8>> {
     let mut stream = None;
     for cand in candidates {
-        if let Ok(Ok(s)) =
-            tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(cand)).await
-        {
+        if let Ok(Ok(s)) = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(cand)).await {
             stream = Some(s);
             break;
         }
@@ -1280,11 +1379,13 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(
     key: &[u8; KEY_LEN],
     msg: &LanMessage,
 ) -> Result<(), LanError> {
-    let plain = serde_json::to_vec(msg).map_err(|e| {
-        LanError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-    })?;
+    let plain = serde_json::to_vec(msg)
+        .map_err(|e| LanError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
     let (cipher, nonce) = encrypt(key, &plain).map_err(|e| {
-        LanError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        LanError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
     })?;
     let total = NONCE_LEN + cipher.len();
     if total > FRAME_MAX {
@@ -1324,9 +1425,8 @@ async fn read_frame<R: AsyncReadExt + Unpin>(
             "AEAD decrypt failed (wrong group key?)",
         ))
     })?;
-    let msg: LanMessage = serde_json::from_slice(&plain).map_err(|e| {
-        LanError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-    })?;
+    let msg: LanMessage = serde_json::from_slice(&plain)
+        .map_err(|e| LanError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
     Ok(Some(msg))
 }
 
@@ -1394,9 +1494,7 @@ mod tests {
         }
         // Oldest keys evicted, newest retained.
         assert!(c.get("k0").is_none());
-        assert!(c
-            .get(&format!("k{}", BLOB_CACHE_MAX_ENTRIES + 2))
-            .is_some());
+        assert!(c.get(&format!("k{}", BLOB_CACHE_MAX_ENTRIES + 2)).is_some());
     }
 
     #[test]
@@ -1489,7 +1587,12 @@ mod tests {
             vec!["192.168.1.50:7000".parse().unwrap()],
         );
 
-        apply_relay_snapshot("dev-m", vec![lp("dev-a", &["192.168.1.2:5000"])], &mut pa, &mut kp);
+        apply_relay_snapshot(
+            "dev-m",
+            vec![lp("dev-a", &["192.168.1.2:5000"])],
+            &mut pa,
+            &mut kp,
+        );
         assert!(kp.contains_key("relay:dev-a"));
         assert!(kp.contains_key("Mac._clipbridge._tcp.local."));
 
@@ -1498,7 +1601,10 @@ mod tests {
         apply_relay_snapshot("dev-m", vec![], &mut pa, &mut kp);
         assert!(!kp.contains_key("relay:dev-a"), "departed peer purged");
         assert!(!pa.contains_key("relay:dev-a"));
-        assert!(kp.contains_key("Mac._clipbridge._tcp.local."), "mDNS survives");
+        assert!(
+            kp.contains_key("Mac._clipbridge._tcp.local."),
+            "mDNS survives"
+        );
         assert!(pa.contains_key("Mac._clipbridge._tcp.local."));
     }
 
@@ -1515,7 +1621,12 @@ mod tests {
         );
         // dev-a < self so normally we'd add it, but mDNS already covers
         // its control link -> no duplicate relay: entry in known_peers.
-        apply_relay_snapshot("dev-m", vec![lp("dev-a", &["192.168.1.2:9999"])], &mut pa, &mut kp);
+        apply_relay_snapshot(
+            "dev-m",
+            vec![lp("dev-a", &["192.168.1.2:9999"])],
+            &mut pa,
+            &mut kp,
+        );
         assert!(!kp.contains_key("relay:dev-a"), "mDNS-covered peer skipped");
         // peer_addrs still gets it (blob fetch is tiebreak-independent).
         assert!(pa.contains_key("relay:dev-a"));
@@ -1536,6 +1647,33 @@ mod tests {
         );
         assert!(pa.is_empty(), "no usable candidates -> nothing added");
         assert!(kp.is_empty());
+    }
+
+    #[test]
+    fn dial_candidates_prefer_same_subnet_addresses() {
+        let local = vec![
+            LocalNetwork {
+                ip: "192.168.248.22".parse().unwrap(),
+                netmask: "255.255.255.0".parse().unwrap(),
+                prefix_len: 24,
+            },
+            LocalNetwork {
+                ip: "10.37.129.2".parse().unwrap(),
+                netmask: "255.255.255.0".parse().unwrap(),
+                prefix_len: 24,
+            },
+        ];
+        let mut candidates: Vec<SocketAddr> = vec![
+            "10.211.55.2:49901".parse().unwrap(),
+            "[fd7a:115c:a1e0::2f34:f655]:49901".parse().unwrap(),
+            "192.168.248.40:49901".parse().unwrap(),
+            "10.37.129.44:49901".parse().unwrap(),
+        ];
+
+        sort_candidates_for_dial(&mut candidates, &local);
+
+        assert_eq!(candidates[0], "192.168.248.40:49901".parse().unwrap());
+        assert_eq!(candidates[1], "10.37.129.44:49901".parse().unwrap());
     }
 
     /// `fetch_blob` over a real localhost socket against a hand-rolled

@@ -71,4 +71,6 @@ dependencies {
     implementation("dev.rikka.shizuku:provider:13.1.5")
     // Lifts the SDK 28+ hidden-API blacklist so we can reflect into IClipboard.
     implementation("org.lsposed.hiddenapibypass:hiddenapibypass:4.3")
+
+    testImplementation("junit:junit:4.13.2")
 }

@@ -45,11 +45,9 @@ pub async fn get_blob(
         group_id,
         sha256_hex,
     }) {
-        Some(bytes) => (
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            bytes,
-        )
-            .into_response(),
+        Some(bytes) => {
+            ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }

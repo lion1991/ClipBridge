@@ -8,7 +8,10 @@ use crate::group::GroupId;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     /// Subscribe to a group's broadcast channel.
-    Join { group_id: GroupId, device_id: String },
+    Join {
+        group_id: GroupId,
+        device_id: String,
+    },
     /// Broadcast an encrypted clip to all other group members.
     Publish {
         group_id: GroupId,
@@ -32,6 +35,8 @@ pub enum ClientMessage {
         group_id: GroupId,
         device_id: String,
         candidates: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        candidate_networks: Vec<LanCandidate>,
     },
 }
 
@@ -39,7 +44,9 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    Joined { group_id: GroupId },
+    Joined {
+        group_id: GroupId,
+    },
     Clip {
         #[serde(with = "b64")]
         ciphertext: Vec<u8>,
@@ -48,8 +55,12 @@ pub enum ServerMessage {
         ts: u64,
         sender_device_id: String,
     },
-    Recent { clips: Vec<RecentClip> },
-    Error { reason: String },
+    Recent {
+        clips: Vec<RecentClip>,
+    },
+    Error {
+        reason: String,
+    },
     /// Current set of *other* rendezvous-capable peers in this group that
     /// share our egress IP (i.e. very likely on the same LAN). Pushed only
     /// to connections that sent `ClientMessage::LanAdvertise`, on join and
@@ -57,7 +68,9 @@ pub enum ServerMessage {
     /// the receiver replaces its relay-learned candidate set wholesale, so
     /// a departed peer simply stops appearing. An empty list means "no LAN
     /// peers right now" and should purge any relay-learned candidates.
-    LanPeers { peers: Vec<LanPeer> },
+    LanPeers {
+        peers: Vec<LanPeer>,
+    },
 }
 
 /// One rendezvous peer entry inside `ServerMessage::LanPeers`.
@@ -66,6 +79,15 @@ pub struct LanPeer {
     pub device_id: String,
     /// Dialable `ip:port` candidates the peer advertised.
     pub candidates: Vec<String>,
+}
+
+/// One advertised LAN candidate plus the local interface prefix it came
+/// from. Additive metadata for new relays; old relays ignore the field and
+/// keep using `candidates`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanCandidate {
+    pub addr: String,
+    pub prefix_len: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,12 +221,41 @@ mod tests {
             group_id: "g1".into(),
             device_id: "dev-a".into(),
             candidates: vec!["192.168.1.5:54321".into(), "10.0.0.2:54321".into()],
+            candidate_networks: vec![LanCandidate {
+                addr: "192.168.1.5:54321".into(),
+                prefix_len: 24,
+            }],
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"type\":\"lan_advertise\""));
+        assert!(s.contains("\"candidate_networks\""));
         let back: ClientMessage = serde_json::from_str(&s).unwrap();
         match back {
-            ClientMessage::LanAdvertise { candidates, .. } => assert_eq!(candidates.len(), 2),
+            ClientMessage::LanAdvertise {
+                candidates,
+                candidate_networks,
+                ..
+            } => {
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidate_networks[0].prefix_len, 24);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn legacy_lan_advertise_without_candidate_networks_deserializes() {
+        let json = r#"{"type":"lan_advertise","group_id":"g1","device_id":"dev-a","candidates":["192.168.1.5:54321"]}"#;
+        let back: ClientMessage = serde_json::from_str(json).unwrap();
+        match back {
+            ClientMessage::LanAdvertise {
+                candidates,
+                candidate_networks,
+                ..
+            } => {
+                assert_eq!(candidates, vec!["192.168.1.5:54321".to_string()]);
+                assert!(candidate_networks.is_empty());
+            }
             _ => panic!("wrong variant"),
         }
     }

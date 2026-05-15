@@ -216,7 +216,10 @@ async fn fetch_recent_returns_cached_clips() {
 
 /// Wait for the next `LanPeers` push, skipping any other server messages
 /// (e.g. the `Joined` ack). Returns `None` on timeout.
-async fn next_lan_peers<S>(ws: &mut S, within: Duration) -> Option<Vec<clipbridge_core::protocol::LanPeer>>
+async fn next_lan_peers<S>(
+    ws: &mut S,
+    within: Duration,
+) -> Option<Vec<clipbridge_core::protocol::LanPeer>>
 where
     S: futures_util::StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
@@ -258,6 +261,7 @@ async fn lan_advertise_requires_joined_group_and_device() {
             group_id: group_id.clone(),
             device_id: "intruder".into(),
             candidates: vec!["192.168.1.200:5000".into()],
+            candidate_networks: vec![],
         },
     )
     .await;
@@ -279,6 +283,7 @@ async fn lan_advertise_requires_joined_group_and_device() {
             group_id: "other-group".into(),
             device_id: "joined-device".into(),
             candidates: vec!["192.168.1.201:5000".into()],
+            candidate_networks: vec![],
         },
     )
     .await;
@@ -290,6 +295,7 @@ async fn lan_advertise_requires_joined_group_and_device() {
             group_id,
             device_id: "different-device".into(),
             candidates: vec!["192.168.1.202:5000".into()],
+            candidate_networks: vec![],
         },
     )
     .await;
@@ -323,11 +329,14 @@ async fn rendezvous_introduces_same_egress_peers() {
             group_id: group_id.clone(),
             device_id: "A".into(),
             candidates: vec!["192.168.1.10:5000".into()],
+            candidate_networks: vec![],
         },
     )
     .await;
     assert_eq!(
-        next_lan_peers(&mut a, Duration::from_secs(2)).await.unwrap(),
+        next_lan_peers(&mut a, Duration::from_secs(2))
+            .await
+            .unwrap(),
         vec![]
     );
 
@@ -339,16 +348,21 @@ async fn rendezvous_introduces_same_egress_peers() {
             group_id: group_id.clone(),
             device_id: "B".into(),
             candidates: vec!["192.168.1.11:6000".into()],
+            candidate_networks: vec![],
         },
     )
     .await;
 
-    let b_sees = next_lan_peers(&mut b, Duration::from_secs(2)).await.unwrap();
+    let b_sees = next_lan_peers(&mut b, Duration::from_secs(2))
+        .await
+        .unwrap();
     assert_eq!(b_sees.len(), 1);
     assert_eq!(b_sees[0].device_id, "A");
     assert_eq!(b_sees[0].candidates, vec!["192.168.1.10:5000".to_string()]);
 
-    let a_sees = next_lan_peers(&mut a, Duration::from_secs(2)).await.unwrap();
+    let a_sees = next_lan_peers(&mut a, Duration::from_secs(2))
+        .await
+        .unwrap();
     assert_eq!(a_sees.len(), 1);
     assert_eq!(a_sees[0].device_id, "B");
 }
@@ -373,8 +387,14 @@ async fn old_client_never_receives_lan_peers() {
         )
         .await;
     }
-    matches!(next_server_msg(&mut old).await, ServerMessage::Joined { .. });
-    matches!(next_server_msg(&mut newc).await, ServerMessage::Joined { .. });
+    matches!(
+        next_server_msg(&mut old).await,
+        ServerMessage::Joined { .. }
+    );
+    matches!(
+        next_server_msg(&mut newc).await,
+        ServerMessage::Joined { .. }
+    );
 
     // The new client opts in; the old one stays silent (as an old build
     // would — it doesn't know the message exists).
@@ -384,13 +404,16 @@ async fn old_client_never_receives_lan_peers() {
             group_id: group_id.clone(),
             device_id: "new".into(),
             candidates: vec!["192.168.1.20:7000".into()],
+            candidate_networks: vec![],
         },
     )
     .await;
     // The new client itself gets a (self-only, empty) snapshot — proving
     // the relay is alive and processed the advertise.
     assert_eq!(
-        next_lan_peers(&mut newc, Duration::from_secs(2)).await.unwrap(),
+        next_lan_peers(&mut newc, Duration::from_secs(2))
+            .await
+            .unwrap(),
         vec![]
     );
 

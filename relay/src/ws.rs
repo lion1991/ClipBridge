@@ -11,7 +11,7 @@ use axum::{
 use clipbridge_core::protocol::{ClientMessage, LanPeer, RecentClip, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
 
-use crate::hub::Hub;
+use crate::hub::{sanitize_lan_advertise, Hub};
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -98,7 +98,7 @@ async fn handle_socket(socket: WebSocket, hub: Hub, egress: std::net::IpAddr) {
                         let reply = ServerMessage::Recent { clips };
                         let _ = ws_tx.send(Message::Text(serde_json::to_string(&reply).unwrap())).await;
                     }
-                    Ok(ClientMessage::LanAdvertise { group_id, device_id: did, candidates }) => {
+                    Ok(ClientMessage::LanAdvertise { group_id, device_id: did, candidates, candidate_networks }) => {
                         let Some(joined_device_id) = device_id.clone() else {
                             let _ = ws_tx.send(Message::Text(serde_json::to_string(&ServerMessage::Error { reason: "join first".into() }).unwrap())).await;
                             continue;
@@ -111,6 +111,8 @@ async fn handle_socket(socket: WebSocket, hub: Hub, egress: std::net::IpAddr) {
                             let _ = ws_tx.send(Message::Text(serde_json::to_string(&ServerMessage::Error { reason: "device mismatch".into() }).unwrap())).await;
                             continue;
                         }
+                        let (candidates, candidate_networks) =
+                            sanitize_lan_advertise(candidates, candidate_networks);
                         // Opt in to relay-assisted rendezvous. Register (or
                         // refresh, if re-sent after a network change) under
                         // this connection's egress IP; the hub immediately
@@ -123,6 +125,7 @@ async fn handle_socket(socket: WebSocket, hub: Hub, egress: std::net::IpAddr) {
                             %egress,
                             candidate_count = candidates.len(),
                             candidates = ?candidates,
+                            candidate_networks = ?candidate_networks,
                             "lan advertise received"
                         );
                         rv_group = Some(group_id.clone());
@@ -132,6 +135,7 @@ async fn handle_socket(socket: WebSocket, hub: Hub, egress: std::net::IpAddr) {
                             conn_id,
                             joined_device_id,
                             candidates,
+                            candidate_networks,
                             rv_tx.clone(),
                         );
                     }
@@ -163,6 +167,12 @@ async fn handle_socket(socket: WebSocket, hub: Hub, egress: std::net::IpAddr) {
             // Rendezvous snapshot pushed by the hub (membership changed).
             rv = rv_rx.recv() => {
                 let Some(peers) = rv else { continue };
+                tracing::info!(
+                    ?device_id,
+                    peer_count = peers.len(),
+                    peers = ?peers,
+                    "lan peers snapshot sent"
+                );
                 let msg = ServerMessage::LanPeers { peers };
                 let _ = ws_tx.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
             }
