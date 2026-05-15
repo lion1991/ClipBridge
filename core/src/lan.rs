@@ -466,6 +466,18 @@ pub struct LanNode {
     reconcile_notify: Arc<Notify>,
 }
 
+pub(crate) struct LanNodeConfig {
+    pub group_id: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub key: [u8; KEY_LEN],
+    pub inbound: mpsc::UnboundedSender<IncomingLanClip>,
+    pub peer_count: Arc<AtomicUsize>,
+    pub peers: PeerRegistry,
+    pub blob_cache: SharedBlobCache,
+    pub peer_addrs: PeerAddrs,
+}
+
 impl LanNode {
     /// Bind a TCP listener on a random port, register an mDNS service for
     /// it, browse for other peers, and start forwarding clips.
@@ -475,17 +487,19 @@ impl LanNode {
     /// shared with the owner so they can be polled from outside the
     /// runtime (FFI getters). `device_name` is sent to peers in our
     /// Hello so they can render us in their UI peer list.
-    pub async fn spawn(
-        group_id: String,
-        device_id: String,
-        device_name: String,
-        key: [u8; KEY_LEN],
-        inbound: mpsc::UnboundedSender<IncomingLanClip>,
-        peer_count: Arc<AtomicUsize>,
-        peers: PeerRegistry,
-        blob_cache: SharedBlobCache,
-        peer_addrs: PeerAddrs,
-    ) -> Result<Self, LanError> {
+    pub(crate) async fn spawn(config: LanNodeConfig) -> Result<Self, LanError> {
+        let LanNodeConfig {
+            group_id,
+            device_id,
+            device_name,
+            key,
+            inbound,
+            peer_count,
+            peers,
+            blob_cache,
+            peer_addrs,
+        } = config;
+
         let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
         let port = listener.local_addr()?.port();
 
@@ -557,7 +571,7 @@ impl LanNode {
         // them), so we synthesize one from the connection's remote addr
         // for the purpose of the peer registry. It's just a unique key.
         {
-            let key = key;
+            let accept_key = key;
             let device_id = device_id.clone();
             let device_name = device_name.clone();
             let inbound = inbound.clone();
@@ -575,7 +589,6 @@ impl LanNode {
                             continue;
                         }
                     };
-                    let key = key;
                     let device_id = device_id.clone();
                     let device_name = device_name.clone();
                     let inbound = inbound.clone();
@@ -585,22 +598,19 @@ impl LanNode {
                     let blob_cache = blob_cache.clone();
                     let registry_key = format!("inbound:{addr}");
                     tokio::spawn(async move {
-                        if let Err(e) = run_peer(
-                            stream,
-                            addr,
-                            key,
-                            device_id,
-                            device_name,
+                        let peer = PeerRunContext {
+                            key: accept_key,
+                            self_device_id: device_id,
+                            self_device_name: device_name,
                             inbound,
                             out_rx,
-                            None,
+                            expected_peer: None,
                             peer_count,
                             peers,
                             blob_cache,
                             registry_key,
-                        )
-                        .await
-                        {
+                        };
+                        if let Err(e) = run_peer(stream, addr, peer).await {
                             tracing::debug!(?e, %addr, "lan peer (inbound) ended");
                         }
                     });
@@ -704,7 +714,7 @@ impl LanNode {
         // automatically — the peer task's disconnect cleanup removes the
         // outbound_peers entry, and the next reconciler tick re-dials.
         {
-            let key = key;
+            let reconnect_key = key;
             let device_id_for_recon = device_id.clone();
             let device_name_for_recon = device_name.clone();
             let inbound = inbound.clone();
@@ -739,7 +749,6 @@ impl LanNode {
                             }
                             p.insert(fullname.clone(), ());
                         }
-                        let key = key;
                         let device_id = device_id_for_recon.clone();
                         let device_name = device_name_for_recon.clone();
                         let inbound = inbound.clone();
@@ -752,20 +761,19 @@ impl LanNode {
                         let peer_did_owned = kp.peer_did.clone();
                         let candidates = kp.candidates.clone();
                         tokio::spawn(async move {
-                            let res = dial_and_run(
-                                candidates,
-                                key,
-                                device_id,
-                                device_name,
+                            let peer = PeerRunContext {
+                                key: reconnect_key,
+                                self_device_id: device_id,
+                                self_device_name: device_name,
                                 inbound,
                                 out_rx,
-                                peer_did_owned,
+                                expected_peer: Some(peer_did_owned),
                                 peer_count,
-                                peers_for_run,
+                                peers: peers_for_run,
                                 blob_cache,
                                 registry_key,
-                            )
-                            .await;
+                            };
+                            let res = dial_and_run(candidates, peer).await;
                             if let Err(e) = res {
                                 tracing::debug!(?e, %fullname, "lan peer (outbound) ended");
                             }
@@ -959,24 +967,24 @@ fn apply_relay_snapshot(
     }
 }
 
-/// Try each candidate address in order with a short per-attempt timeout,
-/// then hand the first connected stream to `run_peer`. Used by both the
-/// initial-discovery and reconciler paths so dial logic stays in one
-/// place.
-#[allow(clippy::too_many_arguments)]
-async fn dial_and_run(
-    candidates: Vec<SocketAddr>,
+struct PeerRunContext {
     key: [u8; KEY_LEN],
     self_device_id: String,
     self_device_name: String,
     inbound: mpsc::UnboundedSender<IncomingLanClip>,
     out_rx: broadcast::Receiver<OutgoingLan>,
-    expected_peer: String,
+    expected_peer: Option<String>,
     peer_count: Arc<AtomicUsize>,
     peers: PeerRegistry,
     blob_cache: SharedBlobCache,
     registry_key: String,
-) -> Result<(), LanError> {
+}
+
+/// Try each candidate address in order with a short per-attempt timeout,
+/// then hand the first connected stream to `run_peer`. Used by both the
+/// initial-discovery and reconciler paths so dial logic stays in one
+/// place.
+async fn dial_and_run(candidates: Vec<SocketAddr>, peer: PeerRunContext) -> Result<(), LanError> {
     let mut connected: Option<(TcpStream, SocketAddr)> = None;
     for cand in &candidates {
         match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(cand)).await {
@@ -994,21 +1002,7 @@ async fn dial_and_run(
             "no advertised address was reachable",
         ))
     })?;
-    run_peer(
-        stream,
-        sock,
-        key,
-        self_device_id,
-        self_device_name,
-        inbound,
-        out_rx,
-        Some(expected_peer),
-        peer_count,
-        peers,
-        blob_cache,
-        registry_key,
-    )
-    .await
+    run_peer(stream, sock, peer).await
 }
 
 /// Drive one TCP session: send Hello, then concurrently push outbound
@@ -1016,17 +1010,21 @@ async fn dial_and_run(
 async fn run_peer(
     stream: TcpStream,
     addr: SocketAddr,
-    key: [u8; KEY_LEN],
-    self_device_id: String,
-    self_device_name: String,
-    inbound: mpsc::UnboundedSender<IncomingLanClip>,
-    mut out_rx: broadcast::Receiver<OutgoingLan>,
-    expected_peer: Option<String>,
-    peer_count: Arc<AtomicUsize>,
-    peers: PeerRegistry,
-    blob_cache: SharedBlobCache,
-    registry_key: String,
+    peer: PeerRunContext,
 ) -> Result<(), LanError> {
+    let PeerRunContext {
+        key,
+        self_device_id,
+        self_device_name,
+        inbound,
+        mut out_rx,
+        expected_peer,
+        peer_count,
+        peers,
+        blob_cache,
+        registry_key,
+    } = peer;
+
     let _ = stream.set_nodelay(true);
     let (mut reader, mut writer) = stream.into_split();
 
@@ -1126,23 +1124,17 @@ async fn run_peer(
     // The classify read above may have already consumed the peer's first
     // real frame (typically its immediate Ping, or a clip that beat it).
     // Process it before the select loop so it isn't dropped.
-    if let Some(first) = pending {
-        match first {
-            LanMessage::Clip {
-                sender_device_id,
-                ts,
-                payload,
-            } => {
-                let _ = inbound.send(IncomingLanClip {
-                    sender_device_id,
-                    ts,
-                    payload,
-                });
-            }
-            // Blob frames only ever belong on a dedicated connection; a
-            // control peer emitting them is buggy/hostile — ignore.
-            _ => {}
-        }
+    if let Some(LanMessage::Clip {
+        sender_device_id,
+        ts,
+        payload,
+    }) = pending
+    {
+        let _ = inbound.send(IncomingLanClip {
+            sender_device_id,
+            ts,
+            payload,
+        });
     }
 
     loop {
@@ -1159,9 +1151,7 @@ async fn run_peer(
                 )));
             }
             _ = ping_interval.tick() => {
-                if let Err(e) = write_frame(&mut writer, &key, &LanMessage::Ping).await {
-                    return Err(e);
-                }
+                write_frame(&mut writer, &key, &LanMessage::Ping).await?;
             }
             out = out_rx.recv() => {
                 match out {
@@ -1176,9 +1166,7 @@ async fn run_peer(
                             ts: out.ts,
                             payload: out.payload,
                         };
-                        if let Err(e) = write_frame(&mut writer, &key, &msg).await {
-                            return Err(e);
-                        }
+                        write_frame(&mut writer, &key, &msg).await?;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(skipped = n, "lan broadcast lagged");
@@ -1381,12 +1369,8 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(
 ) -> Result<(), LanError> {
     let plain = serde_json::to_vec(msg)
         .map_err(|e| LanError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-    let (cipher, nonce) = encrypt(key, &plain).map_err(|e| {
-        LanError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
+    let (cipher, nonce) =
+        encrypt(key, &plain).map_err(|e| LanError::Io(std::io::Error::other(e.to_string())))?;
     let total = NONCE_LEN + cipher.len();
     if total > FRAME_MAX {
         return Err(LanError::Io(std::io::Error::new(
@@ -1788,30 +1772,30 @@ mod tests {
         let count_b = Arc::new(AtomicUsize::new(0));
         let peers_a: PeerRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let peers_b: PeerRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let node_a = LanNode::spawn(
-            group.clone(),
-            did_a.clone(),
-            "node-A".into(),
+        let node_a = LanNode::spawn(LanNodeConfig {
+            group_id: group.clone(),
+            device_id: did_a.clone(),
+            device_name: "node-A".into(),
             key,
-            a_tx,
-            count_a,
-            peers_a,
-            BlobCache::new(),
-            Arc::new(std::sync::Mutex::new(HashMap::new())),
-        )
+            inbound: a_tx,
+            peer_count: count_a,
+            peers: peers_a,
+            blob_cache: BlobCache::new(),
+            peer_addrs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        })
         .await
         .expect("spawn A");
-        let node_b = LanNode::spawn(
-            group.clone(),
-            did_b.clone(),
-            "node-B".into(),
+        let node_b = LanNode::spawn(LanNodeConfig {
+            group_id: group.clone(),
+            device_id: did_b.clone(),
+            device_name: "node-B".into(),
             key,
-            b_tx,
-            count_b,
-            peers_b,
-            BlobCache::new(),
-            Arc::new(std::sync::Mutex::new(HashMap::new())),
-        )
+            inbound: b_tx,
+            peer_count: count_b,
+            peers: peers_b,
+            blob_cache: BlobCache::new(),
+            peer_addrs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        })
         .await
         .expect("spawn B");
 

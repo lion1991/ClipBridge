@@ -12,8 +12,8 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::blob::{BlobClient, BlobError};
 use crate::crypto::{decrypt, encrypt, sha256_hex, KEY_LEN, NONCE_LEN};
 use crate::lan::{
-    lan_fetch_blob, unique_peer_names, BlobCache, IncomingLanClip, LanNode, PeerAddrs,
-    PeerRegistry, SharedBlobCache,
+    lan_fetch_blob, unique_peer_names, BlobCache, IncomingLanClip, LanNode, LanNodeConfig,
+    PeerAddrs, PeerRegistry, SharedBlobCache,
 };
 use crate::protocol::{
     ClientMessage, ClipKind, ClipPayload, ImageMeta, LanCandidate, ServerMessage,
@@ -195,10 +195,10 @@ impl Client {
                     .enable_all()
                     .build()
                     .expect("build runtime");
-                rt.block_on(run(
-                    worker_relay,
-                    worker_group,
-                    key_arr,
+                rt.block_on(run(ClientRun {
+                    relay_url: worker_relay,
+                    group_id: worker_group,
+                    key: key_arr,
                     device_id,
                     device_name,
                     listener,
@@ -207,7 +207,7 @@ impl Client {
                     lan_peer_names,
                     blob_cache,
                     peer_addrs,
-                ));
+                }));
             })
             .map_err(|e| FfiError::Internal {
                 reason: format!("spawn thread: {e}"),
@@ -384,19 +384,35 @@ impl Drop for Client {
     }
 }
 
-async fn run(
+struct ClientRun {
     relay_url: String,
     group_id: String,
     key: [u8; KEY_LEN],
     device_id: String,
     device_name: String,
     listener: Arc<dyn ClipListener>,
-    mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
+    cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     lan_peers: Arc<AtomicUsize>,
     lan_peer_names: PeerRegistry,
     blob_cache: SharedBlobCache,
     peer_addrs: PeerAddrs,
-) {
+}
+
+async fn run(config: ClientRun) {
+    let ClientRun {
+        relay_url,
+        group_id,
+        key,
+        device_id,
+        device_name,
+        listener,
+        mut cmd_rx,
+        lan_peers,
+        lan_peer_names,
+        blob_cache,
+        peer_addrs,
+    } = config;
+
     // Receive-side dedup. The same (sender_device_id, ts) pair may arrive
     // both from the relay WS and from a LAN peer; whichever lands first
     // wins, the other is silently dropped. Shared via Arc<Mutex<>> because
@@ -407,17 +423,17 @@ async fn run(
     // refused, port bind failed in a sandboxed test env) is non-fatal:
     // we just degrade to relay-only and log it.
     let (lan_in_tx, lan_in_rx) = mpsc::unbounded_channel::<IncomingLanClip>();
-    let lan = match LanNode::spawn(
-        group_id.clone(),
-        device_id.clone(),
-        device_name.clone(),
+    let lan = match LanNode::spawn(LanNodeConfig {
+        group_id: group_id.clone(),
+        device_id: device_id.clone(),
+        device_name: device_name.clone(),
         key,
-        lan_in_tx,
-        lan_peers,
-        lan_peer_names,
+        inbound: lan_in_tx,
+        peer_count: lan_peers,
+        peers: lan_peer_names,
         blob_cache,
         peer_addrs,
-    )
+    })
     .await
     {
         Ok(n) => {
@@ -454,14 +470,16 @@ async fn run(
     loop {
         listener.on_state(ConnectionState::Connecting);
         match session(
-            &relay_url,
-            &group_id,
-            &key,
-            &device_id,
-            &listener,
+            SessionCtx {
+                relay_url: &relay_url,
+                group_id: &group_id,
+                key: &key,
+                device_id: &device_id,
+                listener: &listener,
+                lan: lan.as_deref(),
+                dedup: &dedup,
+            },
             &mut cmd_rx,
-            lan.as_deref(),
-            &dedup,
         )
         .await
         {
@@ -505,16 +523,30 @@ fn lan_advertise_refresh_needed(last: Option<&[LanCandidate]>, current: &[LanCan
     }
 }
 
+struct SessionCtx<'a> {
+    relay_url: &'a str,
+    group_id: &'a str,
+    key: &'a [u8; KEY_LEN],
+    device_id: &'a str,
+    listener: &'a Arc<dyn ClipListener>,
+    lan: Option<&'a LanNode>,
+    dedup: &'a Arc<Mutex<DedupCache>>,
+}
+
 async fn session(
-    relay_url: &str,
-    group_id: &str,
-    key: &[u8; KEY_LEN],
-    device_id: &str,
-    listener: &Arc<dyn ClipListener>,
+    ctx: SessionCtx<'_>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
-    lan: Option<&LanNode>,
-    dedup: &Arc<Mutex<DedupCache>>,
 ) -> Result<SessionExit, Box<dyn std::error::Error + Send + Sync>> {
+    let SessionCtx {
+        relay_url,
+        group_id,
+        key,
+        device_id,
+        listener,
+        lan,
+        dedup,
+    } = ctx;
+
     // Accept any of ws:// wss:// http:// https:// — the user often pastes the
     // browser-style URL of the relay's reverse proxy.
     let normalized = relay_url.trim_end_matches('/');
@@ -534,7 +566,7 @@ async fn session(
         group_id: group_id.to_string(),
         device_id: device_id.to_string(),
     };
-    ws.send(Message::Text(serde_json::to_string(&join)?.into()))
+    ws.send(Message::Text(serde_json::to_string(&join)?))
         .await?;
 
     // Pull whatever is still in the relay's recent-cache so devices that
@@ -543,7 +575,7 @@ async fn session(
     let fetch = ClientMessage::FetchRecent {
         group_id: group_id.to_string(),
     };
-    ws.send(Message::Text(serde_json::to_string(&fetch)?.into()))
+    ws.send(Message::Text(serde_json::to_string(&fetch)?))
         .await?;
 
     // Opt into relay-assisted LAN rendezvous: tell the relay our dialable
@@ -563,8 +595,7 @@ async fn session(
                 candidates,
                 candidate_networks: candidate_networks.clone(),
             };
-            ws.send(Message::Text(serde_json::to_string(&adv)?.into()))
-                .await?;
+            ws.send(Message::Text(serde_json::to_string(&adv)?)).await?;
             lan_advertise_error_pending = true;
             last_lan_advertise = Some(candidate_networks);
         }
@@ -594,7 +625,7 @@ async fn session(
                 return Ok(SessionExit::Reconnect);
             }
             _ = ping_interval.tick() => {
-                ws.send(Message::Ping(Vec::new().into())).await?;
+                ws.send(Message::Ping(Vec::new())).await?;
             }
             _ = lan_advertise_interval.tick(), if lan.is_some() && !lan_advertise_disabled => {
                 if let Some(lan) = lan {
@@ -612,7 +643,7 @@ async fn session(
                             candidates,
                             candidate_networks: candidate_networks.clone(),
                         };
-                        ws.send(Message::Text(serde_json::to_string(&adv)?.into())).await?;
+                        ws.send(Message::Text(serde_json::to_string(&adv)?)).await?;
                         lan_advertise_error_pending = true;
                         last_lan_advertise = Some(candidate_networks);
                     }
@@ -642,13 +673,13 @@ async fn session(
                             nonce: nonce.to_vec(),
                             ts: payload.ts,
                         };
-                        ws.send(Message::Text(serde_json::to_string(&msg)?.into())).await?;
+                        ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
                     }
                     Cmd::FetchRecent => {
                         let msg = ClientMessage::FetchRecent {
                             group_id: group_id.to_string(),
                         };
-                        ws.send(Message::Text(serde_json::to_string(&msg)?.into())).await?;
+                        ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
                     }
                 }
             }

@@ -11,7 +11,7 @@ use axum::{
 use clipbridge_core::protocol::{ClientMessage, LanPeer, RecentClip, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
 
-use crate::hub::{sanitize_lan_advertise, Hub};
+use crate::hub::{sanitize_lan_advertise, Hub, RendezvousUpdate};
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -129,15 +129,15 @@ async fn handle_socket(socket: WebSocket, hub: Hub, egress: std::net::IpAddr) {
                             "lan advertise received"
                         );
                         rv_group = Some(group_id.clone());
-                        hub.rendezvous_upsert(
-                            &group_id,
+                        hub.rendezvous_upsert(RendezvousUpdate {
+                            group_id,
                             egress,
                             conn_id,
-                            joined_device_id,
+                            device_id: joined_device_id,
                             candidates,
                             candidate_networks,
-                            rv_tx.clone(),
-                        );
+                            tx: rv_tx.clone(),
+                        });
                     }
                     Err(e) => {
                         let reply = ServerMessage::Error { reason: format!("bad message: {e}") };

@@ -108,17 +108,17 @@ impl Hub {
     /// Register or refresh a rendezvous connection and push a fresh peer
     /// snapshot to every connection sharing its egress IP (including the
     /// caller, so it learns peers that were already present).
-    pub fn rendezvous_upsert(
-        &self,
-        group_id: &str,
-        egress: IpAddr,
-        conn_id: u64,
-        device_id: String,
-        candidates: Vec<String>,
-        candidate_networks: Vec<LanCandidate>,
-        tx: mpsc::UnboundedSender<Vec<LanPeer>>,
-    ) {
-        let group = self.entry(group_id);
+    pub(crate) fn rendezvous_upsert(&self, update: RendezvousUpdate) {
+        let RendezvousUpdate {
+            group_id,
+            egress,
+            conn_id,
+            device_id,
+            candidates,
+            candidate_networks,
+            tx,
+        } = update;
+        let group = self.entry(&group_id);
         let mut p = group.presence.lock();
         p.entry(egress).or_default().insert(
             conn_id,
@@ -146,6 +146,22 @@ impl Hub {
         }
         push_egress(&p, egress);
     }
+}
+
+impl Default for Hub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub(crate) struct RendezvousUpdate {
+    pub group_id: String,
+    pub egress: IpAddr,
+    pub conn_id: u64,
+    pub device_id: String,
+    pub candidates: Vec<String>,
+    pub candidate_networks: Vec<LanCandidate>,
+    pub tx: mpsc::UnboundedSender<Vec<LanPeer>>,
 }
 
 /// Recompute and deliver each connection's tailored `LanPeers` snapshot
@@ -318,6 +334,37 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
     }
 
+    fn rv(
+        group_id: &str,
+        egress: IpAddr,
+        conn_id: u64,
+        device_id: &str,
+        candidates: Vec<String>,
+        tx: mpsc::UnboundedSender<Vec<LanPeer>>,
+    ) -> RendezvousUpdate {
+        rv_with_networks(group_id, egress, conn_id, device_id, candidates, vec![], tx)
+    }
+
+    fn rv_with_networks(
+        group_id: &str,
+        egress: IpAddr,
+        conn_id: u64,
+        device_id: &str,
+        candidates: Vec<String>,
+        candidate_networks: Vec<LanCandidate>,
+        tx: mpsc::UnboundedSender<Vec<LanPeer>>,
+    ) -> RendezvousUpdate {
+        RendezvousUpdate {
+            group_id: group_id.into(),
+            egress,
+            conn_id,
+            device_id: device_id.into(),
+            candidates,
+            candidate_networks,
+            tx,
+        }
+    }
+
     #[tokio::test]
     async fn upsert_pushes_existing_peers_to_newcomer_and_notifies_rest() {
         let hub = Hub::new();
@@ -325,28 +372,12 @@ mod tests {
 
         // A joins first — no peers yet.
         let (a_tx, mut a_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert(
-            "g",
-            egress,
-            1,
-            "A".into(),
-            vec!["1.1.1.1:10".into()],
-            vec![],
-            a_tx,
-        );
+        hub.rendezvous_upsert(rv("g", egress, 1, "A", vec!["1.1.1.1:10".into()], a_tx));
         assert_eq!(a_rx.recv().await.unwrap().len(), 0);
 
         // B joins same egress — B learns A immediately, A is re-notified.
         let (b_tx, mut b_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert(
-            "g",
-            egress,
-            2,
-            "B".into(),
-            vec!["2.2.2.2:20".into()],
-            vec![],
-            b_tx,
-        );
+        hub.rendezvous_upsert(rv("g", egress, 2, "B", vec!["2.2.2.2:20".into()], b_tx));
 
         let b_sees = b_rx.recv().await.unwrap();
         assert_eq!(b_sees.len(), 1);
@@ -363,11 +394,11 @@ mod tests {
         let hub = Hub::new();
         let (a_tx, mut a_rx) = mpsc::unbounded_channel();
         let (b_tx, mut b_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert("g", ip(1), 1, "A".into(), vec!["a:1".into()], vec![], a_tx);
+        hub.rendezvous_upsert(rv("g", ip(1), 1, "A", vec!["a:1".into()], a_tx));
         let _ = a_rx.recv().await;
         // B is on a different egress IP — must not see A and must not
         // trigger a push to A.
-        hub.rendezvous_upsert("g", ip(2), 2, "B".into(), vec!["b:2".into()], vec![], b_tx);
+        hub.rendezvous_upsert(rv("g", ip(2), 2, "B", vec!["b:2".into()], b_tx));
         assert_eq!(b_rx.recv().await.unwrap().len(), 0);
         assert!(
             a_rx.try_recv().is_err(),
@@ -381,9 +412,9 @@ mod tests {
         let egress = ip(1);
         let (a_tx, mut a_rx) = mpsc::unbounded_channel();
         let (b_tx, mut b_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert("g", egress, 1, "A".into(), vec!["a:1".into()], vec![], a_tx);
+        hub.rendezvous_upsert(rv("g", egress, 1, "A", vec!["a:1".into()], a_tx));
         let _ = a_rx.recv().await;
-        hub.rendezvous_upsert("g", egress, 2, "B".into(), vec!["b:2".into()], vec![], b_tx);
+        hub.rendezvous_upsert(rv("g", egress, 2, "B", vec!["b:2".into()], b_tx));
         let _ = a_rx.recv().await; // A learns B
         let _ = b_rx.recv().await;
 
@@ -397,15 +428,7 @@ mod tests {
         let hub = Hub::new();
         let egress = ip(1);
         let (obs_tx, mut obs_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert(
-            "g",
-            egress,
-            1,
-            "obs".into(),
-            vec!["o:1".into()],
-            vec![],
-            obs_tx,
-        );
+        hub.rendezvous_upsert(rv("g", egress, 1, "obs", vec!["o:1".into()], obs_tx));
         let _ = obs_rx.recv().await;
 
         // Same device_id "D" reconnects on a later conn id; the observer
@@ -413,28 +436,19 @@ mod tests {
         // conn_id's candidates, independent of HashMap iteration order.
         for conn_id in 2..130 {
             let (d_tx, _d_rx) = mpsc::unbounded_channel();
-            hub.rendezvous_upsert(
+            hub.rendezvous_upsert(rv(
                 "g",
                 egress,
                 conn_id,
-                "D".into(),
+                "D",
                 vec![format!("old:{conn_id}")],
-                vec![],
                 d_tx,
-            );
+            ));
             let _ = obs_rx.recv().await;
         }
 
         let (d_tx, _d_rx) = mpsc::unbounded_channel();
-        hub.rendezvous_upsert(
-            "g",
-            egress,
-            130,
-            "D".into(),
-            vec!["new:130".into()],
-            vec![],
-            d_tx,
-        );
+        hub.rendezvous_upsert(rv("g", egress, 130, "D", vec!["new:130".into()], d_tx));
         let snap = obs_rx.recv().await.unwrap();
         let d_entries: Vec<_> = snap.iter().filter(|p| p.device_id == "D").collect();
         assert_eq!(d_entries.len(), 1, "duplicate device_id must collapse");
@@ -455,25 +469,25 @@ mod tests {
         let (a_tx, mut a_rx) = mpsc::unbounded_channel();
         let (b_tx, mut b_rx) = mpsc::unbounded_channel();
 
-        hub.rendezvous_upsert(
+        hub.rendezvous_upsert(rv_with_networks(
             "g",
             egress,
             1,
-            "A".into(),
+            "A",
             vec!["192.168.1.10:5000".into(), "10.211.55.2:5000".into()],
             vec![lc("192.168.1.10:5000", 24), lc("10.211.55.2:5000", 24)],
             a_tx,
-        );
+        ));
         let _ = a_rx.recv().await;
-        hub.rendezvous_upsert(
+        hub.rendezvous_upsert(rv_with_networks(
             "g",
             egress,
             2,
-            "B".into(),
+            "B",
             vec!["192.168.1.11:6000".into(), "10.37.129.2:6000".into()],
             vec![lc("192.168.1.11:6000", 24), lc("10.37.129.2:6000", 24)],
             b_tx,
-        );
+        ));
 
         let b_sees = b_rx.recv().await.unwrap();
         assert_eq!(b_sees[0].candidates, vec!["192.168.1.10:5000".to_string()]);

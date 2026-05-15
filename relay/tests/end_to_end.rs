@@ -41,7 +41,7 @@ where
     S: futures_util::SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     let s = serde_json::to_string(msg).unwrap();
-    ws.send(Message::Text(s.into())).await.unwrap();
+    ws.send(Message::Text(s)).await.unwrap();
 }
 
 async fn next_server_msg<S>(ws: &mut S) -> ServerMessage
