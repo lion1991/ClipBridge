@@ -19,7 +19,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -592,6 +592,8 @@ pub(crate) struct LanNodeConfig {
     pub peer_addrs: PeerAddrs,
     pub file_receive_dir: SharedFileReceiveDir,
     pub file_inbound: mpsc::UnboundedSender<ReceivedFile>,
+    pub lan_active: Arc<AtomicBool>,
+    pub lan_mode_notify: Arc<Notify>,
 }
 
 impl LanNode {
@@ -616,6 +618,8 @@ impl LanNode {
             peer_addrs,
             file_receive_dir,
             file_inbound,
+            lan_active,
+            lan_mode_notify,
         } = config;
 
         let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
@@ -699,6 +703,8 @@ impl LanNode {
             let blob_cache = blob_cache.clone();
             let file_receive_dir = file_receive_dir.clone();
             let file_inbound = file_inbound.clone();
+            let lan_active = lan_active.clone();
+            let lan_mode_notify = lan_mode_notify.clone();
             tokio::spawn(async move {
                 loop {
                     let (stream, addr) = match listener.accept().await {
@@ -718,6 +724,8 @@ impl LanNode {
                     let blob_cache = blob_cache.clone();
                     let file_receive_dir = file_receive_dir.clone();
                     let file_inbound = file_inbound.clone();
+                    let lan_active = lan_active.clone();
+                    let lan_mode_notify = lan_mode_notify.clone();
                     let registry_key = format!("inbound:{addr}");
                     tokio::spawn(async move {
                         let peer = PeerRunContext {
@@ -733,6 +741,8 @@ impl LanNode {
                             registry_key,
                             file_receive_dir,
                             file_inbound,
+                            lan_active,
+                            lan_mode_notify,
                         };
                         if let Err(e) = run_peer(stream, addr, peer).await {
                             tracing::debug!(?e, %addr, "lan peer (inbound) ended");
@@ -857,6 +867,8 @@ impl LanNode {
             let reconcile_notify = reconcile_notify.clone();
             let file_receive_dir = file_receive_dir.clone();
             let file_inbound = file_inbound.clone();
+            let lan_active = lan_active.clone();
+            let lan_mode_notify = lan_mode_notify.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(RECONNECT_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -865,6 +877,10 @@ impl LanNode {
                     tokio::select! {
                         _ = interval.tick() => {}
                         _ = reconcile_notify.notified() => {}
+                        _ = lan_mode_notify.notified() => {}
+                    }
+                    if !lan_active.load(Ordering::Relaxed) {
+                        continue;
                     }
                     let snapshot: Vec<(String, KnownPeer)> = {
                         let g = known_peers.lock().await;
@@ -891,6 +907,8 @@ impl LanNode {
                         let blob_cache = blob_cache.clone();
                         let file_receive_dir = file_receive_dir.clone();
                         let file_inbound = file_inbound.clone();
+                        let lan_active = lan_active.clone();
+                        let lan_mode_notify = lan_mode_notify.clone();
                         let registry_key = fullname.clone();
                         let peer_did_owned = kp.peer_did.clone();
                         let candidates = kp.candidates.clone();
@@ -908,6 +926,8 @@ impl LanNode {
                                 registry_key,
                                 file_receive_dir,
                                 file_inbound,
+                                lan_active,
+                                lan_mode_notify,
                             };
                             let res = dial_and_run(candidates, peer).await;
                             if let Err(e) = res {
@@ -1122,6 +1142,8 @@ struct PeerRunContext {
     registry_key: String,
     file_receive_dir: SharedFileReceiveDir,
     file_inbound: mpsc::UnboundedSender<ReceivedFile>,
+    lan_active: Arc<AtomicBool>,
+    lan_mode_notify: Arc<Notify>,
 }
 
 /// Try each candidate address in order with a short per-attempt timeout,
@@ -1169,6 +1191,8 @@ async fn run_peer(
         registry_key,
         file_receive_dir,
         file_inbound,
+        lan_active,
+        lan_mode_notify,
     } = peer;
 
     let _ = stream.set_nodelay(true);
@@ -1305,13 +1329,16 @@ async fn run_peer(
         sender_device_id,
         ts,
         payload,
-    }) = pending
+    }) = &pending
     {
         let _ = inbound.send(IncomingLanClip {
-            sender_device_id,
-            ts,
-            payload,
+            sender_device_id: sender_device_id.clone(),
+            ts: *ts,
+            payload: payload.clone(),
         });
+    }
+    if matches!(pending, Some(LanMessage::Ping)) && !lan_active.load(Ordering::Relaxed) {
+        write_frame(&mut writer, &key, &LanMessage::Ping).await?;
     }
 
     loop {
@@ -1327,10 +1354,17 @@ async fn run_peer(
                     "no inbound frame within idle window",
                 )));
             }
-            _ = ping_interval.tick() => {
+            _ = ping_interval.tick(), if lan_active.load(Ordering::Relaxed) => {
                 write_frame(&mut writer, &key, &LanMessage::Ping).await?;
             }
-            out = out_rx.recv() => {
+            _ = lan_mode_notify.notified() => {
+                tracing::debug!(
+                    peer = %display_name,
+                    active = lan_active.load(Ordering::Relaxed),
+                    "lan active mode changed"
+                );
+            }
+            out = out_rx.recv(), if lan_active.load(Ordering::Relaxed) => {
                 match out {
                     Ok(out) => {
                         // Don't echo a clip back to the device that
@@ -1369,7 +1403,13 @@ async fn run_peer(
                         // Spurious second Hello — ignore.
                     }
                     Some(LanMessage::Ping) => {
-                        // Already touched last_seen above; nothing more.
+                        // Active peers send their own periodic Ping. In
+                        // inactive Android standby we stay passive, but echo
+                        // a Ping so a desktop probe can prove we're alive on
+                        // the LAN without re-enabling discovery/reconnects.
+                        if !lan_active.load(Ordering::Relaxed) {
+                            write_frame(&mut writer, &key, &LanMessage::Ping).await?;
+                        }
                     }
                     Some(LanMessage::BlobRequest { .. })
                     | Some(LanMessage::BlobChunk { .. })
@@ -2388,6 +2428,8 @@ mod tests {
                     registry_key: "test".into(),
                     file_receive_dir,
                     file_inbound: file_tx,
+                    lan_active: Arc::new(AtomicBool::new(true)),
+                    lan_mode_notify: Arc::new(Notify::new()),
                 };
                 run_peer(stream, peer_addr, peer).await.unwrap();
             }
@@ -2425,6 +2467,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn inactive_lan_peer_completes_handshake_and_answers_ping() {
+        let key = [19u8; KEY_LEN];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let lan_active = Arc::new(AtomicBool::new(false));
+        let lan_mode_notify = Arc::new(Notify::new());
+
+        let server = tokio::spawn({
+            let lan_active = lan_active.clone();
+            let lan_mode_notify = lan_mode_notify.clone();
+            async move {
+                let (stream, peer_addr) = listener.accept().await.unwrap();
+                let (clip_tx, _clip_rx) = mpsc::unbounded_channel::<IncomingLanClip>();
+                let (file_tx, _file_rx) = mpsc::unbounded_channel::<ReceivedFile>();
+                let peer = PeerRunContext {
+                    key,
+                    self_device_id: "android".into(),
+                    self_device_name: "Android".into(),
+                    inbound: clip_tx,
+                    out_rx: broadcast::channel::<OutgoingLan>(1).1,
+                    expected_peer: Some("desktop".into()),
+                    peer_count: Arc::new(AtomicUsize::new(0)),
+                    peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    blob_cache: BlobCache::new(),
+                    registry_key: "probe".into(),
+                    file_receive_dir: Arc::new(std::sync::Mutex::new(None)),
+                    file_inbound: file_tx,
+                    lan_active,
+                    lan_mode_notify,
+                };
+                run_peer(stream, peer_addr, peer).await.unwrap();
+            }
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        write_frame(
+            &mut writer,
+            &key,
+            &LanMessage::Hello {
+                device_id: "desktop".into(),
+                version: PROTO_VERSION,
+                device_name: "Desktop".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let hello = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut reader, &key))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match hello {
+            LanMessage::Hello { device_id, .. } => assert_eq!(device_id, "android"),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+
+        let first_ping =
+            tokio::time::timeout(Duration::from_secs(1), read_frame(&mut reader, &key))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert!(matches!(first_ping, LanMessage::Ping));
+
+        write_frame(&mut writer, &key, &LanMessage::Ping)
+            .await
+            .unwrap();
+        let ping_reply =
+            tokio::time::timeout(Duration::from_secs(1), read_frame(&mut reader, &key))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert!(matches!(ping_reply, LanMessage::Ping));
+
+        drop(writer);
+        drop(reader);
+        server.await.unwrap();
+    }
+
     /// Two nodes on localhost discover each other via mDNS and exchange
     /// one clip. Marked `#[ignore]` because:
     ///   - macOS requires per-binary "Local Network" privacy permission;
@@ -2458,6 +2583,8 @@ mod tests {
         let count_b = Arc::new(AtomicUsize::new(0));
         let peers_a: PeerRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let peers_b: PeerRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let lan_active_a = Arc::new(AtomicBool::new(true));
+        let lan_active_b = Arc::new(AtomicBool::new(true));
         let node_a = LanNode::spawn(LanNodeConfig {
             group_id: group.clone(),
             device_id: did_a.clone(),
@@ -2470,6 +2597,8 @@ mod tests {
             peer_addrs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             file_receive_dir: Arc::new(std::sync::Mutex::new(None)),
             file_inbound: a_file_tx,
+            lan_active: lan_active_a,
+            lan_mode_notify: Arc::new(Notify::new()),
         })
         .await
         .expect("spawn A");
@@ -2485,6 +2614,8 @@ mod tests {
             peer_addrs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             file_receive_dir: Arc::new(std::sync::Mutex::new(None)),
             file_inbound: b_file_tx,
+            lan_active: lan_active_b,
+            lan_mode_notify: Arc::new(Notify::new()),
         })
         .await
         .expect("spawn B");

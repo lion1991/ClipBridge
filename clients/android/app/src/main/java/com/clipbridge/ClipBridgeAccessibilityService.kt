@@ -1,12 +1,15 @@
 package com.clipbridge
 
 import android.accessibilityservice.AccessibilityService
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.net.Uri
+import android.os.PowerManager
 import android.net.wifi.WifiManager
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
@@ -34,10 +37,10 @@ import uniffi.clipbridge_core.ImageMeta
  * Two paths to picking up clipboard changes on Android 10+, where background
  * `ClipboardManager.getPrimaryClip()` is blocked:
  *
- *   - **Shizuku poller (preferred)**: every 2s, ask the IClipboard system
- *     service through Shizuku's shell-uid binder for the current primary clip.
- *     Catches every kind of copy (system menu, external keyboard, programmatic
- *     setPrimaryClip, etc.).
+ *   - **On-demand Shizuku read (preferred)**: after a remote write, ask the
+ *     IClipboard system service through Shizuku's shell-uid binder for the
+ *     current primary clip. This catches system clipboard state without
+ *     keeping an always-on polling loop alive in standby.
  *   - **Accessibility events (fallback)**: cache the latest text selection and
  *     publish it when a "copied" toast fires. Works without Shizuku but misses
  *     copies that don't go through the long-press toolbar.
@@ -52,10 +55,10 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private var clipboard: ClipboardManager? = null
     private var clipListener: ClipboardManager.OnPrimaryClipChangedListener? = null
     private var prefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
-    // Held while a Client is alive, so the LAN transport's mDNS multicast
-    // packets aren't dropped by Wi-Fi power save. Released when the client
-    // is stopped (pairing change, service unbind) so we don't keep Wi-Fi
-    // hot when there's no client to use it.
+    private var screenReceiver: BroadcastReceiver? = null
+    // Held only while Android LAN mode is active. Screen-off standby releases
+    // it; transfer activity opens a short LAN window so mDNS/TCP LAN paths can
+    // wake briefly without keeping Wi-Fi multicast hot all night.
     private var multicastLock: WifiManager.MulticastLock? = null
 
     // Most recent content we wrote to the clipboard from a remote clip.
@@ -65,7 +68,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     @Volatile private var expectedEcho: String? = null
     @Volatile private var expectedEchoAt: Long = 0L
     // Short window to dedupe the multiple sources (clipboard listener,
-    // Shizuku poller, copy toast) all firing for the same user copy.
+    // Shizuku read, copy toast) all firing for the same user copy.
     @Volatile private var lastPublished: String? = null
     @Volatile private var lastPublishedAt: Long = 0L
     private var lastSelection: String? = null
@@ -79,15 +82,20 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     // grow it unbounded; entries beyond capacity get LRU-evicted.
     private val recentImageHashes = LinkedHashSet<String>()
     private val recentImageHashesCap = 32
-    // Last image URI we observed via the Shizuku poller, dedup'd by URI
-    // string. Tracks "is this the same clip we already saw?" between
-    // ticks; cross-source dedup with the listener happens in publishImage
-    // via `recentImageHashes`.
+    // Last values observed via an on-demand Shizuku read. These prevent a
+    // remote write that we just mirrored to the system clipboard from being
+    // reprocessed as a fresh local copy if several callbacks fire around
+    // the same time. Shizuku reads are remote-triggered only; there is no
+    // always-on clipboard polling loop.
+    private var lastShizukuText: String? = null
     private var lastPolledImageUri: String? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private var pollerJob: Job? = null
+    private var shizukuReadJob: Job? = null
     private var lanCountJob: Job? = null
+    private var lanActiveJob: Job? = null
+    @Volatile private var reconnectIdleMode: Boolean = false
+    @Volatile private var lanActive: Boolean = true
 
     init {
         _stateFlow.value = UiConnState.Idle
@@ -114,73 +122,140 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         prefs.registerOnSharedPreferenceChangeListener(prefsListener)
 
         ShizukuBridge.register()
-        startShizukuPoller()
+        registerScreenStateReceiver()
         startLanCountPoller()
         startClient()
+    }
+
+    private fun registerScreenStateReceiver() {
+        if (screenReceiver != null) return
+        screenReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_OFF -> setReconnectIdleMode(true)
+                    Intent.ACTION_SCREEN_ON,
+                    Intent.ACTION_USER_PRESENT -> setReconnectIdleMode(false)
+                }
+            }
+        }
+        registerReceiver(
+            screenReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+            },
+        )
+        setReconnectIdleMode(isScreenOffForReconnect())
+    }
+
+    private fun unregisterScreenStateReceiver() {
+        screenReceiver?.let {
+            try { unregisterReceiver(it) } catch (_: Throwable) {}
+        }
+        screenReceiver = null
+    }
+
+    private fun isScreenOffForReconnect(): Boolean {
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return false
+        return !pm.isInteractive
+    }
+
+    private fun setReconnectIdleMode(enabled: Boolean) {
+        reconnectIdleMode = enabled
+        client?.setReconnectIdleMode(enabled)
+        if (enabled) {
+            setLanActive(false)
+        } else {
+            lanActiveJob?.cancel()
+            lanActiveJob = null
+            setLanActive(true)
+        }
+        Log.i(TAG, "reconnect idle mode: $enabled")
+    }
+
+    private fun setLanActive(enabled: Boolean) {
+        lanActive = enabled
+        client?.setLanActive(enabled)
+        if (enabled) {
+            if (client != null) acquireMulticastLock()
+        } else {
+            lanActiveJob?.cancel()
+            lanActiveJob = null
+            _lanPeerNames.value = emptyList()
+            _lanPeerCount.value = 0
+            releaseMulticastLock()
+        }
+        Log.i(TAG, "lan active: $enabled")
+    }
+
+    private fun activateLanTemporarily(reason: String) {
+        setLanActive(true)
+        lanActiveJob?.cancel()
+        if (!reconnectIdleMode) return
+
+        lanActiveJob = scope.launch {
+            Log.i(TAG, "temporary LAN window opened: $reason")
+            delay(LAN_ACTIVE_WINDOW_MS)
+            lanActiveJob = null
+            if (reconnectIdleMode) {
+                setLanActive(false)
+            }
+        }
     }
 
     private fun startLanCountPoller() {
         lanCountJob?.cancel()
         lanCountJob = scope.launch {
             while (isActive) {
-                val names = client?.lanPeers().orEmpty().sorted()
-                _lanPeerNames.value = names
-                _lanPeerCount.value = names.size
-                delay(2_000)
+                if (lanActive) {
+                    val names = client?.lanPeers().orEmpty().sorted()
+                    _lanPeerNames.value = names
+                    _lanPeerCount.value = names.size
+                    delay(LAN_COUNT_ACTIVE_INTERVAL_MS)
+                } else {
+                    _lanPeerNames.value = emptyList()
+                    _lanPeerCount.value = 0
+                    delay(LAN_COUNT_IDLE_INTERVAL_MS)
+                }
             }
         }
     }
 
-    private fun startShizukuPoller() {
-        pollerJob?.cancel()
-        pollerJob = scope.launch {
-            Log.i(TAG, "shizuku poller starting, initial state=${ShizukuBridge.state()}")
-            var lastLoggedState: ShizukuBridge.State? = null
-            var tickCount = 0
-            // Poll-local change detection: only act when the read content differs
-            // from what we saw last tick. Cross-source dedupe with the clipboard
-            // listener and copy toast happens inside `publish*()`.
-            var lastPolledText: String? = null
-            while (isActive) {
-                val state = ShizukuBridge.state()
-                if (state != lastLoggedState) {
-                    Log.i(TAG, "shizuku state -> $state")
-                    lastLoggedState = state
-                }
-                if (state == ShizukuBridge.State.READY) {
-                    val clip = ShizukuBridge.readPrimaryClip()
-                    if (++tickCount % 10 == 0) {
-                        Log.d(TAG, "shizuku tick $tickCount: clip=$clip")
-                    }
-                    when (clip) {
-                        is ShizukuBridge.Clip.Text -> {
-                            val text = clip.value
-                            if (text.isNotEmpty() && text != lastPolledText) {
-                                lastPolledText = text
-                                withContext(Dispatchers.Main) {
-                                    Log.i(TAG, "shizuku read NEW text: ${text.length} chars")
-                                    publish(text)
-                                }
-                            }
+    private fun triggerShizukuClipboardRead(reason: String) {
+        if (shizukuReadJob?.isActive == true) return
+        shizukuReadJob = scope.launch {
+            val state = ShizukuBridge.state()
+            if (state != ShizukuBridge.State.READY) {
+                Log.d(TAG, "skip Shizuku clipboard read ($reason): state=$state")
+                return@launch
+            }
+            when (val clip = ShizukuBridge.readPrimaryClip()) {
+                is ShizukuBridge.Clip.Text -> {
+                    val text = clip.value
+                    if (text.isNotEmpty() && text != lastShizukuText) {
+                        lastShizukuText = text
+                        withContext(Dispatchers.Main) {
+                            Log.i(TAG, "Shizuku read text after $reason: ${text.length} chars")
+                            publish(text)
                         }
-                        is ShizukuBridge.Clip.ImageUri -> {
-                            val key = clip.uri.toString()
-                            if (key != lastPolledImageUri) {
-                                lastPolledImageUri = key
-                                Log.i(TAG, "shizuku read NEW image uri: $key")
-                                val outbound = ImagePipeline.outboundFromUri(
-                                    this@ClipBridgeAccessibilityService,
-                                    clip.uri,
-                                )
-                                if (outbound != null) {
-                                    withContext(Dispatchers.Main) { publishImage(outbound) }
-                                }
-                            }
-                        }
-                        null -> { /* Shizuku not ready or read failed */ }
                     }
                 }
-                delay(POLL_INTERVAL_MS)
+                is ShizukuBridge.Clip.ImageUri -> {
+                    val key = clip.uri.toString()
+                    if (key != lastPolledImageUri) {
+                        lastPolledImageUri = key
+                        Log.i(TAG, "Shizuku read image uri after $reason: $key")
+                        val outbound = ImagePipeline.outboundFromUri(
+                            this@ClipBridgeAccessibilityService,
+                            clip.uri,
+                        )
+                        if (outbound != null) {
+                            withContext(Dispatchers.Main) { publishImage(outbound) }
+                        }
+                    }
+                }
+                null -> { /* Shizuku not ready, read failed, or clipboard empty. */ }
             }
         }
     }
@@ -201,8 +276,10 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     override fun onUnbind(intent: Intent?): Boolean {
         Log.i(TAG, "accessibility service unbinding")
         if (instanceRef === this) instanceRef = null
-        pollerJob?.cancel()
-        pollerJob = null
+        shizukuReadJob?.cancel()
+        shizukuReadJob = null
+        lanActiveJob?.cancel()
+        lanActiveJob = null
         lanCountJob?.cancel()
         lanCountJob = null
         scope.cancel()
@@ -214,6 +291,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
                 .unregisterOnSharedPreferenceChangeListener(it)
         }
         prefsListener = null
+        unregisterScreenStateReceiver()
         client?.stop()
         client = null
         releaseMulticastLock()
@@ -331,7 +409,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         }
         val now = System.currentTimeMillis()
         // Echo of a recent remote write — skip without consuming, so other
-        // sources (poller, toast) firing for the same change all skip too.
+        // sources (Shizuku read, toast) firing for the same change all skip too.
         if (text == expectedEcho && now - expectedEchoAt < ECHO_WINDOW_MS) {
             Log.i(TAG, "skip: matches expectedEcho")
             return
@@ -351,6 +429,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             image = null,
         )
         try {
+            activateLanTemporarily("local text")
             client?.sendClip(payload)
             Log.i(TAG, "published clip (${text.length} chars)")
         } catch (t: Throwable) {
@@ -361,7 +440,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     /**
      * Image counterpart to `publish(text)`. Two callers:
      *
-     *   - Clipboard listener / Shizuku poller (clipboard activity) — passes
+     *   - Clipboard listener / Shizuku read (clipboard activity) — passes
      *     `dedup = true` so multiple sources firing for the same copy
      *     collapse, AND so a re-paste of an image we just received doesn't
      *     bounce back to the source device.
@@ -392,6 +471,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         // we don't care about the return value here; we just want it in.
         if (!dedup) rememberImageHash(h)
 
+        activateLanTemporarily("local image")
         val deviceName = android.os.Build.MODEL ?: "Android"
         val ts = System.currentTimeMillis()
         // Surface in the UI history immediately — the upload may take a
@@ -475,7 +555,6 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         }
         val deviceId = PairingStore.deviceId(this)
         val deviceName = android.os.Build.MODEL ?: "Android"
-        acquireMulticastLock()
         client = try {
             Client(
                 relayUrl = config.relayUrl,
@@ -503,6 +582,8 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             Log.e(TAG, "failed to start client", t)
             null
         }
+        client?.setReconnectIdleMode(reconnectIdleMode)
+        setLanActive(lanActive)
     }
 
     private fun restartClient() {
@@ -564,6 +645,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     }
 
     private fun handleRemoteClip(payload: ClipPayload) {
+        activateLanTemporarily("remote clip")
         when (payload.kind) {
             ClipKind.TEXT -> {
                 Log.i(TAG, "remote text clip (${payload.content.length} chars)")
@@ -574,6 +656,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
                 clipboard?.setPrimaryClip(
                     ClipData.newPlainText("ClipBridge", payload.content)
                 )
+                triggerShizukuClipboardRead("remote text")
             }
             ClipKind.IMAGE -> handleRemoteImage(payload)
         }
@@ -612,7 +695,10 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
                     meta.mimeType,
                 )
                 if (!ok) Log.w(TAG, "writeImageToClipboard returned false")
-                else Log.i(TAG, "wrote remote image to clipboard")
+                else {
+                    Log.i(TAG, "wrote remote image to clipboard")
+                    triggerShizukuClipboardRead("remote image")
+                }
                 appendImageHistory(
                     ImageHistoryEntry(
                         id = h,
@@ -631,12 +717,13 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "ClipBridge"
-        private const val POLL_INTERVAL_MS = 2_000L
         // See `expectedEcho` doc above the field.
         private const val ECHO_WINDOW_MS = 10_000L
-        // Long enough to cover one Shizuku poll interval after a listener fire,
-        // short enough that an intentional re-copy of the same text still goes.
+        // Short enough that an intentional re-copy of the same text still goes.
         private const val SOURCE_DEDUPE_MS = 3_000L
+        private const val LAN_ACTIVE_WINDOW_MS = 60_000L
+        private const val LAN_COUNT_ACTIVE_INTERVAL_MS = 2_000L
+        private const val LAN_COUNT_IDLE_INTERVAL_MS = 30_000L
 
         // In-process state for the UI to observe. AS and Activity share the
         // same process (no android:process attribute on either component) so

@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::blob::{BlobClient, BlobError};
@@ -107,6 +107,9 @@ enum Cmd {
     Stop,
 }
 
+const IDLE_RECONNECT_INITIAL: Duration = Duration::from_secs(5);
+const IDLE_RECONNECT_MAX: Duration = Duration::from_secs(5 * 60);
+
 #[derive(uniffi::Object)]
 pub struct Client {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
@@ -144,6 +147,10 @@ struct Shared {
     lan_peer_names: PeerRegistry,
     file_receive_dir: SharedFileReceiveDir,
     received_files: Arc<Mutex<VecDeque<ReceivedFileRecord>>>,
+    reconnect_idle_mode: Arc<AtomicBool>,
+    reconnect_mode_notify: Arc<Notify>,
+    lan_active: Arc<AtomicBool>,
+    lan_mode_notify: Arc<Notify>,
 }
 
 #[uniffi::export]
@@ -185,6 +192,10 @@ impl Client {
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let file_receive_dir: SharedFileReceiveDir = Arc::new(std::sync::Mutex::new(None));
         let received_files = Arc::new(Mutex::new(VecDeque::new()));
+        let reconnect_idle_mode = Arc::new(AtomicBool::new(false));
+        let reconnect_mode_notify = Arc::new(Notify::new());
+        let lan_active = Arc::new(AtomicBool::new(true));
+        let lan_mode_notify = Arc::new(Notify::new());
         let shared = Arc::new(Shared {
             key: key_arr,
             group_id: group_id.clone(),
@@ -197,6 +208,10 @@ impl Client {
             peer_addrs: peer_addrs.clone(),
             file_receive_dir: file_receive_dir.clone(),
             received_files: received_files.clone(),
+            reconnect_idle_mode: reconnect_idle_mode.clone(),
+            reconnect_mode_notify: reconnect_mode_notify.clone(),
+            lan_active: lan_active.clone(),
+            lan_mode_notify: lan_mode_notify.clone(),
         });
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
@@ -223,6 +238,10 @@ impl Client {
                     peer_addrs,
                     file_receive_dir,
                     received_files,
+                    reconnect_idle_mode,
+                    reconnect_mode_notify,
+                    lan_active,
+                    lan_mode_notify,
                 }));
             })
             .map_err(|e| FfiError::Internal {
@@ -245,6 +264,24 @@ impl Client {
         self.cmd_tx
             .send(Cmd::FetchRecent)
             .map_err(|_| FfiError::Stopped)
+    }
+
+    /// Tell the worker whether reconnects are happening while the host is in
+    /// a locked / screen-off idle state. Active hosts keep the original
+    /// immediate reconnect behavior; idle hosts back off normal reconnects.
+    pub fn set_reconnect_idle_mode(&self, enabled: bool) {
+        self.shared
+            .reconnect_idle_mode
+            .store(enabled, Ordering::Relaxed);
+        self.shared.reconnect_mode_notify.notify_waiters();
+    }
+
+    /// Tell the worker whether the host currently wants LAN discovery and
+    /// peer sessions active. Platforms that never call this keep the default
+    /// always-on LAN behavior.
+    pub fn set_lan_active(&self, enabled: bool) {
+        self.shared.lan_active.store(enabled, Ordering::Relaxed);
+        self.shared.lan_mode_notify.notify_waiters();
     }
 
     /// Encrypt `image_bytes`, upload the ciphertext to the relay's blob
@@ -469,6 +506,10 @@ struct ClientRun {
     peer_addrs: PeerAddrs,
     file_receive_dir: SharedFileReceiveDir,
     received_files: Arc<Mutex<VecDeque<ReceivedFileRecord>>>,
+    reconnect_idle_mode: Arc<AtomicBool>,
+    reconnect_mode_notify: Arc<Notify>,
+    lan_active: Arc<AtomicBool>,
+    lan_mode_notify: Arc<Notify>,
 }
 
 async fn run(config: ClientRun) {
@@ -486,6 +527,10 @@ async fn run(config: ClientRun) {
         peer_addrs,
         file_receive_dir,
         received_files,
+        reconnect_idle_mode,
+        reconnect_mode_notify,
+        lan_active,
+        lan_mode_notify,
     } = config;
 
     // Receive-side dedup. The same (sender_device_id, ts) pair may arrive
@@ -511,6 +556,8 @@ async fn run(config: ClientRun) {
         peer_addrs,
         file_receive_dir,
         file_inbound: file_in_tx,
+        lan_active: lan_active.clone(),
+        lan_mode_notify: lan_mode_notify.clone(),
     })
     .await
     {
@@ -558,6 +605,8 @@ async fn run(config: ClientRun) {
     }
 
     let mut backoff = Duration::from_secs(1);
+    let mut idle_reconnect_backoff =
+        IdleReconnectBackoff::new(IDLE_RECONNECT_INITIAL, IDLE_RECONNECT_MAX);
     loop {
         listener.on_state(ConnectionState::Connecting);
         match session(
@@ -569,6 +618,7 @@ async fn run(config: ClientRun) {
                 listener: &listener,
                 lan: lan.as_deref(),
                 dedup: &dedup,
+                lan_active: lan_active.as_ref(),
             },
             &mut cmd_rx,
         )
@@ -581,6 +631,24 @@ async fn run(config: ClientRun) {
             Ok(SessionExit::Reconnect) => {
                 listener.on_state(ConnectionState::Disconnected);
                 backoff = Duration::from_secs(1);
+                if let Some(delay) = reconnect_delay_for_mode(
+                    reconnect_idle_mode.load(Ordering::Relaxed),
+                    &mut idle_reconnect_backoff,
+                ) {
+                    tracing::info!(
+                        ?delay,
+                        "screen-off idle mode active; delaying websocket reconnect"
+                    );
+                    wait_for_idle_reconnect_delay(
+                        delay,
+                        &reconnect_idle_mode,
+                        &reconnect_mode_notify,
+                    )
+                    .await;
+                    if !reconnect_idle_mode.load(Ordering::Relaxed) {
+                        idle_reconnect_backoff.reset();
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "session error, will reconnect");
@@ -600,6 +668,63 @@ enum SessionExit {
 }
 
 const LAN_ADVERTISE_REFRESH_EVERY: Duration = Duration::from_secs(5);
+
+struct IdleReconnectBackoff {
+    initial: Duration,
+    max: Duration,
+    next: Duration,
+}
+
+impl IdleReconnectBackoff {
+    fn new(initial: Duration, max: Duration) -> Self {
+        Self {
+            initial,
+            max,
+            next: initial,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = (self.next * 2).min(self.max);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.next = self.initial;
+    }
+}
+
+fn reconnect_delay_for_mode(
+    idle_mode: bool,
+    backoff: &mut IdleReconnectBackoff,
+) -> Option<Duration> {
+    if idle_mode {
+        Some(backoff.next_delay())
+    } else {
+        backoff.reset();
+        None
+    }
+}
+
+async fn wait_for_idle_reconnect_delay(
+    delay: Duration,
+    reconnect_idle_mode: &AtomicBool,
+    reconnect_mode_notify: &Notify,
+) {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => break,
+            _ = reconnect_mode_notify.notified() => {
+                if !reconnect_idle_mode.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        }
+    }
+}
 
 fn normalize_lan_candidate_networks(mut candidates: Vec<LanCandidate>) -> Vec<LanCandidate> {
     candidates.sort_by(|a, b| a.addr.cmp(&b.addr).then(a.prefix_len.cmp(&b.prefix_len)));
@@ -622,6 +747,7 @@ struct SessionCtx<'a> {
     listener: &'a Arc<dyn ClipListener>,
     lan: Option<&'a LanNode>,
     dedup: &'a Arc<Mutex<DedupCache>>,
+    lan_active: &'a AtomicBool,
 }
 
 async fn session(
@@ -636,6 +762,7 @@ async fn session(
         listener,
         lan,
         dedup,
+        lan_active,
     } = ctx;
 
     // Accept any of ws:// wss:// http:// https:// — the user often pastes the
@@ -675,7 +802,7 @@ async fn session(
     // connection rendezvous-capable — old relays just reply with an error
     // we ignore, and never push us `LanPeers`. Skipped entirely if the LAN
     // node didn't start (multicast/socket blocked) or has no private IPs.
-    if let Some(lan) = lan {
+    if let Some(lan) = lan.filter(|_| lan_active.load(Ordering::Relaxed)) {
         let candidate_networks =
             normalize_lan_candidate_networks(lan.advertise_candidate_networks());
         let candidates: Vec<String> = candidate_networks.iter().map(|c| c.addr.clone()).collect();
@@ -718,7 +845,7 @@ async fn session(
             _ = ping_interval.tick() => {
                 ws.send(Message::Ping(Vec::new())).await?;
             }
-            _ = lan_advertise_interval.tick(), if lan.is_some() && !lan_advertise_disabled => {
+            _ = lan_advertise_interval.tick(), if lan.is_some() && !lan_advertise_disabled && lan_active.load(Ordering::Relaxed) => {
                 if let Some(lan) = lan {
                     let candidate_networks =
                         normalize_lan_candidate_networks(lan.advertise_candidate_networks());
@@ -788,7 +915,7 @@ async fn session(
                         // each time, so intercept before dispatch.
                         if let ServerMessage::LanPeers { peers } = parsed {
                             lan_advertise_error_pending = false;
-                            if let Some(lan) = lan {
+                            if let Some(lan) = lan.filter(|_| lan_active.load(Ordering::Relaxed)) {
                                 lan.ingest_relay_peers(peers).await;
                             }
                         } else {
@@ -1023,6 +1150,59 @@ mod tests {
         assert!(!lan_advertise_disabled);
     }
 
+    #[test]
+    fn idle_reconnect_backoff_grows_exponentially_until_cap() {
+        let mut backoff =
+            IdleReconnectBackoff::new(Duration::from_secs(5), Duration::from_secs(20));
+
+        assert_eq!(
+            reconnect_delay_for_mode(true, &mut backoff),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            reconnect_delay_for_mode(true, &mut backoff),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            reconnect_delay_for_mode(true, &mut backoff),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(
+            reconnect_delay_for_mode(true, &mut backoff),
+            Some(Duration::from_secs(20))
+        );
+    }
+
+    #[test]
+    fn active_reconnect_keeps_existing_immediate_behavior_and_resets_idle_backoff() {
+        let mut backoff =
+            IdleReconnectBackoff::new(Duration::from_secs(5), Duration::from_secs(20));
+
+        assert_eq!(
+            reconnect_delay_for_mode(true, &mut backoff),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(reconnect_delay_for_mode(false, &mut backoff), None);
+        assert_eq!(
+            reconnect_delay_for_mode(true, &mut backoff),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn client_lan_active_mode_can_be_toggled_by_platform() {
+        let client = client_for_file_tests(
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        );
+
+        client.set_lan_active(false);
+        assert!(!client.shared.lan_active.load(Ordering::Relaxed));
+
+        client.set_lan_active(true);
+        assert!(client.shared.lan_active.load(Ordering::Relaxed));
+    }
+
     fn client_for_file_tests(peer_addrs: PeerAddrs, peer_names: PeerRegistry) -> Client {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<Cmd>();
         Client {
@@ -1040,6 +1220,10 @@ mod tests {
                 lan_peer_names: peer_names,
                 file_receive_dir: Arc::new(std::sync::Mutex::new(None)),
                 received_files: Arc::new(Mutex::new(VecDeque::new())),
+                reconnect_idle_mode: Arc::new(AtomicBool::new(false)),
+                reconnect_mode_notify: Arc::new(Notify::new()),
+                lan_active: Arc::new(AtomicBool::new(true)),
+                lan_mode_notify: Arc::new(Notify::new()),
             }),
         }
     }
