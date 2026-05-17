@@ -456,6 +456,19 @@ fn sort_candidates_for_dial(candidates: &mut [SocketAddr], local_networks: &[Loc
     });
 }
 
+fn is_local_interface_candidate(candidate: &SocketAddr, local_networks: &[LocalNetwork]) -> bool {
+    local_networks
+        .iter()
+        .any(|local| candidate.ip() == local.ip)
+}
+
+fn drop_local_interface_candidates(
+    candidates: &mut Vec<SocketAddr>,
+    local_networks: &[LocalNetwork],
+) {
+    candidates.retain(|candidate| !is_local_interface_candidate(candidate, local_networks));
+}
+
 /// Enumerate this host's advertisable private interface addresses as
 /// `ip:port` strings for `ClientMessage::LanAdvertise`. Loopback,
 /// public, and link-local-v6 addresses are filtered out. Returns empty
@@ -797,6 +810,7 @@ impl LanNode {
                                 .filter(|a| !is_unroutable(a))
                                 .map(|a| SocketAddr::new(a, port))
                                 .collect();
+                            drop_local_interface_candidates(&mut candidates, &local_networks);
                             sort_candidates_for_dial(&mut candidates, &local_networks);
                             if candidates.is_empty() {
                                 continue;
@@ -1085,9 +1099,25 @@ fn apply_relay_snapshot(
     peer_addrs: &mut HashMap<String, PeerAddrEntry>,
     known_peers: &mut HashMap<String, KnownPeer>,
 ) {
+    let local_networks = local_private_networks();
+    apply_relay_snapshot_with_local_networks(
+        self_device_id,
+        peers,
+        peer_addrs,
+        known_peers,
+        &local_networks,
+    );
+}
+
+fn apply_relay_snapshot_with_local_networks(
+    self_device_id: &str,
+    peers: Vec<crate::protocol::LanPeer>,
+    peer_addrs: &mut HashMap<String, PeerAddrEntry>,
+    known_peers: &mut HashMap<String, KnownPeer>,
+    local_networks: &[LocalNetwork],
+) {
     // device_id -> relay-provided name + dialable candidates, parsed & filtered.
     let mut desired: Vec<(String, Option<String>, Vec<SocketAddr>)> = Vec::new();
-    let local_networks = local_private_networks();
     for p in peers {
         if p.device_id == self_device_id {
             continue; // never rendezvous with ourselves
@@ -1100,7 +1130,8 @@ fn apply_relay_snapshot(
                 }
             }
         }
-        sort_candidates_for_dial(&mut cands, &local_networks);
+        drop_local_interface_candidates(&mut cands, local_networks);
+        sort_candidates_for_dial(&mut cands, local_networks);
         if !cands.is_empty() {
             desired.push((
                 p.device_id,
@@ -2254,6 +2285,36 @@ mod tests {
         );
         assert!(pa.is_empty(), "no usable candidates -> nothing added");
         assert!(kp.is_empty());
+    }
+
+    #[test]
+    fn relay_snapshot_drops_candidates_on_local_interface_only() {
+        let local_networks = vec![LocalNetwork {
+            ip: "192.168.1.10".parse().unwrap(),
+            netmask: "255.255.255.0".parse().unwrap(),
+            prefix_len: 24,
+        }];
+        let mut pa: HashMap<String, PeerAddrEntry> = HashMap::new();
+        let mut kp: HashMap<String, KnownPeer> = HashMap::new();
+
+        apply_relay_snapshot_with_local_networks(
+            "dev-m",
+            vec![
+                lp("old-self", &["192.168.1.10:5000"]),
+                lp("dev-a", &["192.168.1.10:6000", "192.168.1.11:6000"]),
+            ],
+            &mut pa,
+            &mut kp,
+            &local_networks,
+        );
+
+        assert!(
+            !pa.contains_key("relay:old-self"),
+            "same host candidate should not appear as a stale peer"
+        );
+        let peer = pa.get("relay:dev-a").expect("same subnet peer remains");
+        assert_eq!(peer.candidates, vec!["192.168.1.11:6000".parse().unwrap()]);
+        assert!(kp.contains_key("relay:dev-a"));
     }
 
     #[test]

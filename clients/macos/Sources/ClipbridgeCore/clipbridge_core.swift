@@ -572,6 +572,14 @@ public protocol ClientProtocol: AnyObject, Sendable {
      */
     func lanPeers()  -> [String]
 
+    /**
+     * Ask the active session to immediately re-advertise LAN candidates and
+     * wake the LAN reconciler instead of waiting for the periodic timers.
+     * Platforms that do not call this keep the existing timer-driven LAN
+     * behavior.
+     */
+    func refreshLanNow() throws
+
     func sendClip(payload: ClipPayload) throws
 
     func sendFileToPeer(targetDeviceId: String, sourcePath: String, mimeType: String?) throws  -> SentFile
@@ -742,6 +750,19 @@ open func lanPeers() -> [String]  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+
+    /**
+     * Ask the active session to immediately re-advertise LAN candidates and
+     * wake the LAN reconciler instead of waiting for the periodic timers.
+     * Platforms that do not call this keep the existing timer-driven LAN
+     * behavior.
+     */
+open func refreshLanNow()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_clipbridge_core_fn_method_client_refresh_lan_now(
+            self.uniffiCloneHandle(),$0
+    )
+}
 }
 
 open func sendClip(payload: ClipPayload)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -1927,6 +1948,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_client_lan_peers() != 17374) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_clipbridge_core_checksum_method_client_refresh_lan_now() != 10042) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_client_send_clip() != 42893) {
