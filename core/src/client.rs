@@ -11,9 +11,13 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::blob::{BlobClient, BlobError};
 use crate::crypto::{decrypt, encrypt, sha256_hex, KEY_LEN, NONCE_LEN};
+use crate::file_transfer::{
+    FileTransferConfig, ReceivedFile, ReceivedFileRecord, SendFileRequest, SentFile,
+};
 use crate::lan::{
-    lan_fetch_blob, unique_peer_names, BlobCache, IncomingLanClip, LanNode, LanNodeConfig,
-    PeerAddrs, PeerRegistry, SharedBlobCache,
+    candidates_for_peer, lan_fetch_blob, lan_send_file, peer_records, unique_peer_names, BlobCache,
+    IncomingLanClip, LanNode, LanNodeConfig, LanPeerRecord, PeerAddrs, PeerRegistry,
+    SharedBlobCache, SharedFileReceiveDir,
 };
 use crate::protocol::{
     ClientMessage, ClipKind, ClipPayload, ImageMeta, LanCandidate, ServerMessage,
@@ -76,6 +80,10 @@ pub enum FfiError {
     BlobNotFound,
     #[error("blob exceeds relay size limit")]
     BlobTooLarge,
+    #[error("no LAN candidates for peer: {device_id}")]
+    NoLanPeer { device_id: String },
+    #[error("file transfer failed: {reason}")]
+    FileTransfer { reason: String },
     #[error("internal: {reason}")]
     Internal { reason: String },
 }
@@ -134,6 +142,8 @@ struct Shared {
     /// so the FFI getter can hand back a `Vec<String>` for the UI to
     /// render "局域网: Mac, iPhone".
     lan_peer_names: PeerRegistry,
+    file_receive_dir: SharedFileReceiveDir,
+    received_files: Arc<Mutex<VecDeque<ReceivedFileRecord>>>,
 }
 
 #[uniffi::export]
@@ -173,6 +183,8 @@ impl Client {
         let blob_cache = BlobCache::new();
         let peer_addrs: PeerAddrs =
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let file_receive_dir: SharedFileReceiveDir = Arc::new(std::sync::Mutex::new(None));
+        let received_files = Arc::new(Mutex::new(VecDeque::new()));
         let shared = Arc::new(Shared {
             key: key_arr,
             group_id: group_id.clone(),
@@ -183,6 +195,8 @@ impl Client {
             lan_peer_names: lan_peer_names.clone(),
             blob_cache: blob_cache.clone(),
             peer_addrs: peer_addrs.clone(),
+            file_receive_dir: file_receive_dir.clone(),
+            received_files: received_files.clone(),
         });
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
@@ -207,6 +221,8 @@ impl Client {
                     lan_peer_names,
                     blob_cache,
                     peer_addrs,
+                    file_receive_dir,
+                    received_files,
                 }));
             })
             .map_err(|e| FfiError::Internal {
@@ -306,7 +322,7 @@ impl Client {
                 .shared
                 .peer_addrs
                 .lock()
-                .map(|g| g.values().cloned().collect())
+                .map(|g| g.values().map(|entry| entry.candidates.clone()).collect())
                 .unwrap_or_default();
             for candidates in peers {
                 let Some(ciphertext) = lan_fetch_blob(
@@ -366,6 +382,61 @@ impl Client {
         unique_peer_names(&self.shared.lan_peer_names)
     }
 
+    pub fn lan_peer_records(&self) -> Vec<LanPeerRecord> {
+        peer_records(&self.shared.lan_peer_names, &self.shared.peer_addrs)
+    }
+
+    pub fn send_file_to_peer(
+        &self,
+        target_device_id: String,
+        source_path: String,
+        mime_type: Option<String>,
+    ) -> Result<SentFile, FfiError> {
+        let candidates = candidates_for_peer(&self.shared.peer_addrs, &target_device_id);
+        if candidates.is_empty() {
+            return Err(FfiError::NoLanPeer {
+                device_id: target_device_id,
+            });
+        }
+        lan_send_file(
+            candidates,
+            self.shared.key,
+            SendFileRequest {
+                source_device_id: self.shared.device_id.clone(),
+                source_device_name: self.shared.device_name.clone(),
+                target_device_id,
+                source_path: std::path::PathBuf::from(source_path),
+                mime_type,
+                config: FileTransferConfig::default(),
+            },
+        )
+        .map_err(|e| FfiError::FileTransfer {
+            reason: e.to_string(),
+        })
+    }
+
+    pub fn set_file_receive_dir(&self, dir: String) {
+        let mut g = self
+            .shared
+            .file_receive_dir
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *g = if dir.trim().is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(dir))
+        };
+    }
+
+    pub fn take_received_files(&self) -> Vec<ReceivedFileRecord> {
+        let mut g = self
+            .shared
+            .received_files
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        g.drain(..).collect()
+    }
+
     /// Signal the worker thread to disconnect and wait for it to finish.
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(Cmd::Stop);
@@ -396,6 +467,8 @@ struct ClientRun {
     lan_peer_names: PeerRegistry,
     blob_cache: SharedBlobCache,
     peer_addrs: PeerAddrs,
+    file_receive_dir: SharedFileReceiveDir,
+    received_files: Arc<Mutex<VecDeque<ReceivedFileRecord>>>,
 }
 
 async fn run(config: ClientRun) {
@@ -411,6 +484,8 @@ async fn run(config: ClientRun) {
         lan_peer_names,
         blob_cache,
         peer_addrs,
+        file_receive_dir,
+        received_files,
     } = config;
 
     // Receive-side dedup. The same (sender_device_id, ts) pair may arrive
@@ -423,6 +498,7 @@ async fn run(config: ClientRun) {
     // refused, port bind failed in a sandboxed test env) is non-fatal:
     // we just degrade to relay-only and log it.
     let (lan_in_tx, lan_in_rx) = mpsc::unbounded_channel::<IncomingLanClip>();
+    let (file_in_tx, mut file_in_rx) = mpsc::unbounded_channel::<ReceivedFile>();
     let lan = match LanNode::spawn(LanNodeConfig {
         group_id: group_id.clone(),
         device_id: device_id.clone(),
@@ -433,6 +509,8 @@ async fn run(config: ClientRun) {
         peers: lan_peer_names,
         blob_cache,
         peer_addrs,
+        file_receive_dir,
+        file_inbound: file_in_tx,
     })
     .await
     {
@@ -445,6 +523,19 @@ async fn run(config: ClientRun) {
             None
         }
     };
+
+    {
+        let received_files = received_files.clone();
+        tokio::spawn(async move {
+            while let Some(file) = file_in_rx.recv().await {
+                let mut g = received_files.lock().unwrap_or_else(|p| p.into_inner());
+                if g.len() >= 128 {
+                    g.pop_front();
+                }
+                g.push_back(file.into());
+            }
+        });
+    }
 
     // Drain LAN inbound into the listener regardless of WS state, so a
     // brief relay outage doesn't also stall LAN delivery.
@@ -930,6 +1021,116 @@ mod tests {
         );
         assert!(!lan_advertise_error_pending);
         assert!(!lan_advertise_disabled);
+    }
+
+    fn client_for_file_tests(peer_addrs: PeerAddrs, peer_names: PeerRegistry) -> Client {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<Cmd>();
+        Client {
+            cmd_tx,
+            thread: Mutex::new(None),
+            shared: Arc::new(Shared {
+                key: [31u8; KEY_LEN],
+                group_id: "group".into(),
+                device_id: "source".into(),
+                device_name: "Source".into(),
+                blob: BlobClient::new("http://127.0.0.1:1").unwrap(),
+                blob_cache: BlobCache::new(),
+                peer_addrs,
+                lan_peers: Arc::new(AtomicUsize::new(0)),
+                lan_peer_names: peer_names,
+                file_receive_dir: Arc::new(std::sync::Mutex::new(None)),
+                received_files: Arc::new(Mutex::new(VecDeque::new())),
+            }),
+        }
+    }
+
+    #[test]
+    fn client_exposes_lan_peer_records_with_device_ids() {
+        let peer_names: PeerRegistry =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        peer_names
+            .lock()
+            .unwrap()
+            .insert("relay:target".into(), ("target".into(), "Target".into()));
+        let peer_addrs: PeerAddrs =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        peer_addrs.lock().unwrap().insert(
+            "relay:target".into(),
+            crate::lan::PeerAddrEntry {
+                device_id: "target".into(),
+                candidates: vec!["127.0.0.1:5555".parse().unwrap()],
+            },
+        );
+        let client = client_for_file_tests(peer_addrs, peer_names);
+
+        let records = client.lan_peer_records();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].device_id, "target");
+        assert_eq!(records[0].display_name, "Target");
+        assert_eq!(records[0].candidate_count, 1);
+    }
+
+    #[tokio::test]
+    async fn client_sends_file_to_peer_device_id() {
+        let root = std::env::temp_dir().join(format!(
+            "clipbridge-client-file-send-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("client-send.txt");
+        std::fs::write(&source, b"from client").unwrap();
+        let destination = root.join("received");
+        std::fs::create_dir_all(&destination).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let receiver = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            crate::lan::receive_file_from_stream(
+                stream,
+                [31u8; KEY_LEN],
+                "target".into(),
+                "Target".into(),
+                destination,
+                crate::file_transfer::FileTransferConfig::default(),
+            )
+            .await
+            .unwrap()
+        });
+
+        let peer_addrs: PeerAddrs =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        peer_addrs.lock().unwrap().insert(
+            "relay:target".into(),
+            crate::lan::PeerAddrEntry {
+                device_id: "target".into(),
+                candidates: vec![addr],
+            },
+        );
+        let client = client_for_file_tests(
+            peer_addrs,
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        );
+
+        let sent = tokio::task::spawn_blocking(move || {
+            client.send_file_to_peer(
+                "target".into(),
+                source.to_string_lossy().into_owned(),
+                Some("text/plain".into()),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let received = receiver.await.unwrap();
+
+        assert_eq!(sent.bytes_sent, 11);
+        assert_eq!(received.file_name, "client-send.txt");
+        assert_eq!(
+            std::fs::read_to_string(received.path).unwrap(),
+            "from client"
+        );
     }
 
     fn lc(addr: &str, prefix_len: u8) -> crate::protocol::LanCandidate {

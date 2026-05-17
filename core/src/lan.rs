@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -32,6 +33,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
 use crate::crypto::{decrypt, encrypt, KEY_LEN, NONCE_LEN};
+use crate::file_transfer::{
+    FileOffer, FileTransferConfig, FileTransferError, IncomingFileWriter, OutgoingFile,
+    ReceivedFile, SendFileRequest, SentFile,
+};
 use crate::protocol::{ClipPayload, LanCandidate};
 
 const SERVICE_TYPE: &str = "_clipbridge._tcp.local.";
@@ -40,6 +45,7 @@ const PROTO_VERSION: u32 = 1;
 /// v1 (only the metadata sidecar inside `ClipPayload`), so 1 MiB is more
 /// than enough for any text clip plus its envelope.
 const FRAME_MAX: usize = 1024 * 1024;
+pub const MAX_FILE_CHUNK_BYTES: usize = 512 * 1024;
 /// Hard cap on the broadcast channel — if a peer is wedged we'd rather
 /// drop a clip on the LAN side than back-pressure the sender. The relay
 /// path will still deliver it.
@@ -100,7 +106,9 @@ enum LanMessage {
     /// address). Old peers that don't know this variant fail JSON parse
     /// and drop only that throwaway connection — the requester then falls
     /// back to the relay, so the optimization degrades safely.
-    BlobRequest { sha256_hex: String },
+    BlobRequest {
+        sha256_hex: String,
+    },
     /// One slice of the requested ciphertext. `last == true` marks the
     /// final chunk (an empty `data` with `last` is valid for a 0-byte
     /// blob, though images never are).
@@ -112,7 +120,32 @@ enum LanMessage {
     /// The serving peer doesn't have `sha256_hex` cached. Requester aborts
     /// immediately and falls back to the relay rather than waiting out a
     /// timeout.
-    BlobMiss { sha256_hex: String },
+    BlobMiss {
+        sha256_hex: String,
+    },
+    FileOffer {
+        offer: FileOffer,
+    },
+    FileAccept {
+        transfer_id: String,
+    },
+    FileReject {
+        transfer_id: String,
+        reason: String,
+    },
+    FileChunk {
+        transfer_id: String,
+        offset: u64,
+        #[serde(with = "b64")]
+        data: Vec<u8>,
+    },
+    FileComplete {
+        transfer_id: String,
+    },
+    FileCancel {
+        transfer_id: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -146,15 +179,94 @@ mod b64 {
     }
 }
 
-/// mDNS instance `fullname` → dialable addresses for every group peer
-/// resolved, in *both* directions (unlike `known_peers`, which the
-/// control-link tiebreak only populates on the larger-id side). The
-/// blob-fetch path is symmetric — a receiver pulls bytes from whoever has
-/// them regardless of who dials the control link — so it needs addresses
-/// cached on every node. Keyed by fullname (not did) so a device's
-/// multiple processes stay distinct and `ServiceRemoved` can purge the
-/// exact instance that went away.
-pub type PeerAddrs = Arc<std::sync::Mutex<HashMap<String, Vec<SocketAddr>>>>;
+/// One resolved LAN address set for a peer instance. The key in
+/// [`PeerAddrs`] remains the mDNS fullname or `relay:<device_id>` namespace,
+/// while this value carries the stable logical device id needed by file
+/// transfer UI and targeted dialing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAddrEntry {
+    pub device_id: String,
+    pub candidates: Vec<SocketAddr>,
+}
+
+/// Stable peer record for UI target selection.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LanPeerRecord {
+    pub device_id: String,
+    pub display_name: String,
+    pub candidate_count: u32,
+}
+
+/// mDNS instance `fullname` / relay namespace → dialable addresses for
+/// every group peer resolved, in *both* directions (unlike `known_peers`,
+/// which the control-link tiebreak only populates on the larger-id side).
+/// The blob/file paths are symmetric — a receiver pulls or sends bytes
+/// from/to whoever has candidates regardless of who dials the control link.
+pub type PeerAddrs = Arc<std::sync::Mutex<HashMap<String, PeerAddrEntry>>>;
+pub type SharedFileReceiveDir = Arc<std::sync::Mutex<Option<PathBuf>>>;
+
+/// Snapshot stable peer records with one row per logical device.
+pub fn peer_records(peers: &PeerRegistry, addrs: &PeerAddrs) -> Vec<LanPeerRecord> {
+    let mut names: HashMap<String, String> = HashMap::new();
+    if let Ok(g) = peers.lock() {
+        let mut entries: Vec<_> = g.iter().collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (_, (did, name)) in entries {
+            names.entry(did.clone()).or_insert_with(|| name.clone());
+        }
+    }
+
+    let mut by_device: HashMap<String, (String, u32)> = HashMap::new();
+    if let Ok(g) = addrs.lock() {
+        for entry in g.values() {
+            let display_name = names
+                .get(&entry.device_id)
+                .cloned()
+                .unwrap_or_else(|| short_id(&entry.device_id));
+            let rec = by_device
+                .entry(entry.device_id.clone())
+                .or_insert((display_name, 0));
+            rec.1 = rec.1.saturating_add(entry.candidates.len() as u32);
+        }
+    }
+
+    for (did, name) in names {
+        by_device.entry(did).or_insert((name, 0));
+    }
+
+    let mut out: Vec<LanPeerRecord> = by_device
+        .into_iter()
+        .map(
+            |(device_id, (display_name, candidate_count))| LanPeerRecord {
+                device_id,
+                display_name,
+                candidate_count,
+            },
+        )
+        .collect();
+    out.sort_by(|a, b| {
+        a.display_name
+            .cmp(&b.display_name)
+            .then_with(|| a.device_id.cmp(&b.device_id))
+    });
+    out
+}
+
+pub fn candidates_for_peer(addrs: &PeerAddrs, device_id: &str) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    if let Ok(g) = addrs.lock() {
+        for entry in g.values() {
+            if entry.device_id == device_id {
+                for cand in &entry.candidates {
+                    if !out.contains(cand) {
+                        out.push(*cand);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
 
 /// Bounded in-memory cache of group-key ciphertext keyed by
 /// sha256(ciphertext) — the same address the relay blob endpoint uses.
@@ -375,6 +487,8 @@ pub enum LanError {
     Io(#[from] std::io::Error),
     #[error("mdns: {0}")]
     Mdns(String),
+    #[error("file transfer: {0}")]
+    FileTransfer(#[from] FileTransferError),
 }
 
 impl From<mdns_sd::Error> for LanError {
@@ -476,6 +590,8 @@ pub(crate) struct LanNodeConfig {
     pub peers: PeerRegistry,
     pub blob_cache: SharedBlobCache,
     pub peer_addrs: PeerAddrs,
+    pub file_receive_dir: SharedFileReceiveDir,
+    pub file_inbound: mpsc::UnboundedSender<ReceivedFile>,
 }
 
 impl LanNode {
@@ -498,6 +614,8 @@ impl LanNode {
             peers,
             blob_cache,
             peer_addrs,
+            file_receive_dir,
+            file_inbound,
         } = config;
 
         let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
@@ -579,6 +697,8 @@ impl LanNode {
             let peer_count = peer_count.clone();
             let peers = peers.clone();
             let blob_cache = blob_cache.clone();
+            let file_receive_dir = file_receive_dir.clone();
+            let file_inbound = file_inbound.clone();
             tokio::spawn(async move {
                 loop {
                     let (stream, addr) = match listener.accept().await {
@@ -596,6 +716,8 @@ impl LanNode {
                     let peer_count = peer_count.clone();
                     let peers = peers.clone();
                     let blob_cache = blob_cache.clone();
+                    let file_receive_dir = file_receive_dir.clone();
+                    let file_inbound = file_inbound.clone();
                     let registry_key = format!("inbound:{addr}");
                     tokio::spawn(async move {
                         let peer = PeerRunContext {
@@ -609,6 +731,8 @@ impl LanNode {
                             peers,
                             blob_cache,
                             registry_key,
+                            file_receive_dir,
+                            file_inbound,
                         };
                         if let Err(e) = run_peer(stream, addr, peer).await {
                             tracing::debug!(?e, %addr, "lan peer (inbound) ended");
@@ -672,7 +796,13 @@ impl LanNode {
                             // `ServiceRemoved` — which only carries the
                             // fullname — can purge the right one.
                             if let Ok(mut a) = peer_addrs.lock() {
-                                a.insert(fullname.clone(), candidates.clone());
+                                a.insert(
+                                    fullname.clone(),
+                                    PeerAddrEntry {
+                                        device_id: peer_did.to_string(),
+                                        candidates: candidates.clone(),
+                                    },
+                                );
                             }
                             // Lexicographic tiebreak: only the side with the
                             // larger device_id initiates the *control* link.
@@ -725,6 +855,8 @@ impl LanNode {
             let known_peers = known_peers.clone();
             let blob_cache = blob_cache.clone();
             let reconcile_notify = reconcile_notify.clone();
+            let file_receive_dir = file_receive_dir.clone();
+            let file_inbound = file_inbound.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(RECONNECT_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -757,6 +889,8 @@ impl LanNode {
                         let peer_count = peer_count.clone();
                         let peers_for_run = peers.clone();
                         let blob_cache = blob_cache.clone();
+                        let file_receive_dir = file_receive_dir.clone();
+                        let file_inbound = file_inbound.clone();
                         let registry_key = fullname.clone();
                         let peer_did_owned = kp.peer_did.clone();
                         let candidates = kp.candidates.clone();
@@ -772,6 +906,8 @@ impl LanNode {
                                 peers: peers_for_run,
                                 blob_cache,
                                 registry_key,
+                                file_receive_dir,
+                                file_inbound,
                             };
                             let res = dial_and_run(candidates, peer).await;
                             if let Err(e) = res {
@@ -918,7 +1054,7 @@ impl Drop for PeerSessionGuard {
 fn apply_relay_snapshot(
     self_device_id: &str,
     peers: Vec<crate::protocol::LanPeer>,
-    peer_addrs: &mut HashMap<String, Vec<SocketAddr>>,
+    peer_addrs: &mut HashMap<String, PeerAddrEntry>,
     known_peers: &mut HashMap<String, KnownPeer>,
 ) {
     // device_id -> dialable candidates, parsed & filtered.
@@ -944,7 +1080,13 @@ fn apply_relay_snapshot(
 
     peer_addrs.retain(|k, _| !k.starts_with("relay:"));
     for (did, cands) in &desired {
-        peer_addrs.insert(format!("relay:{did}"), cands.clone());
+        peer_addrs.insert(
+            format!("relay:{did}"),
+            PeerAddrEntry {
+                device_id: did.clone(),
+                candidates: cands.clone(),
+            },
+        );
     }
 
     known_peers.retain(|k, _| !k.starts_with("relay:"));
@@ -978,6 +1120,8 @@ struct PeerRunContext {
     peers: PeerRegistry,
     blob_cache: SharedBlobCache,
     registry_key: String,
+    file_receive_dir: SharedFileReceiveDir,
+    file_inbound: mpsc::UnboundedSender<ReceivedFile>,
 }
 
 /// Try each candidate address in order with a short per-attempt timeout,
@@ -1023,6 +1167,8 @@ async fn run_peer(
         peers,
         blob_cache,
         registry_key,
+        file_receive_dir,
+        file_inbound,
     } = peer;
 
     let _ = stream.set_nodelay(true);
@@ -1086,6 +1232,37 @@ async fn run_peer(
         match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader, &key)).await {
             Ok(Ok(Some(LanMessage::BlobRequest { sha256_hex }))) => {
                 return serve_blob(&mut writer, &key, &blob_cache, &sha256_hex).await;
+            }
+            Ok(Ok(Some(LanMessage::FileOffer { offer }))) => {
+                let receive_dir = file_receive_dir
+                    .lock()
+                    .ok()
+                    .and_then(|dir| dir.as_ref().cloned());
+                let Some(receive_dir) = receive_dir else {
+                    reject_file_offer(
+                        &mut writer,
+                        &key,
+                        &offer.transfer_id,
+                        "file receiving is not enabled",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                let received = receive_offered_file(
+                    &mut reader,
+                    &mut writer,
+                    offer,
+                    ReceiveOfferContext {
+                        key: &key,
+                        self_device_id: &self_device_id,
+                        peer_device_id: &peer_did,
+                        destination_dir: receive_dir,
+                        config: FileTransferConfig::default(),
+                    },
+                )
+                .await?;
+                let _ = file_inbound.send(received);
+                return Ok(());
             }
             Ok(Ok(Some(other))) => Some(other),
             Ok(Ok(None)) => return Ok(()), // peer closed right after Hello
@@ -1196,9 +1373,15 @@ async fn run_peer(
                     }
                     Some(LanMessage::BlobRequest { .. })
                     | Some(LanMessage::BlobChunk { .. })
-                    | Some(LanMessage::BlobMiss { .. }) => {
-                        // Blob traffic only ever rides a dedicated, freshly
-                        // classified connection (see above). Seeing it on an
+                    | Some(LanMessage::BlobMiss { .. })
+                    | Some(LanMessage::FileOffer { .. })
+                    | Some(LanMessage::FileAccept { .. })
+                    | Some(LanMessage::FileReject { .. })
+                    | Some(LanMessage::FileChunk { .. })
+                    | Some(LanMessage::FileComplete { .. })
+                    | Some(LanMessage::FileCancel { .. }) => {
+                        // Bulk-transfer traffic only ever rides a dedicated,
+                        // freshly classified connection. Seeing it on an
                         // established control link means a buggy/old/hostile
                         // peer — ignore rather than tear down clip sync.
                     }
@@ -1206,6 +1389,382 @@ async fn run_peer(
                 }
             }
         }
+    }
+}
+
+pub async fn send_file_to_stream(
+    stream: TcpStream,
+    key: [u8; KEY_LEN],
+    request: SendFileRequest,
+) -> Result<SentFile, LanError> {
+    let SendFileRequest {
+        source_device_id,
+        source_device_name,
+        target_device_id,
+        source_path,
+        mime_type,
+        config,
+    } = request;
+    let mut outgoing = OutgoingFile::open(
+        source_device_id.clone(),
+        target_device_id.clone(),
+        &source_path,
+        mime_type,
+        config,
+    )?;
+    let offer = outgoing.offer.clone();
+
+    let _ = stream.set_nodelay(true);
+    let (mut reader, mut writer) = stream.into_split();
+    write_hello(&mut writer, &key, &source_device_id, &source_device_name).await?;
+    let (peer_device_id, _) = read_hello(&mut reader, &key).await?;
+    if peer_device_id != target_device_id {
+        return Err(FileTransferError::PeerMismatch {
+            expected: target_device_id,
+            got: peer_device_id,
+        }
+        .into());
+    }
+
+    write_frame(
+        &mut writer,
+        &key,
+        &LanMessage::FileOffer {
+            offer: offer.clone(),
+        },
+    )
+    .await?;
+
+    loop {
+        match read_frame(&mut reader, &key).await? {
+            Some(LanMessage::FileAccept { transfer_id }) if transfer_id == offer.transfer_id => {
+                break;
+            }
+            Some(LanMessage::FileReject { reason, .. }) => {
+                return Err(FileTransferError::Rejected { reason }.into());
+            }
+            Some(LanMessage::Ping) | Some(LanMessage::Hello { .. }) => continue,
+            Some(other) => {
+                return Err(FileTransferError::UnexpectedFrame {
+                    frame: frame_label(&other).into(),
+                }
+                .into());
+            }
+            None => {
+                return Err(FileTransferError::Canceled {
+                    reason: "peer closed before accepting file offer".into(),
+                }
+                .into());
+            }
+        }
+    }
+
+    let mut offset = 0u64;
+    let mut buf = Vec::new();
+    loop {
+        let read = outgoing.read_chunk(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        write_frame(
+            &mut writer,
+            &key,
+            &LanMessage::FileChunk {
+                transfer_id: offer.transfer_id.clone(),
+                offset,
+                data: buf.clone(),
+            },
+        )
+        .await?;
+        offset += read as u64;
+    }
+    write_frame(
+        &mut writer,
+        &key,
+        &LanMessage::FileComplete {
+            transfer_id: offer.transfer_id.clone(),
+        },
+    )
+    .await?;
+
+    Ok(SentFile {
+        transfer_id: offer.transfer_id,
+        file_name: offer.file_name,
+        bytes_sent: offset,
+        sha256_hex: offer.sha256_hex,
+    })
+}
+
+async fn send_file_to_candidates(
+    candidates: &[SocketAddr],
+    key: [u8; KEY_LEN],
+    request: SendFileRequest,
+) -> Result<SentFile, LanError> {
+    let mut connected: Option<TcpStream> = None;
+    for cand in candidates {
+        match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(cand)).await {
+            Ok(Ok(s)) => {
+                connected = Some(s);
+                break;
+            }
+            Ok(Err(e)) => tracing::debug!(?e, %cand, "file transfer dial failed, trying next"),
+            Err(_) => tracing::debug!(%cand, "file transfer dial timed out, trying next"),
+        }
+    }
+    let stream = connected.ok_or_else(|| {
+        LanError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "no advertised address was reachable for file transfer",
+        ))
+    })?;
+    send_file_to_stream(stream, key, request).await
+}
+
+pub fn lan_send_file(
+    candidates: Vec<SocketAddr>,
+    key: [u8; KEY_LEN],
+    request: SendFileRequest,
+) -> Result<SentFile, LanError> {
+    if candidates.is_empty() {
+        return Err(LanError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no LAN candidates for file transfer",
+        )));
+    }
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(send_file_to_candidates(&candidates, key, request))
+    })
+    .join()
+    .map_err(|_| {
+        LanError::Io(std::io::Error::other(
+            "file transfer worker thread panicked",
+        ))
+    })?
+}
+
+pub async fn receive_file_from_stream(
+    stream: TcpStream,
+    key: [u8; KEY_LEN],
+    self_device_id: String,
+    self_device_name: String,
+    destination_dir: PathBuf,
+    config: FileTransferConfig,
+) -> Result<ReceivedFile, LanError> {
+    let _ = stream.set_nodelay(true);
+    let (mut reader, mut writer) = stream.into_split();
+    write_hello(&mut writer, &key, &self_device_id, &self_device_name).await?;
+    let (peer_device_id, _) = read_hello(&mut reader, &key).await?;
+
+    let offer = match read_frame(&mut reader, &key).await? {
+        Some(LanMessage::FileOffer { offer }) => offer,
+        Some(other) => {
+            return Err(FileTransferError::UnexpectedFrame {
+                frame: frame_label(&other).into(),
+            }
+            .into());
+        }
+        None => {
+            return Err(FileTransferError::Canceled {
+                reason: "peer closed before sending file offer".into(),
+            }
+            .into());
+        }
+    };
+
+    receive_offered_file(
+        &mut reader,
+        &mut writer,
+        offer,
+        ReceiveOfferContext {
+            key: &key,
+            self_device_id: &self_device_id,
+            peer_device_id: &peer_device_id,
+            destination_dir,
+            config,
+        },
+    )
+    .await
+}
+
+struct ReceiveOfferContext<'a> {
+    key: &'a [u8; KEY_LEN],
+    self_device_id: &'a str,
+    peer_device_id: &'a str,
+    destination_dir: PathBuf,
+    config: FileTransferConfig,
+}
+
+async fn receive_offered_file<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    offer: FileOffer,
+    ctx: ReceiveOfferContext<'_>,
+) -> Result<ReceivedFile, LanError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let ReceiveOfferContext {
+        key,
+        self_device_id,
+        peer_device_id,
+        destination_dir,
+        config,
+    } = ctx;
+    if offer.target_device_id != self_device_id {
+        let reason = "file offer targeted a different device".to_string();
+        reject_file_offer(writer, key, &offer.transfer_id, &reason).await?;
+        return Err(FileTransferError::PeerMismatch {
+            expected: self_device_id.to_string(),
+            got: offer.target_device_id,
+        }
+        .into());
+    }
+    if offer.source_device_id != peer_device_id {
+        let reason = "file offer source did not match handshake".to_string();
+        reject_file_offer(writer, key, &offer.transfer_id, &reason).await?;
+        return Err(FileTransferError::PeerMismatch {
+            expected: peer_device_id.to_string(),
+            got: offer.source_device_id,
+        }
+        .into());
+    }
+
+    let mut incoming = match IncomingFileWriter::accept(offer.clone(), &destination_dir, config) {
+        Ok(writer) => writer,
+        Err(e) => {
+            let reason = e.to_string();
+            reject_file_offer(writer, key, &offer.transfer_id, &reason).await?;
+            return Err(e.into());
+        }
+    };
+    write_frame(
+        writer,
+        key,
+        &LanMessage::FileAccept {
+            transfer_id: offer.transfer_id.clone(),
+        },
+    )
+    .await?;
+
+    loop {
+        match read_frame(reader, key).await? {
+            Some(LanMessage::FileChunk {
+                transfer_id,
+                offset,
+                data,
+            }) if transfer_id == incoming.transfer_id() => {
+                if let Err(e) = incoming.write_chunk(offset, &data) {
+                    let reason = e.to_string();
+                    let _ = write_frame(
+                        writer,
+                        key,
+                        &LanMessage::FileCancel {
+                            transfer_id,
+                            reason,
+                        },
+                    )
+                    .await;
+                    return Err(e.into());
+                }
+            }
+            Some(LanMessage::FileComplete { transfer_id })
+                if transfer_id == incoming.transfer_id() =>
+            {
+                return incoming.finish().map_err(Into::into);
+            }
+            Some(LanMessage::FileCancel { reason, .. }) => {
+                return Err(FileTransferError::Canceled { reason }.into());
+            }
+            Some(other) => {
+                return Err(FileTransferError::UnexpectedFrame {
+                    frame: frame_label(&other).into(),
+                }
+                .into());
+            }
+            None => {
+                return Err(FileTransferError::Canceled {
+                    reason: "peer closed before file transfer completed".into(),
+                }
+                .into());
+            }
+        }
+    }
+}
+
+async fn write_hello<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    key: &[u8; KEY_LEN],
+    device_id: &str,
+    device_name: &str,
+) -> Result<(), LanError> {
+    write_frame(
+        writer,
+        key,
+        &LanMessage::Hello {
+            device_id: device_id.to_string(),
+            version: PROTO_VERSION,
+            device_name: device_name.to_string(),
+        },
+    )
+    .await
+}
+
+async fn read_hello<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    key: &[u8; KEY_LEN],
+) -> Result<(String, String), LanError> {
+    match read_frame(reader, key).await? {
+        Some(LanMessage::Hello {
+            device_id,
+            device_name,
+            ..
+        }) => Ok((device_id, device_name)),
+        Some(other) => Err(FileTransferError::UnexpectedFrame {
+            frame: frame_label(&other).into(),
+        }
+        .into()),
+        None => Err(FileTransferError::Canceled {
+            reason: "peer closed during hello handshake".into(),
+        }
+        .into()),
+    }
+}
+
+async fn reject_file_offer<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    key: &[u8; KEY_LEN],
+    transfer_id: &str,
+    reason: &str,
+) -> Result<(), LanError> {
+    write_frame(
+        writer,
+        key,
+        &LanMessage::FileReject {
+            transfer_id: transfer_id.to_string(),
+            reason: reason.to_string(),
+        },
+    )
+    .await
+}
+
+fn frame_label(msg: &LanMessage) -> &'static str {
+    match msg {
+        LanMessage::Hello { .. } => "hello",
+        LanMessage::Clip { .. } => "clip",
+        LanMessage::Ping => "ping",
+        LanMessage::BlobRequest { .. } => "blob_request",
+        LanMessage::BlobChunk { .. } => "blob_chunk",
+        LanMessage::BlobMiss { .. } => "blob_miss",
+        LanMessage::FileOffer { .. } => "file_offer",
+        LanMessage::FileAccept { .. } => "file_accept",
+        LanMessage::FileReject { .. } => "file_reject",
+        LanMessage::FileChunk { .. } => "file_chunk",
+        LanMessage::FileComplete { .. } => "file_complete",
+        LanMessage::FileCancel { .. } => "file_cancel",
     }
 }
 
@@ -1320,7 +1879,13 @@ async fn fetch_blob(
             Ok(Ok(Some(LanMessage::Ping)))
             | Ok(Ok(Some(LanMessage::Hello { .. })))
             | Ok(Ok(Some(LanMessage::Clip { .. }))) => continue,
-            Ok(Ok(Some(LanMessage::BlobRequest { .. }))) => return None,
+            Ok(Ok(Some(LanMessage::BlobRequest { .. })))
+            | Ok(Ok(Some(LanMessage::FileOffer { .. })))
+            | Ok(Ok(Some(LanMessage::FileAccept { .. })))
+            | Ok(Ok(Some(LanMessage::FileReject { .. })))
+            | Ok(Ok(Some(LanMessage::FileChunk { .. })))
+            | Ok(Ok(Some(LanMessage::FileComplete { .. })))
+            | Ok(Ok(Some(LanMessage::FileCancel { .. }))) => return None,
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return None,
         }
     }
@@ -1527,7 +2092,7 @@ mod tests {
 
     #[test]
     fn relay_snapshot_tiebreak_and_peer_addrs() {
-        let mut pa: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+        let mut pa: HashMap<String, PeerAddrEntry> = HashMap::new();
         let mut kp: HashMap<String, KnownPeer> = HashMap::new();
 
         // self = "dev-m". Peer "dev-a" < self -> we initiate (in
@@ -1556,7 +2121,7 @@ mod tests {
 
     #[test]
     fn relay_snapshot_purges_departed_and_keeps_mdns() {
-        let mut pa: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+        let mut pa: HashMap<String, PeerAddrEntry> = HashMap::new();
         let mut kp: HashMap<String, KnownPeer> = HashMap::new();
         // Pre-existing mDNS entry (non-relay key) must survive.
         kp.insert(
@@ -1568,7 +2133,10 @@ mod tests {
         );
         pa.insert(
             "Mac._clipbridge._tcp.local.".into(),
-            vec!["192.168.1.50:7000".parse().unwrap()],
+            PeerAddrEntry {
+                device_id: "dev-mdns".into(),
+                candidates: vec!["192.168.1.50:7000".parse().unwrap()],
+            },
         );
 
         apply_relay_snapshot(
@@ -1594,7 +2162,7 @@ mod tests {
 
     #[test]
     fn relay_snapshot_skips_peer_already_known_via_mdns() {
-        let mut pa: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+        let mut pa: HashMap<String, PeerAddrEntry> = HashMap::new();
         let mut kp: HashMap<String, KnownPeer> = HashMap::new();
         kp.insert(
             "A._clipbridge._tcp.local.".into(),
@@ -1618,7 +2186,7 @@ mod tests {
 
     #[test]
     fn relay_snapshot_drops_unroutable_and_unparseable() {
-        let mut pa: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+        let mut pa: HashMap<String, PeerAddrEntry> = HashMap::new();
         let mut kp: HashMap<String, KnownPeer> = HashMap::new();
         apply_relay_snapshot(
             "dev-m",
@@ -1631,6 +2199,52 @@ mod tests {
         );
         assert!(pa.is_empty(), "no usable candidates -> nothing added");
         assert!(kp.is_empty());
+    }
+
+    #[test]
+    fn peer_records_dedupe_by_device_id_and_keep_candidates() {
+        let peers: PeerRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        peers.lock().unwrap().insert(
+            "Mac._clipbridge._tcp.local.".into(),
+            ("dev-a".into(), "Mac".into()),
+        );
+        peers.lock().unwrap().insert(
+            "inbound:127.0.0.1:5555".into(),
+            ("dev-a".into(), "Mac duplicate".into()),
+        );
+        peers
+            .lock()
+            .unwrap()
+            .insert("relay:dev-b".into(), ("dev-b".into(), "Android".into()));
+
+        let addrs: PeerAddrs = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        addrs.lock().unwrap().insert(
+            "Mac._clipbridge._tcp.local.".into(),
+            PeerAddrEntry {
+                device_id: "dev-a".into(),
+                candidates: vec!["192.168.1.20:5000".parse().unwrap()],
+            },
+        );
+        addrs.lock().unwrap().insert(
+            "relay:dev-b".into(),
+            PeerAddrEntry {
+                device_id: "dev-b".into(),
+                candidates: vec!["192.168.1.30:5000".parse().unwrap()],
+            },
+        );
+
+        let records = peer_records(&peers, &addrs);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].device_id, "dev-b");
+        assert_eq!(records[0].display_name, "Android");
+        assert_eq!(records[0].candidate_count, 1);
+        assert_eq!(records[1].device_id, "dev-a");
+        assert_eq!(records[1].display_name, "Mac");
+        assert_eq!(
+            candidates_for_peer(&addrs, "dev-a"),
+            vec!["192.168.1.20:5000".parse().unwrap()]
+        );
     }
 
     #[test]
@@ -1741,6 +2355,76 @@ mod tests {
         assert_eq!(got, None);
     }
 
+    #[tokio::test]
+    async fn run_peer_classifies_file_offer_and_reports_received_file() {
+        let key = [17u8; KEY_LEN];
+        let root =
+            std::env::temp_dir().join(format!("clipbridge-run-peer-file-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("run-peer.txt");
+        std::fs::write(&source, b"via run_peer").unwrap();
+        let destination = root.join("received");
+        std::fs::create_dir_all(&destination).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (clip_tx, _clip_rx) = mpsc::unbounded_channel::<IncomingLanClip>();
+        let (file_tx, mut file_rx) = mpsc::unbounded_channel::<ReceivedFile>();
+        let file_receive_dir = Arc::new(std::sync::Mutex::new(Some(destination)));
+        let server = tokio::spawn({
+            let file_receive_dir = file_receive_dir.clone();
+            async move {
+                let (stream, peer_addr) = listener.accept().await.unwrap();
+                let peer = PeerRunContext {
+                    key,
+                    self_device_id: "target".into(),
+                    self_device_name: "Target".into(),
+                    inbound: clip_tx,
+                    out_rx: broadcast::channel::<OutgoingLan>(1).1,
+                    expected_peer: Some("source".into()),
+                    peer_count: Arc::new(AtomicUsize::new(0)),
+                    peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    blob_cache: BlobCache::new(),
+                    registry_key: "test".into(),
+                    file_receive_dir,
+                    file_inbound: file_tx,
+                };
+                run_peer(stream, peer_addr, peer).await.unwrap();
+            }
+        });
+
+        let sent = tokio::task::spawn_blocking(move || {
+            lan_send_file(
+                vec![addr],
+                key,
+                SendFileRequest {
+                    source_device_id: "source".into(),
+                    source_device_name: "Source".into(),
+                    target_device_id: "target".into(),
+                    source_path: source,
+                    mime_type: Some("text/plain".into()),
+                    config: FileTransferConfig::default(),
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), file_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(sent.bytes_sent, 12);
+        assert_eq!(received.file_name, "run-peer.txt");
+        assert_eq!(
+            std::fs::read_to_string(received.path).unwrap(),
+            "via run_peer"
+        );
+    }
+
     /// Two nodes on localhost discover each other via mDNS and exchange
     /// one clip. Marked `#[ignore]` because:
     ///   - macOS requires per-binary "Local Network" privacy permission;
@@ -1767,6 +2451,8 @@ mod tests {
 
         let (a_tx, mut a_rx) = mpsc::unbounded_channel::<IncomingLanClip>();
         let (b_tx, mut b_rx) = mpsc::unbounded_channel::<IncomingLanClip>();
+        let (a_file_tx, _a_file_rx) = mpsc::unbounded_channel::<ReceivedFile>();
+        let (b_file_tx, _b_file_rx) = mpsc::unbounded_channel::<ReceivedFile>();
 
         let count_a = Arc::new(AtomicUsize::new(0));
         let count_b = Arc::new(AtomicUsize::new(0));
@@ -1782,6 +2468,8 @@ mod tests {
             peers: peers_a,
             blob_cache: BlobCache::new(),
             peer_addrs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            file_receive_dir: Arc::new(std::sync::Mutex::new(None)),
+            file_inbound: a_file_tx,
         })
         .await
         .expect("spawn A");
@@ -1795,6 +2483,8 @@ mod tests {
             peers: peers_b,
             blob_cache: BlobCache::new(),
             peer_addrs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            file_receive_dir: Arc::new(std::sync::Mutex::new(None)),
+            file_inbound: b_file_tx,
         })
         .await
         .expect("spawn B");
