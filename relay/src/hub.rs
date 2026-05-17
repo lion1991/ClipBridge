@@ -28,6 +28,7 @@ pub struct Hub {
 /// One rendezvous-capable connection: a client that sent `LanAdvertise`.
 struct RvConn {
     device_id: String,
+    device_name: String,
     candidates: Vec<String>,
     candidate_networks: Vec<LanCandidate>,
     /// Per-connection mailbox. The connection's ws task drains this and
@@ -114,6 +115,7 @@ impl Hub {
             egress,
             conn_id,
             device_id,
+            device_name,
             candidates,
             candidate_networks,
             tx,
@@ -124,6 +126,7 @@ impl Hub {
             conn_id,
             RvConn {
                 device_id,
+                device_name,
                 candidates,
                 candidate_networks,
                 tx,
@@ -159,6 +162,7 @@ pub(crate) struct RendezvousUpdate {
     pub egress: IpAddr,
     pub conn_id: u64,
     pub device_id: String,
+    pub device_name: String,
     pub candidates: Vec<String>,
     pub candidate_networks: Vec<LanCandidate>,
     pub tx: mpsc::UnboundedSender<Vec<LanPeer>>,
@@ -194,6 +198,7 @@ fn push_egress(p: &HashMap<IpAddr, HashMap<u64, RvConn>>, egress: IpAddr) {
                 let candidates = candidates_for_receiver(c, peer);
                 (!candidates.is_empty()).then_some(LanPeer {
                     device_id: did.to_string(),
+                    device_name: peer.device_name.clone(),
                     candidates,
                 })
             })
@@ -359,6 +364,7 @@ mod tests {
             egress,
             conn_id,
             device_id: device_id.into(),
+            device_name: device_id.into(),
             candidates,
             candidate_networks,
             tx,
@@ -382,6 +388,7 @@ mod tests {
         let b_sees = b_rx.recv().await.unwrap();
         assert_eq!(b_sees.len(), 1);
         assert_eq!(b_sees[0].device_id, "A");
+        assert_eq!(b_sees[0].device_name, "A");
         assert_eq!(b_sees[0].candidates, vec!["1.1.1.1:10".to_string()]);
 
         let a_sees = a_rx.recv().await.unwrap();
@@ -453,6 +460,31 @@ mod tests {
         let d_entries: Vec<_> = snap.iter().filter(|p| p.device_id == "D").collect();
         assert_eq!(d_entries.len(), 1, "duplicate device_id must collapse");
         assert_eq!(d_entries[0].candidates, vec!["new:130".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn rendezvous_snapshots_forward_device_names() {
+        let hub = Hub::new();
+        let egress = ip(1);
+
+        let (a_tx, mut a_rx) = mpsc::unbounded_channel();
+        let mut a = rv("g", egress, 1, "dev-a", vec!["1.1.1.1:10".into()], a_tx);
+        a.device_name = "MacBook Pro".into();
+        hub.rendezvous_upsert(a);
+        let _ = a_rx.recv().await;
+
+        let (b_tx, mut b_rx) = mpsc::unbounded_channel();
+        let mut b = rv("g", egress, 2, "dev-b", vec!["2.2.2.2:20".into()], b_tx);
+        b.device_name = "SM-S9380".into();
+        hub.rendezvous_upsert(b);
+
+        let b_sees = b_rx.recv().await.unwrap();
+        assert_eq!(b_sees[0].device_id, "dev-a");
+        assert_eq!(b_sees[0].device_name, "MacBook Pro");
+
+        let a_sees = a_rx.recv().await.unwrap();
+        assert_eq!(a_sees[0].device_id, "dev-b");
+        assert_eq!(a_sees[0].device_name, "SM-S9380");
     }
 
     fn lc(addr: &str, prefix_len: u8) -> LanCandidate {

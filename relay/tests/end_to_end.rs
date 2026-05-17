@@ -260,6 +260,7 @@ async fn lan_advertise_requires_joined_group_and_device() {
         &ClientMessage::LanAdvertise {
             group_id: group_id.clone(),
             device_id: "intruder".into(),
+            device_name: "Intruder".into(),
             candidates: vec!["192.168.1.200:5000".into()],
             candidate_networks: vec![],
         },
@@ -282,6 +283,7 @@ async fn lan_advertise_requires_joined_group_and_device() {
         &ClientMessage::LanAdvertise {
             group_id: "other-group".into(),
             device_id: "joined-device".into(),
+            device_name: "Joined".into(),
             candidates: vec!["192.168.1.201:5000".into()],
             candidate_networks: vec![],
         },
@@ -294,6 +296,7 @@ async fn lan_advertise_requires_joined_group_and_device() {
         &ClientMessage::LanAdvertise {
             group_id,
             device_id: "different-device".into(),
+            device_name: "Different".into(),
             candidates: vec!["192.168.1.202:5000".into()],
             candidate_networks: vec![],
         },
@@ -328,6 +331,7 @@ async fn rendezvous_introduces_same_egress_peers() {
         &ClientMessage::LanAdvertise {
             group_id: group_id.clone(),
             device_id: "A".into(),
+            device_name: "Device A".into(),
             candidates: vec!["192.168.1.10:5000".into()],
             candidate_networks: vec![],
         },
@@ -347,6 +351,7 @@ async fn rendezvous_introduces_same_egress_peers() {
         &ClientMessage::LanAdvertise {
             group_id: group_id.clone(),
             device_id: "B".into(),
+            device_name: "Device B".into(),
             candidates: vec!["192.168.1.11:6000".into()],
             candidate_networks: vec![],
         },
@@ -358,6 +363,7 @@ async fn rendezvous_introduces_same_egress_peers() {
         .unwrap();
     assert_eq!(b_sees.len(), 1);
     assert_eq!(b_sees[0].device_id, "A");
+    assert_eq!(b_sees[0].device_name, "Device A");
     assert_eq!(b_sees[0].candidates, vec!["192.168.1.10:5000".to_string()]);
 
     let a_sees = next_lan_peers(&mut a, Duration::from_secs(2))
@@ -365,6 +371,7 @@ async fn rendezvous_introduces_same_egress_peers() {
         .unwrap();
     assert_eq!(a_sees.len(), 1);
     assert_eq!(a_sees[0].device_id, "B");
+    assert_eq!(a_sees[0].device_name, "Device B");
 }
 
 /// Mixed-fleet safety: a client that never sends `LanAdvertise` (an old
@@ -403,6 +410,7 @@ async fn old_client_never_receives_lan_peers() {
         &ClientMessage::LanAdvertise {
             group_id: group_id.clone(),
             device_id: "new".into(),
+            device_name: "New".into(),
             candidates: vec!["192.168.1.20:7000".into()],
             candidate_networks: vec![],
         },

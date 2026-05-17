@@ -31,7 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // via mDNS, "仅中继" otherwise. Refreshed by `transportTimer`.
         menu.addItem(NSMenuItem(title: "传输:仅中继", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(makeItem("图片传输…", #selector(showImageTransfer), key: "i"))
+        menu.addItem(makeItem("传输…", #selector(showImageTransfer), key: "i"))
         menu.addItem(makeItem("打开配对窗口…", #selector(showPairing), key: "p"))
         menu.addItem(makeItem("重置配对", #selector(resetPairing), key: ""))
         menu.addItem(NSMenuItem.separator())
@@ -146,7 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 backing: .buffered,
                 defer: false
             )
-            win.title = "ClipBridge · 图片传输"
+            win.title = "ClipBridge · 传输"
             win.isReleasedWhenClosed = false
             win.center()
             imageWindow = win

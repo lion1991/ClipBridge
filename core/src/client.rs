@@ -615,6 +615,7 @@ async fn run(config: ClientRun) {
                 group_id: &group_id,
                 key: &key,
                 device_id: &device_id,
+                device_name: &device_name,
                 listener: &listener,
                 lan: lan.as_deref(),
                 dedup: &dedup,
@@ -744,6 +745,7 @@ struct SessionCtx<'a> {
     group_id: &'a str,
     key: &'a [u8; KEY_LEN],
     device_id: &'a str,
+    device_name: &'a str,
     listener: &'a Arc<dyn ClipListener>,
     lan: Option<&'a LanNode>,
     dedup: &'a Arc<Mutex<DedupCache>>,
@@ -759,6 +761,7 @@ async fn session(
         group_id,
         key,
         device_id,
+        device_name,
         listener,
         lan,
         dedup,
@@ -810,6 +813,7 @@ async fn session(
             let adv = ClientMessage::LanAdvertise {
                 group_id: group_id.to_string(),
                 device_id: device_id.to_string(),
+                device_name: device_name.to_string(),
                 candidates,
                 candidate_networks: candidate_networks.clone(),
             };
@@ -858,6 +862,7 @@ async fn session(
                         let adv = ClientMessage::LanAdvertise {
                             group_id: group_id.to_string(),
                             device_id: device_id.to_string(),
+                            device_name: device_name.to_string(),
                             candidates,
                             candidate_networks: candidate_networks.clone(),
                         };
@@ -1242,6 +1247,7 @@ mod tests {
             "relay:target".into(),
             crate::lan::PeerAddrEntry {
                 device_id: "target".into(),
+                display_name: None,
                 candidates: vec!["127.0.0.1:5555".parse().unwrap()],
             },
         );
@@ -1289,6 +1295,7 @@ mod tests {
             "relay:target".into(),
             crate::lan::PeerAddrEntry {
                 device_id: "target".into(),
+                display_name: None,
                 candidates: vec![addr],
             },
         );

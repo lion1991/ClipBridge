@@ -13,6 +13,15 @@ use futures_util::{SinkExt, StreamExt};
 
 use crate::hub::{sanitize_lan_advertise, Hub, RendezvousUpdate};
 
+fn sanitize_device_name(name: &str) -> String {
+    name.chars()
+        .filter(|ch| !ch.is_control())
+        .take(80)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -98,7 +107,7 @@ async fn handle_socket(socket: WebSocket, hub: Hub, egress: std::net::IpAddr) {
                         let reply = ServerMessage::Recent { clips };
                         let _ = ws_tx.send(Message::Text(serde_json::to_string(&reply).unwrap())).await;
                     }
-                    Ok(ClientMessage::LanAdvertise { group_id, device_id: did, candidates, candidate_networks }) => {
+                    Ok(ClientMessage::LanAdvertise { group_id, device_id: did, device_name, candidates, candidate_networks }) => {
                         let Some(joined_device_id) = device_id.clone() else {
                             let _ = ws_tx.send(Message::Text(serde_json::to_string(&ServerMessage::Error { reason: "join first".into() }).unwrap())).await;
                             continue;
@@ -134,6 +143,7 @@ async fn handle_socket(socket: WebSocket, hub: Hub, egress: std::net::IpAddr) {
                             egress,
                             conn_id,
                             device_id: joined_device_id,
+                            device_name: sanitize_device_name(&device_name),
                             candidates,
                             candidate_networks,
                             tx: rv_tx.clone(),

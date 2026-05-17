@@ -352,7 +352,7 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
-// Initial value and increment amount for handles. 
+// Initial value and increment amount for handles.
 // These ensure that SWIFT handles always have the lowest bit set
 fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
 fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
@@ -457,6 +457,30 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
+
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -517,15 +541,15 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 public protocol ClientProtocol: AnyObject, Sendable {
-    
+
     /**
      * Download the ciphertext for `meta` from the relay and decrypt it
      * with the group key. Blocking; safe to call from a background thread.
      */
     func fetchImage(meta: ImageMeta) throws  -> Data
-    
-    func fetchRecent() throws 
-    
+
+    func fetchRecent() throws
+
     /**
      * Number of LAN peers currently in a fully-handshaked session. The
      * UI polls this every couple of seconds to render a transport badge
@@ -534,7 +558,9 @@ public protocol ClientProtocol: AnyObject, Sendable {
      * permission denied) and we're relay-only.
      */
     func lanPeerCount()  -> UInt32
-    
+
+    func lanPeerRecords()  -> [LanPeerRecord]
+
     /**
      * Snapshot of currently-connected peers' device names, one entry per
      * logical peer (deduped on device_id so a reconnect transient or an
@@ -545,22 +571,42 @@ public protocol ClientProtocol: AnyObject, Sendable {
      * Android shows ["Mac", "iPhone"], the missing edge is Mac↔iPhone.
      */
     func lanPeers()  -> [String]
-    
-    func sendClip(payload: ClipPayload) throws 
-    
+
+    func sendClip(payload: ClipPayload) throws
+
+    func sendFileToPeer(targetDeviceId: String, sourcePath: String, mimeType: String?) throws  -> SentFile
+
     /**
      * Encrypt `image_bytes`, upload the ciphertext to the relay's blob
      * endpoint, then queue a `Publish` carrying the resulting `ImageMeta`.
      * Blocks the calling thread for the duration of the HTTP upload —
      * hosts should call this from a background thread / coroutine.
      */
-    func sendImage(imageBytes: Data, mimeType: String, width: UInt32, height: UInt32, deviceName: String, ts: UInt64) throws 
-    
+    func sendImage(imageBytes: Data, mimeType: String, width: UInt32, height: UInt32, deviceName: String, ts: UInt64) throws
+
+    func setFileReceiveDir(dir: String)
+
+    /**
+     * Tell the worker whether the host currently wants LAN discovery and
+     * peer sessions active. Platforms that never call this keep the default
+     * always-on LAN behavior.
+     */
+    func setLanActive(enabled: Bool)
+
+    /**
+     * Tell the worker whether reconnects are happening while the host is in
+     * a locked / screen-off idle state. Active hosts keep the original
+     * immediate reconnect behavior; idle hosts back off normal reconnects.
+     */
+    func setReconnectIdleMode(enabled: Bool)
+
     /**
      * Signal the worker thread to disconnect and wait for it to finish.
      */
-    func stop() 
-    
+    func stop()
+
+    func takeReceivedFiles()  -> [ReceivedFileRecord]
+
 }
 open class Client: ClientProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -635,9 +681,9 @@ public convenience init(relayUrl: String, groupId: String, key: Data, deviceId: 
         try! rustCall { uniffi_clipbridge_core_fn_free_client(handle, $0) }
     }
 
-    
 
-    
+
+
     /**
      * Download the ciphertext for `meta` from the relay and decrypt it
      * with the group key. Blocking; safe to call from a background thread.
@@ -650,14 +696,14 @@ open func fetchImage(meta: ImageMeta)throws  -> Data  {
     )
 })
 }
-    
+
 open func fetchRecent()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_clipbridge_core_fn_method_client_fetch_recent(
             self.uniffiCloneHandle(),$0
     )
 }
 }
-    
+
     /**
      * Number of LAN peers currently in a fully-handshaked session. The
      * UI polls this every couple of seconds to render a transport badge
@@ -672,7 +718,15 @@ open func lanPeerCount() -> UInt32  {
     )
 })
 }
-    
+
+open func lanPeerRecords() -> [LanPeerRecord]  {
+    return try!  FfiConverterSequenceTypeLanPeerRecord.lift(try! rustCall() {
+    uniffi_clipbridge_core_fn_method_client_lan_peer_records(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
     /**
      * Snapshot of currently-connected peers' device names, one entry per
      * logical peer (deduped on device_id so a reconnect transient or an
@@ -689,7 +743,7 @@ open func lanPeers() -> [String]  {
     )
 })
 }
-    
+
 open func sendClip(payload: ClipPayload)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_clipbridge_core_fn_method_client_send_clip(
             self.uniffiCloneHandle(),
@@ -697,7 +751,18 @@ open func sendClip(payload: ClipPayload)throws   {try rustCallWithError(FfiConve
     )
 }
 }
-    
+
+open func sendFileToPeer(targetDeviceId: String, sourcePath: String, mimeType: String?)throws  -> SentFile  {
+    return try  FfiConverterTypeSentFile_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_clipbridge_core_fn_method_client_send_file_to_peer(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(targetDeviceId),
+        FfiConverterString.lower(sourcePath),
+        FfiConverterOptionString.lower(mimeType),$0
+    )
+})
+}
+
     /**
      * Encrypt `image_bytes`, upload the ciphertext to the relay's blob
      * endpoint, then queue a `Publish` carrying the resulting `ImageMeta`.
@@ -716,7 +781,41 @@ open func sendImage(imageBytes: Data, mimeType: String, width: UInt32, height: U
     )
 }
 }
-    
+
+open func setFileReceiveDir(dir: String)  {try! rustCall() {
+    uniffi_clipbridge_core_fn_method_client_set_file_receive_dir(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(dir),$0
+    )
+}
+}
+
+    /**
+     * Tell the worker whether the host currently wants LAN discovery and
+     * peer sessions active. Platforms that never call this keep the default
+     * always-on LAN behavior.
+     */
+open func setLanActive(enabled: Bool)  {try! rustCall() {
+    uniffi_clipbridge_core_fn_method_client_set_lan_active(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
+
+    /**
+     * Tell the worker whether reconnects are happening while the host is in
+     * a locked / screen-off idle state. Active hosts keep the original
+     * immediate reconnect behavior; idle hosts back off normal reconnects.
+     */
+open func setReconnectIdleMode(enabled: Bool)  {try! rustCall() {
+    uniffi_clipbridge_core_fn_method_client_set_reconnect_idle_mode(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
+
     /**
      * Signal the worker thread to disconnect and wait for it to finish.
      */
@@ -726,9 +825,17 @@ open func stop()  {try! rustCall() {
     )
 }
 }
-    
 
-    
+open func takeReceivedFiles() -> [ReceivedFileRecord]  {
+    return try!  FfiConverterSequenceTypeReceivedFileRecord.lift(try! rustCall() {
+    uniffi_clipbridge_core_fn_method_client_take_received_files(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+
+
 }
 
 
@@ -782,11 +889,11 @@ public func FfiConverterTypeClient_lower(_ value: Client) -> UInt64 {
  * that the host app implements; Rust calls into them on the worker thread.
  */
 public protocol ClipListener: AnyObject, Sendable {
-    
-    func onClip(payload: ClipPayload) 
-    
-    func onState(state: ConnectionState) 
-    
+
+    func onClip(payload: ClipPayload)
+
+    func onState(state: ConnectionState)
+
 }
 /**
  * Foreign-implementable callback. UniFFI generates Swift/Kotlin protocols
@@ -842,9 +949,9 @@ open class ClipListenerImpl: ClipListener, @unchecked Sendable {
         try! rustCall { uniffi_clipbridge_core_fn_free_cliplistener(handle, $0) }
     }
 
-    
 
-    
+
+
 open func onClip(payload: ClipPayload)  {try! rustCall() {
     uniffi_clipbridge_core_fn_method_cliplistener_on_clip(
             self.uniffiCloneHandle(),
@@ -852,7 +959,7 @@ open func onClip(payload: ClipPayload)  {try! rustCall() {
     )
 }
 }
-    
+
 open func onState(state: ConnectionState)  {try! rustCall() {
     uniffi_clipbridge_core_fn_method_cliplistener_on_state(
             self.uniffiCloneHandle(),
@@ -860,9 +967,9 @@ open func onState(state: ConnectionState)  {try! rustCall() {
     )
 }
 }
-    
 
-    
+
+
 }
 
 
@@ -905,7 +1012,7 @@ fileprivate struct UniffiCallbackInterfaceClipListener {
                 )
             }
 
-            
+
             let writeReturn = { () }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
@@ -929,7 +1036,7 @@ fileprivate struct UniffiCallbackInterfaceClipListener {
                 )
             }
 
-            
+
             let writeReturn = { () }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
@@ -1035,11 +1142,11 @@ public struct ClipPayload: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(kind: ClipKind, 
+    public init(kind: ClipKind,
         /**
          * Text content. For non-text kinds this is empty (kept non-optional so
          * the FFI surface stays stable for existing Swift/Kotlin call sites).
-         */content: String, deviceName: String, ts: UInt64, 
+         */content: String, deviceName: String, ts: UInt64,
         /**
          * Present iff `kind == Image`. Carries the metadata needed to fetch
          * and verify the encrypted blob from the relay's blob endpoint.
@@ -1051,9 +1158,9 @@ public struct ClipPayload: Equatable, Hashable {
         self.image = image
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1067,10 +1174,10 @@ public struct FfiConverterTypeClipPayload: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ClipPayload {
         return
             try ClipPayload(
-                kind: FfiConverterTypeClipKind.read(from: &buf), 
-                content: FfiConverterString.read(from: &buf), 
-                deviceName: FfiConverterString.read(from: &buf), 
-                ts: FfiConverterUInt64.read(from: &buf), 
+                kind: FfiConverterTypeClipKind.read(from: &buf),
+                content: FfiConverterString.read(from: &buf),
+                deviceName: FfiConverterString.read(from: &buf),
+                ts: FfiConverterUInt64.read(from: &buf),
                 image: FfiConverterOptionTypeImageMeta.read(from: &buf)
         )
     }
@@ -1129,15 +1236,15 @@ public struct ImageMeta: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(mimeType: String, width: UInt32, height: UInt32, 
+    public init(mimeType: String, width: UInt32, height: UInt32,
         /**
          * Plaintext byte length. Lets the receiver render a placeholder /
          * progress bar before the blob arrives.
-         */sizeBytes: UInt64, 
+         */sizeBytes: UInt64,
         /**
          * Hex-encoded SHA-256 of the *ciphertext* stored in the blob endpoint.
          * Doubles as the blob URL key and a local-cache lookup key.
-         */sha256Hex: String, 
+         */sha256Hex: String,
         /**
          * Random 12-byte nonce used to encrypt the blob, base64-encoded.
          * Required by ChaCha20-Poly1305 — must be unique per encryption.
@@ -1150,9 +1257,9 @@ public struct ImageMeta: Equatable, Hashable {
         self.nonceB64 = nonceB64
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1166,11 +1273,11 @@ public struct FfiConverterTypeImageMeta: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImageMeta {
         return
             try ImageMeta(
-                mimeType: FfiConverterString.read(from: &buf), 
-                width: FfiConverterUInt32.read(from: &buf), 
-                height: FfiConverterUInt32.read(from: &buf), 
-                sizeBytes: FfiConverterUInt64.read(from: &buf), 
-                sha256Hex: FfiConverterString.read(from: &buf), 
+                mimeType: FfiConverterString.read(from: &buf),
+                width: FfiConverterUInt32.read(from: &buf),
+                height: FfiConverterUInt32.read(from: &buf),
+                sizeBytes: FfiConverterUInt64.read(from: &buf),
+                sha256Hex: FfiConverterString.read(from: &buf),
                 nonceB64: FfiConverterString.read(from: &buf)
         )
     }
@@ -1200,11 +1307,200 @@ public func FfiConverterTypeImageMeta_lower(_ value: ImageMeta) -> RustBuffer {
     return FfiConverterTypeImageMeta.lower(value)
 }
 
+
+/**
+ * Stable peer record for UI target selection.
+ */
+public struct LanPeerRecord: Equatable, Hashable {
+    public var deviceId: String
+    public var displayName: String
+    public var candidateCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(deviceId: String, displayName: String, candidateCount: UInt32) {
+        self.deviceId = deviceId
+        self.displayName = displayName
+        self.candidateCount = candidateCount
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension LanPeerRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLanPeerRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LanPeerRecord {
+        return
+            try LanPeerRecord(
+                deviceId: FfiConverterString.read(from: &buf),
+                displayName: FfiConverterString.read(from: &buf),
+                candidateCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LanPeerRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.deviceId, into: &buf)
+        FfiConverterString.write(value.displayName, into: &buf)
+        FfiConverterUInt32.write(value.candidateCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanPeerRecord_lift(_ buf: RustBuffer) throws -> LanPeerRecord {
+    return try FfiConverterTypeLanPeerRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanPeerRecord_lower(_ value: LanPeerRecord) -> RustBuffer {
+    return FfiConverterTypeLanPeerRecord.lower(value)
+}
+
+
+public struct ReceivedFileRecord: Equatable, Hashable {
+    public var transferId: String
+    public var fileName: String
+    public var path: String
+    public var sizeBytes: UInt64
+    public var sha256Hex: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(transferId: String, fileName: String, path: String, sizeBytes: UInt64, sha256Hex: String) {
+        self.transferId = transferId
+        self.fileName = fileName
+        self.path = path
+        self.sizeBytes = sizeBytes
+        self.sha256Hex = sha256Hex
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ReceivedFileRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReceivedFileRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceivedFileRecord {
+        return
+            try ReceivedFileRecord(
+                transferId: FfiConverterString.read(from: &buf),
+                fileName: FfiConverterString.read(from: &buf),
+                path: FfiConverterString.read(from: &buf),
+                sizeBytes: FfiConverterUInt64.read(from: &buf),
+                sha256Hex: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReceivedFileRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.transferId, into: &buf)
+        FfiConverterString.write(value.fileName, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterUInt64.write(value.sizeBytes, into: &buf)
+        FfiConverterString.write(value.sha256Hex, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReceivedFileRecord_lift(_ buf: RustBuffer) throws -> ReceivedFileRecord {
+    return try FfiConverterTypeReceivedFileRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReceivedFileRecord_lower(_ value: ReceivedFileRecord) -> RustBuffer {
+    return FfiConverterTypeReceivedFileRecord.lower(value)
+}
+
+
+public struct SentFile: Equatable, Hashable {
+    public var transferId: String
+    public var fileName: String
+    public var bytesSent: UInt64
+    public var sha256Hex: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(transferId: String, fileName: String, bytesSent: UInt64, sha256Hex: String) {
+        self.transferId = transferId
+        self.fileName = fileName
+        self.bytesSent = bytesSent
+        self.sha256Hex = sha256Hex
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SentFile: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSentFile: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SentFile {
+        return
+            try SentFile(
+                transferId: FfiConverterString.read(from: &buf),
+                fileName: FfiConverterString.read(from: &buf),
+                bytesSent: FfiConverterUInt64.read(from: &buf),
+                sha256Hex: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SentFile, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.transferId, into: &buf)
+        FfiConverterString.write(value.fileName, into: &buf)
+        FfiConverterUInt64.write(value.bytesSent, into: &buf)
+        FfiConverterString.write(value.sha256Hex, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSentFile_lift(_ buf: RustBuffer) throws -> SentFile {
+    return try FfiConverterTypeSentFile.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSentFile_lower(_ value: SentFile) -> RustBuffer {
+    return FfiConverterTypeSentFile.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum ClipKind: Equatable, Hashable {
-    
+
     case text
     case image
 
@@ -1227,26 +1523,26 @@ public struct FfiConverterTypeClipKind: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ClipKind {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .text
-        
+
         case 2: return .image
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: ClipKind, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .text:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .image:
             writeInt(&buf, Int32(2))
-        
+
         }
     }
 }
@@ -1271,7 +1567,7 @@ public func FfiConverterTypeClipKind_lower(_ value: ClipKind) -> RustBuffer {
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum ConnectionState: Equatable, Hashable {
-    
+
     case connecting
     case connected
     case disconnected
@@ -1297,40 +1593,40 @@ public struct FfiConverterTypeConnectionState: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConnectionState {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .connecting
-        
+
         case 2: return .connected
-        
+
         case 3: return .disconnected
-        
+
         case 4: return .error(message: try FfiConverterString.read(from: &buf)
         )
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: ConnectionState, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .connecting:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .connected:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .disconnected:
             writeInt(&buf, Int32(3))
-        
-        
+
+
         case let .error(message):
             writeInt(&buf, Int32(4))
             FfiConverterString.write(message, into: &buf)
-            
+
         }
     }
 }
@@ -1361,25 +1657,29 @@ public func FfiConverterTypeConnectionState_lower(_ value: ConnectionState) -> R
  */
 public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
-    
-    
+
+
     case Stopped
     case InvalidKey(got: UInt32
     )
     case BlobNotFound
     case BlobTooLarge
+    case NoLanPeer(deviceId: String
+    )
+    case FileTransfer(reason: String
+    )
     case Internal(reason: String
     )
 
-    
 
-    
 
-    
+
+
+
     public var errorDescription: String? {
         String(reflecting: self)
     }
-    
+
 }
 
 #if compiler(>=6)
@@ -1396,16 +1696,22 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
-        
 
-        
+
+
         case 1: return .Stopped
         case 2: return .InvalidKey(
             got: try FfiConverterUInt32.read(from: &buf)
             )
         case 3: return .BlobNotFound
         case 4: return .BlobTooLarge
-        case 5: return .Internal(
+        case 5: return .NoLanPeer(
+            deviceId: try FfiConverterString.read(from: &buf)
+            )
+        case 6: return .FileTransfer(
+            reason: try FfiConverterString.read(from: &buf)
+            )
+        case 7: return .Internal(
             reason: try FfiConverterString.read(from: &buf)
             )
 
@@ -1416,31 +1722,41 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
     public static func write(_ value: FfiError, into buf: inout [UInt8]) {
         switch value {
 
-        
 
-        
-        
+
+
+
         case .Stopped:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case let .InvalidKey(got):
             writeInt(&buf, Int32(2))
             FfiConverterUInt32.write(got, into: &buf)
-            
-        
+
+
         case .BlobNotFound:
             writeInt(&buf, Int32(3))
-        
-        
+
+
         case .BlobTooLarge:
             writeInt(&buf, Int32(4))
-        
-        
-        case let .Internal(reason):
+
+
+        case let .NoLanPeer(deviceId):
             writeInt(&buf, Int32(5))
+            FfiConverterString.write(deviceId, into: &buf)
+
+
+        case let .FileTransfer(reason):
+            writeInt(&buf, Int32(6))
             FfiConverterString.write(reason, into: &buf)
-            
+
+
+        case let .Internal(reason):
+            writeInt(&buf, Int32(7))
+            FfiConverterString.write(reason, into: &buf)
+
         }
     }
 }
@@ -1458,6 +1774,30 @@ public func FfiConverterTypeFfiError_lift(_ buf: RustBuffer) throws -> FfiError 
 #endif
 public func FfiConverterTypeFfiError_lower(_ value: FfiError) -> RustBuffer {
     return FfiConverterTypeFfiError.lower(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
 }
 
 #if swift(>=5.8)
@@ -1509,6 +1849,56 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeLanPeerRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [LanPeerRecord]
+
+    public static func write(_ value: [LanPeerRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLanPeerRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LanPeerRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LanPeerRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLanPeerRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeReceivedFileRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [ReceivedFileRecord]
+
+    public static func write(_ value: [ReceivedFileRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeReceivedFileRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ReceivedFileRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ReceivedFileRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeReceivedFileRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
 private enum InitializationResult {
     case ok
     case contractVersionMismatch
@@ -1533,16 +1923,34 @@ private let initializationResult: InitializationResult = {
     if (uniffi_clipbridge_core_checksum_method_client_lan_peer_count() != 51217) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_clipbridge_core_checksum_method_client_lan_peer_records() != 58913) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_clipbridge_core_checksum_method_client_lan_peers() != 17374) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_client_send_clip() != 42893) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_clipbridge_core_checksum_method_client_send_file_to_peer() != 52538) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_clipbridge_core_checksum_method_client_send_image() != 45764) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_clipbridge_core_checksum_method_client_set_file_receive_dir() != 63587) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_clipbridge_core_checksum_method_client_set_lan_active() != 35601) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_clipbridge_core_checksum_method_client_set_reconnect_idle_mode() != 25599) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_clipbridge_core_checksum_method_client_stop() != 44720) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_clipbridge_core_checksum_method_client_take_received_files() != 16058) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_cliplistener_on_clip() != 60960) {

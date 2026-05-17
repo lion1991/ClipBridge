@@ -150,6 +150,18 @@ final class BridgeCoordinator: ObservableObject {
     @Published private(set) var sentImages: [ImageHistoryEntry] = []
     private static let imageHistoryLimit = 12
 
+    /// LAN peers and completed file transfers surfaced in the transfer
+    /// window. Core owns the actual LAN transfer; the app polls cheap
+    /// snapshots because UniFFI does not expose Swift async streams here.
+    @Published private(set) var lanFilePeers: [LanPeerRecord] = []
+    @Published private(set) var receivedFiles: [FileTransferHistoryEntry] = []
+    @Published private(set) var sentFiles: [FileTransferHistoryEntry] = []
+    private static let fileHistoryLimit = 40
+
+    /// Dedicated queue for file sends. A large local file transfer should
+    /// not block image blob upload/download work or AppKit pasteboard reads.
+    private let fileQueue = DispatchQueue(label: "com.clipbridge.files", qos: .userInitiated)
+
     /// Most recent ConnectionState — used to revert after a transient error
     /// auto-clears. See `showTransientError`.
     private var lastConnectionStatus: BridgeStatus = .disconnected
@@ -223,6 +235,7 @@ final class BridgeCoordinator: ObservableObject {
             onStateChange(.error("客户端错误:\(error)"))
             return
         }
+        configureFileReceiving()
         startPolling()
     }
 
@@ -237,10 +250,54 @@ final class BridgeCoordinator: ObservableObject {
     private func startPolling() {
         pollTimer?.invalidate()
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.refreshFileTransferState()
             self?.checkPasteboard()
         }
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer
+    }
+
+    private func configureFileReceiving() {
+        let folder = AppSettings.effectiveFileReceiveFolder
+        do {
+            try FileManager.default.createDirectory(
+                at: folder,
+                withIntermediateDirectories: true
+            )
+            client?.setFileReceiveDir(dir: folder.path)
+        } catch {
+            onStateChange(.error("文件接收目录不可用:\(error.localizedDescription)"))
+        }
+    }
+
+    func setFileReceiveFolder(_ url: URL) {
+        AppSettings.fileReceiveFolder = url
+        configureFileReceiving()
+    }
+
+    private func refreshFileTransferState() {
+        guard let client else {
+            if !lanFilePeers.isEmpty { lanFilePeers = [] }
+            return
+        }
+
+        let peers = client.lanPeerRecords()
+            .filter { $0.candidateCount > 0 }
+            .sorted {
+                if $0.displayName == $1.displayName {
+                    return $0.deviceId < $1.deviceId
+                }
+                return $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+            }
+        if peers != lanFilePeers {
+            lanFilePeers = peers
+        }
+
+        let completed = client.takeReceivedFiles()
+        guard !completed.isEmpty else { return }
+        for record in completed {
+            appendReceivedFile(FileTransferHistoryEntry(received: record))
+        }
     }
 
     private func checkPasteboard() {
@@ -340,6 +397,67 @@ final class BridgeCoordinator: ObservableObject {
             sendImage(clip)
         } catch {
             onStateChange(.error("读取失败:\(error.localizedDescription)"))
+        }
+    }
+
+    func sendFiles(urls: [URL], to peers: [LanPeerRecord]) {
+        guard !peers.isEmpty else {
+            onStateChange(.error("请选择 LAN 设备"))
+            return
+        }
+        guard !urls.isEmpty else { return }
+
+        for url in urls where url.isFileURL {
+            guard isRegularFile(url) else {
+                onStateChange(.error("只能发送普通文件:\(url.lastPathComponent)"))
+                continue
+            }
+
+            let size = fileSize(url)
+            let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+            for peer in peers {
+                let id = UUID()
+                appendSentFile(FileTransferHistoryEntry(
+                    id: id,
+                    direction: .sent,
+                    fileName: url.lastPathComponent,
+                    fileURL: url,
+                    deviceName: peer.displayName,
+                    sizeBytes: size,
+                    date: Date(),
+                    status: .sending
+                ))
+
+                fileQueue.async { [weak self] in
+                    guard let self else { return }
+                    guard let client = self.client else {
+                        DispatchQueue.main.async {
+                            self.updateSentFile(id: id, status: .failed("未连接"))
+                        }
+                        return
+                    }
+                    do {
+                        let sent = try client.sendFileToPeer(
+                            targetDeviceId: peer.deviceId,
+                            sourcePath: url.path,
+                            mimeType: mime
+                        )
+                        DispatchQueue.main.async {
+                            self.updateSentFile(
+                                id: id,
+                                sizeBytes: sent.bytesSent,
+                                status: .completed
+                            )
+                        }
+                    } catch {
+                        let message = self.friendlyErrorMessage(error)
+                        DispatchQueue.main.async {
+                            self.updateSentFile(id: id, status: .failed(message))
+                        }
+                        self.showTransientError("文件发送失败: \(message)")
+                    }
+                }
+            }
         }
     }
 
@@ -557,7 +675,35 @@ final class BridgeCoordinator: ObservableObject {
         DispatchQueue.main.async {
             self.receivedImages.removeAll()
             self.sentImages.removeAll()
+            self.receivedFiles.removeAll()
+            self.sentFiles.removeAll()
         }
+    }
+
+    private func appendReceivedFile(_ entry: FileTransferHistoryEntry) {
+        receivedFiles.insert(entry, at: 0)
+        if receivedFiles.count > Self.fileHistoryLimit {
+            receivedFiles.removeLast(receivedFiles.count - Self.fileHistoryLimit)
+        }
+    }
+
+    private func appendSentFile(_ entry: FileTransferHistoryEntry) {
+        sentFiles.insert(entry, at: 0)
+        if sentFiles.count > Self.fileHistoryLimit {
+            sentFiles.removeLast(sentFiles.count - Self.fileHistoryLimit)
+        }
+    }
+
+    private func updateSentFile(
+        id: UUID,
+        sizeBytes: UInt64? = nil,
+        status: FileTransferStatus
+    ) {
+        guard let index = sentFiles.firstIndex(where: { $0.id == id }) else { return }
+        if let sizeBytes {
+            sentFiles[index].sizeBytes = sizeBytes
+        }
+        sentFiles[index].status = status
     }
 
     private func autoSaveIfConfigured(_ entry: ImageHistoryEntry) {
@@ -628,6 +774,7 @@ struct ImageHistoryEntry: Identifiable, Equatable {
 /// preferences. Currently just the auto-save target folder.
 enum AppSettings {
     private static let autoSaveFolderKey = "imageAutoSaveFolder"
+    private static let fileReceiveFolderKey = "fileReceiveFolder"
 
     /// File-URL the user picked via the folder panel in the transfer
     /// window. Stored as a string path; the unsandboxed Mac app can read
@@ -642,6 +789,123 @@ enum AppSettings {
             UserDefaults.standard.set(newValue?.path, forKey: autoSaveFolderKey)
         }
     }
+
+    static var defaultFileReceiveFolder: URL {
+        let downloads = FileManager.default.urls(
+            for: .downloadsDirectory,
+            in: .userDomainMask
+        ).first ?? URL(fileURLWithPath: NSHomeDirectory())
+        return downloads.appendingPathComponent("ClipBridge", isDirectory: true)
+    }
+
+    static var effectiveFileReceiveFolder: URL {
+        fileReceiveFolder ?? defaultFileReceiveFolder
+    }
+
+    static var fileReceiveFolder: URL? {
+        get {
+            guard let s = UserDefaults.standard.string(forKey: fileReceiveFolderKey),
+                  !s.isEmpty else { return nil }
+            return URL(fileURLWithPath: s, isDirectory: true)
+        }
+        set {
+            UserDefaults.standard.set(newValue?.path, forKey: fileReceiveFolderKey)
+        }
+    }
+}
+
+enum FileTransferDirection: Equatable {
+    case received
+    case sent
+}
+
+enum FileTransferStatus: Equatable {
+    case sending
+    case completed
+    case failed(String)
+
+    var label: String {
+        switch self {
+        case .sending: return "发送中"
+        case .completed: return "完成"
+        case .failed: return "失败"
+        }
+    }
+
+    var detail: String? {
+        if case .failed(let message) = self { return message }
+        return nil
+    }
+}
+
+struct FileTransferHistoryEntry: Identifiable, Equatable {
+    let id: UUID
+    let direction: FileTransferDirection
+    let fileName: String
+    let fileURL: URL?
+    let deviceName: String
+    var sizeBytes: UInt64
+    let date: Date
+    var status: FileTransferStatus
+
+    init(
+        id: UUID = UUID(),
+        direction: FileTransferDirection,
+        fileName: String,
+        fileURL: URL?,
+        deviceName: String,
+        sizeBytes: UInt64,
+        date: Date,
+        status: FileTransferStatus
+    ) {
+        self.id = id
+        self.direction = direction
+        self.fileName = fileName
+        self.fileURL = fileURL
+        self.deviceName = deviceName
+        self.sizeBytes = sizeBytes
+        self.date = date
+        self.status = status
+    }
+
+    init(received record: ReceivedFileRecord) {
+        self.init(
+            id: UUID(uuidString: record.transferId) ?? UUID(),
+            direction: .received,
+            fileName: record.fileName,
+            fileURL: URL(fileURLWithPath: record.path),
+            deviceName: "LAN",
+            sizeBytes: record.sizeBytes,
+            date: Date(),
+            status: .completed
+        )
+    }
+
+    var sizeLabel: String {
+        formatByteCount(sizeBytes)
+    }
+}
+
+private func isRegularFile(_ url: URL) -> Bool {
+    guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]) else {
+        return false
+    }
+    return values.isRegularFile == true
+}
+
+private func fileSize(_ url: URL) -> UInt64 {
+    guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+          let fileSize = values.fileSize,
+          fileSize > 0
+    else { return 0 }
+    return UInt64(fileSize)
+}
+
+func formatByteCount(_ bytes: UInt64) -> String {
+    ByteCountFormatter.string(
+        fromByteCount: Int64(clamping: bytes),
+        countStyle: .file
+    )
 }
 
 private struct ClipboardImage {

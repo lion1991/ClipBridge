@@ -186,6 +186,7 @@ mod b64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerAddrEntry {
     pub device_id: String,
+    pub display_name: Option<String>,
     pub candidates: Vec<SocketAddr>,
 }
 
@@ -222,6 +223,7 @@ pub fn peer_records(peers: &PeerRegistry, addrs: &PeerAddrs) -> Vec<LanPeerRecor
             let display_name = names
                 .get(&entry.device_id)
                 .cloned()
+                .or_else(|| non_empty_display_name(entry.display_name.as_deref()))
                 .unwrap_or_else(|| short_id(&entry.device_id));
             let rec = by_device
                 .entry(entry.device_id.clone())
@@ -250,6 +252,11 @@ pub fn peer_records(peers: &PeerRegistry, addrs: &PeerAddrs) -> Vec<LanPeerRecor
             .then_with(|| a.device_id.cmp(&b.device_id))
     });
     out
+}
+
+fn non_empty_display_name(value: Option<&str>) -> Option<String> {
+    let trimmed = value?.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 pub fn candidates_for_peer(addrs: &PeerAddrs, device_id: &str) -> Vec<SocketAddr> {
@@ -810,6 +817,7 @@ impl LanNode {
                                     fullname.clone(),
                                     PeerAddrEntry {
                                         device_id: peer_did.to_string(),
+                                        display_name: None,
                                         candidates: candidates.clone(),
                                     },
                                 );
@@ -1077,8 +1085,8 @@ fn apply_relay_snapshot(
     peer_addrs: &mut HashMap<String, PeerAddrEntry>,
     known_peers: &mut HashMap<String, KnownPeer>,
 ) {
-    // device_id -> dialable candidates, parsed & filtered.
-    let mut desired: Vec<(String, Vec<SocketAddr>)> = Vec::new();
+    // device_id -> relay-provided name + dialable candidates, parsed & filtered.
+    let mut desired: Vec<(String, Option<String>, Vec<SocketAddr>)> = Vec::new();
     let local_networks = local_private_networks();
     for p in peers {
         if p.device_id == self_device_id {
@@ -1094,16 +1102,21 @@ fn apply_relay_snapshot(
         }
         sort_candidates_for_dial(&mut cands, &local_networks);
         if !cands.is_empty() {
-            desired.push((p.device_id, cands));
+            desired.push((
+                p.device_id,
+                non_empty_display_name(Some(&p.device_name)),
+                cands,
+            ));
         }
     }
 
     peer_addrs.retain(|k, _| !k.starts_with("relay:"));
-    for (did, cands) in &desired {
+    for (did, display_name, cands) in &desired {
         peer_addrs.insert(
             format!("relay:{did}"),
             PeerAddrEntry {
                 device_id: did.clone(),
+                display_name: display_name.clone(),
                 candidates: cands.clone(),
             },
         );
@@ -1112,7 +1125,7 @@ fn apply_relay_snapshot(
     known_peers.retain(|k, _| !k.starts_with("relay:"));
     let mdns_dids: std::collections::HashSet<String> =
         known_peers.values().map(|kp| kp.peer_did.clone()).collect();
-    for (peer_did, cands) in desired {
+    for (peer_did, _, cands) in desired {
         if self_device_id <= peer_did.as_str() {
             continue;
         }
@@ -2126,6 +2139,7 @@ mod tests {
     fn lp(did: &str, cands: &[&str]) -> crate::protocol::LanPeer {
         crate::protocol::LanPeer {
             device_id: did.into(),
+            device_name: format!("{did} name"),
             candidates: cands.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -2175,6 +2189,7 @@ mod tests {
             "Mac._clipbridge._tcp.local.".into(),
             PeerAddrEntry {
                 device_id: "dev-mdns".into(),
+                display_name: None,
                 candidates: vec!["192.168.1.50:7000".parse().unwrap()],
             },
         );
@@ -2262,6 +2277,7 @@ mod tests {
             "Mac._clipbridge._tcp.local.".into(),
             PeerAddrEntry {
                 device_id: "dev-a".into(),
+                display_name: None,
                 candidates: vec!["192.168.1.20:5000".parse().unwrap()],
             },
         );
@@ -2269,6 +2285,7 @@ mod tests {
             "relay:dev-b".into(),
             PeerAddrEntry {
                 device_id: "dev-b".into(),
+                display_name: None,
                 candidates: vec!["192.168.1.30:5000".parse().unwrap()],
             },
         );
@@ -2285,6 +2302,26 @@ mod tests {
             candidates_for_peer(&addrs, "dev-a"),
             vec!["192.168.1.20:5000".parse().unwrap()]
         );
+    }
+
+    #[test]
+    fn peer_records_use_relay_advertised_device_name_before_handshake() {
+        let peers: PeerRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let addrs: PeerAddrs = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        addrs.lock().unwrap().insert(
+            "relay:android".into(),
+            PeerAddrEntry {
+                device_id: "8eb4001d9a41f00d".into(),
+                display_name: Some("SM-S9380".into()),
+                candidates: vec!["192.168.1.30:5000".parse().unwrap()],
+            },
+        );
+
+        let records = peer_records(&peers, &addrs);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].display_name, "SM-S9380");
+        assert_eq!(records[0].candidate_count, 1);
     }
 
     #[test]

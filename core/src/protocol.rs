@@ -34,6 +34,8 @@ pub enum ClientMessage {
     LanAdvertise {
         group_id: GroupId,
         device_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        device_name: String,
         candidates: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         candidate_networks: Vec<LanCandidate>,
@@ -77,6 +79,8 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LanPeer {
     pub device_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device_name: String,
     /// Dialable `ip:port` candidates the peer advertised.
     pub candidates: Vec<String>,
 }
@@ -220,6 +224,7 @@ mod tests {
         let m = ClientMessage::LanAdvertise {
             group_id: "g1".into(),
             device_id: "dev-a".into(),
+            device_name: "Mac".into(),
             candidates: vec!["192.168.1.5:54321".into(), "10.0.0.2:54321".into()],
             candidate_networks: vec![LanCandidate {
                 addr: "192.168.1.5:54321".into(),
@@ -232,10 +237,12 @@ mod tests {
         let back: ClientMessage = serde_json::from_str(&s).unwrap();
         match back {
             ClientMessage::LanAdvertise {
+                device_name,
                 candidates,
                 candidate_networks,
                 ..
             } => {
+                assert_eq!(device_name, "Mac");
                 assert_eq!(candidates.len(), 2);
                 assert_eq!(candidate_networks[0].prefix_len, 24);
             }
@@ -249,10 +256,12 @@ mod tests {
         let back: ClientMessage = serde_json::from_str(json).unwrap();
         match back {
             ClientMessage::LanAdvertise {
+                device_name,
                 candidates,
                 candidate_networks,
                 ..
             } => {
+                assert!(device_name.is_empty());
                 assert_eq!(candidates, vec!["192.168.1.5:54321".to_string()]);
                 assert!(candidate_networks.is_empty());
             }
@@ -265,6 +274,7 @@ mod tests {
         let m = ServerMessage::LanPeers {
             peers: vec![LanPeer {
                 device_id: "dev-b".into(),
+                device_name: "Phone".into(),
                 candidates: vec!["192.168.1.9:60000".into()],
             }],
         };
@@ -274,6 +284,7 @@ mod tests {
         match back {
             ServerMessage::LanPeers { peers } => {
                 assert_eq!(peers[0].device_id, "dev-b");
+                assert_eq!(peers[0].device_name, "Phone");
                 assert_eq!(peers[0].candidates, vec!["192.168.1.9:60000".to_string()]);
             }
             _ => panic!("wrong variant"),
