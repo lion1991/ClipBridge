@@ -223,6 +223,7 @@ private fun PairingScreen(
                 batteryOptDisabled = isBatteryOptimizationDisabled(context)
                 shizukuState = ShizukuBridge.state()
                 imageReadGranted = isImageReadGranted(context)
+                ClipBridgeAccessibilityService.activeService()?.onHostAppForeground()
             }
         }
         lifecycle.addObserver(observer)

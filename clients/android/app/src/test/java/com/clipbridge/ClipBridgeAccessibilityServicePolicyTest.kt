@@ -9,6 +9,9 @@ class ClipBridgeAccessibilityServicePolicyTest {
     private val serviceSource: String
         get() = File("src/main/java/com/clipbridge/ClipBridgeAccessibilityService.kt")
             .readText()
+    private val mainActivitySource: String
+        get() = File("src/main/java/com/clipbridge/MainActivity.kt")
+            .readText()
 
     @Test
     fun serviceConnectionDoesNotStartShizukuPolling() {
@@ -61,6 +64,29 @@ class ClipBridgeAccessibilityServicePolicyTest {
             "Remote and local transfer activity should open a bounded LAN window instead of keeping LAN always-on.",
             serviceSource.contains("activateLanTemporarily(") &&
                 serviceSource.contains("LAN_ACTIVE_WINDOW_MS"),
+        )
+    }
+
+    @Test
+    fun hostAppForegroundRequestsActiveReconnectWithoutChangingScreenOffStandby() {
+        val resumeBody = mainActivitySource.functionBody("if (event == Lifecycle.Event.ON_RESUME)")
+        val foregroundBody = serviceSource.functionBody("fun onHostAppForeground()")
+        val screenOffBody = serviceSource.functionBody("private fun setReconnectIdleMode(enabled: Boolean)")
+
+        assertTrue(
+            "MainActivity resume should notify the accessibility service that the host app is foreground.",
+            resumeBody.contains("onHostAppForeground()"),
+        )
+        assertTrue(
+            "Foregrounding the host app should leave idle reconnect mode, activate LAN, refresh LAN now, and refresh recent clips.",
+            foregroundBody.contains("setReconnectIdleMode(false)") &&
+                foregroundBody.contains("setLanActive(true)") &&
+                foregroundBody.contains("refreshLanNow()") &&
+                foregroundBody.contains("fetchRecent()"),
+        )
+        assertTrue(
+            "Screen-off standby must still suspend LAN activity.",
+            screenOffBody.contains("setLanActive(false)"),
         )
     }
 }

@@ -209,6 +209,17 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         }
     }
 
+    fun onHostAppForeground() {
+        setReconnectIdleMode(false)
+        setLanActive(true)
+        try {
+            client?.refreshLanNow()
+            client?.fetchRecent()
+        } catch (t: Throwable) {
+            Log.w(TAG, "foreground refresh failed: ${t.message}")
+        }
+    }
+
     private fun startLanCountPoller() {
         lanCountJob?.cancel()
         lanCountJob = scope.launch {

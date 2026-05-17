@@ -104,6 +104,7 @@ impl From<ClientError> for FfiError {
 enum Cmd {
     SendClip(ClipPayload),
     FetchRecent,
+    RefreshLan,
     Stop,
 }
 
@@ -266,6 +267,17 @@ impl Client {
             .map_err(|_| FfiError::Stopped)
     }
 
+    /// Ask the active session to immediately re-advertise LAN candidates and
+    /// wake the LAN reconciler instead of waiting for the periodic timers.
+    /// Platforms that do not call this keep the existing timer-driven LAN
+    /// behavior.
+    pub fn refresh_lan_now(&self) -> Result<(), FfiError> {
+        self.shared.lan_mode_notify.notify_waiters();
+        self.cmd_tx
+            .send(Cmd::RefreshLan)
+            .map_err(|_| FfiError::Stopped)
+    }
+
     /// Tell the worker whether reconnects are happening while the host is in
     /// a locked / screen-off idle state. Active hosts keep the original
     /// immediate reconnect behavior; idle hosts back off normal reconnects.
@@ -421,6 +433,9 @@ impl Client {
 
     pub fn lan_peer_records(&self) -> Vec<LanPeerRecord> {
         peer_records(&self.shared.lan_peer_names, &self.shared.peer_addrs)
+            .into_iter()
+            .filter(|peer| peer.device_id != self.shared.device_id)
+            .collect()
     }
 
     pub fn send_file_to_peer(
@@ -733,7 +748,14 @@ fn normalize_lan_candidate_networks(mut candidates: Vec<LanCandidate>) -> Vec<La
     candidates
 }
 
-fn lan_advertise_refresh_needed(last: Option<&[LanCandidate]>, current: &[LanCandidate]) -> bool {
+fn lan_advertise_refresh_needed(
+    last: Option<&[LanCandidate]>,
+    current: &[LanCandidate],
+    force: bool,
+) -> bool {
+    if force {
+        return !current.is_empty();
+    }
     match last {
         Some(last) => last != current,
         None => !current.is_empty(),
@@ -856,6 +878,7 @@ async fn session(
                     if lan_advertise_refresh_needed(
                         last_lan_advertise.as_deref(),
                         &candidate_networks,
+                        false,
                     ) {
                         let candidates: Vec<String> =
                             candidate_networks.iter().map(|c| c.addr.clone()).collect();
@@ -903,6 +926,34 @@ async fn session(
                             group_id: group_id.to_string(),
                         };
                         ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                    }
+                    Cmd::RefreshLan => {
+                        if let Some(lan) = lan.filter(|_| {
+                            !lan_advertise_disabled && lan_active.load(Ordering::Relaxed)
+                        }) {
+                            let candidate_networks =
+                                normalize_lan_candidate_networks(lan.advertise_candidate_networks());
+                            if lan_advertise_refresh_needed(
+                                last_lan_advertise.as_deref(),
+                                &candidate_networks,
+                                true,
+                            ) {
+                                let candidates: Vec<String> = candidate_networks
+                                    .iter()
+                                    .map(|c| c.addr.clone())
+                                    .collect();
+                                let adv = ClientMessage::LanAdvertise {
+                                    group_id: group_id.to_string(),
+                                    device_id: device_id.to_string(),
+                                    device_name: device_name.to_string(),
+                                    candidates,
+                                    candidate_networks: candidate_networks.clone(),
+                                };
+                                ws.send(Message::Text(serde_json::to_string(&adv)?)).await?;
+                                lan_advertise_error_pending = true;
+                                last_lan_advertise = Some(candidate_networks);
+                            }
+                        }
                     }
                 }
             }
@@ -1261,6 +1312,28 @@ mod tests {
         assert_eq!(records[0].candidate_count, 1);
     }
 
+    #[test]
+    fn client_lan_peer_records_exclude_self_candidates() {
+        let peer_addrs: PeerAddrs =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        peer_addrs.lock().unwrap().insert(
+            "mdns:self".into(),
+            crate::lan::PeerAddrEntry {
+                device_id: "source".into(),
+                display_name: None,
+                candidates: vec!["127.0.0.1:5555".parse().unwrap()],
+            },
+        );
+        let client = client_for_file_tests(
+            peer_addrs,
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        );
+
+        let records = client.lan_peer_records();
+
+        assert!(records.is_empty());
+    }
+
     #[tokio::test]
     async fn client_sends_file_to_peer_device_id() {
         let root = std::env::temp_dir().join(format!(
@@ -1347,13 +1420,21 @@ mod tests {
             lc("10.0.0.2:5000", 24),
         ]);
 
-        assert!(lan_advertise_refresh_needed(None, &first));
+        assert!(lan_advertise_refresh_needed(None, &first, false));
         assert!(!lan_advertise_refresh_needed(
             Some(&first),
-            &reordered_duplicate
+            &reordered_duplicate,
+            false
         ));
-        assert!(lan_advertise_refresh_needed(Some(&first), &changed));
-        assert!(lan_advertise_refresh_needed(Some(&first), &[]));
-        assert!(!lan_advertise_refresh_needed(None, &[]));
+        assert!(lan_advertise_refresh_needed(Some(&first), &changed, false));
+        assert!(lan_advertise_refresh_needed(Some(&first), &[], false));
+        assert!(!lan_advertise_refresh_needed(None, &[], false));
+    }
+
+    #[test]
+    fn forced_lan_advertise_refresh_sends_even_when_candidates_are_unchanged() {
+        let current = normalize_lan_candidate_networks(vec![lc("192.168.1.10:5000", 24)]);
+
+        assert!(lan_advertise_refresh_needed(Some(&current), &current, true));
     }
 }
