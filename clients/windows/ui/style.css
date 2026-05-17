@@ -143,6 +143,19 @@ main.view {
   color: var(--accent);
 }
 
+.drop-zone.disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.drop-zone.disabled:hover {
+  background: var(--surface-2);
+}
+
+.file-drop-zone {
+  margin-bottom: 8px;
+}
+
 .drop-zone .drop-icon {
   font-size: 28px;
   line-height: 1;

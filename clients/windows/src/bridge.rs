@@ -271,6 +271,39 @@ impl Bridge {
         Ok(entry)
     }
 
+    pub fn send_image_paths(&self, paths: Vec<PathBuf>) -> Result<Vec<ImageHistoryEntry>, String> {
+        let device_name = device_name();
+        let image_paths = supported_drag_image_paths(paths.iter());
+        if image_paths.is_empty() {
+            return Err("没有可发送的图片".to_string());
+        }
+
+        let mut entries = Vec::new();
+        for path in image_paths {
+            let Some(png) = normalize_image_file_at_path(&path) else {
+                continue;
+            };
+            if let Some(h) = pixel_hash_hex(&png.bytes) {
+                let _ = remember_hash(&self.recent_image_hashes, &h);
+            }
+            let entry = build_history_entry(&png, &device_name, "sent");
+            publish_image(self.client.as_ref(), &png, &device_name, entry.ts)?;
+            store_history(
+                &self.image_history,
+                &self.image_bytes,
+                &self.image_tx,
+                entry.clone(),
+                png.bytes,
+            );
+            entries.push(entry);
+        }
+
+        if entries.is_empty() {
+            return Err("没有可发送的图片".to_string());
+        }
+        Ok(entries)
+    }
+
     /// Snapshot of the in-process image history for the UI to render
     /// after a hot reload / window close-and-reopen.
     pub fn recent_images(&self) -> Vec<ImageHistoryEntry> {
@@ -727,6 +760,27 @@ fn file_display_name(path: &Path) -> String {
         .to_string()
 }
 
+pub(crate) fn pathbufs_from_drag_strings(paths: Vec<String>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let trimmed = path.trim();
+            (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+        })
+        .collect()
+}
+
+fn supported_drag_image_paths<'a, I>(paths: I) -> Vec<PathBuf>
+where
+    I: IntoIterator<Item = &'a PathBuf>,
+{
+    paths
+        .into_iter()
+        .filter(|path| is_supported_clipboard_image_file(path))
+        .cloned()
+        .collect()
+}
+
 fn default_file_receive_dir() -> PathBuf {
     UserDirs::new()
         .and_then(|u| u.download_dir().map(|p| p.to_path_buf()))
@@ -821,7 +875,6 @@ where
         .find_map(|path| normalize_image_file_at_path(path.as_path()))
 }
 
-#[cfg(any(windows, test))]
 fn normalize_image_file_at_path(path: &Path) -> Option<NormalizedPng> {
     if !is_supported_clipboard_image_file(path) {
         return None;
@@ -834,7 +887,6 @@ fn normalize_image_file_at_path(path: &Path) -> Option<NormalizedPng> {
     normalize_to_png(&bytes)
 }
 
-#[cfg(any(windows, test))]
 fn is_supported_clipboard_image_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -1153,6 +1205,34 @@ mod tests {
         let path = PathBuf::from(r"C:\Users\matt\Downloads\report.pdf");
 
         assert_eq!(file_display_name(&path), "report.pdf");
+    }
+
+    #[test]
+    fn drag_image_paths_keep_supported_images_only() {
+        let paths = [
+            PathBuf::from(r"C:\drop\photo.PNG"),
+            PathBuf::from(r"C:\drop\notes.pdf"),
+            PathBuf::from(r"C:\drop\scan.jpeg"),
+            PathBuf::from(r"C:\drop\archive"),
+        ];
+
+        let names: Vec<_> = supported_drag_image_paths(paths.iter())
+            .into_iter()
+            .map(|path| file_display_name(&path))
+            .collect();
+
+        assert_eq!(names, vec!["photo.PNG", "scan.jpeg"]);
+    }
+
+    #[test]
+    fn drag_path_strings_ignore_blank_entries() {
+        let paths = pathbufs_from_drag_strings(vec![
+            String::from(" "),
+            String::from(r"C:\drop\report.pdf"),
+            String::new(),
+        ]);
+
+        assert_eq!(paths, vec![PathBuf::from(r"C:\drop\report.pdf")]);
     }
 
     #[test]

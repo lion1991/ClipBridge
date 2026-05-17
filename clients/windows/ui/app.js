@@ -119,6 +119,7 @@ const imageHistory = [];
 const fileHistory = [];
 let lanFilePeers = [];
 const selectedFileTargets = new Set();
+const SUPPORTED_DRAG_IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg"]);
 
 function formatSize(bytes) {
   const kb = Math.max(1, Math.round(bytes / 1024));
@@ -139,6 +140,7 @@ function renderFileTransfer() {
   const list = $("file-peer-list");
   const selectAll = $("btn-file-select-all");
   const sendBtn = $("btn-pick-files");
+  const fileDropZone = $("file-drop-zone");
 
   const validIds = new Set(lanFilePeers.map((p) => p.device_id));
   [...selectedFileTargets].forEach((id) => {
@@ -154,6 +156,7 @@ function renderFileTransfer() {
   selectAll.disabled = lanFilePeers.length === 0;
   selectAll.textContent = selectedCount === lanFilePeers.length && lanFilePeers.length > 0 ? "清空" : "全选";
   sendBtn.disabled = lanFilePeers.length === 0 || selectedCount === 0;
+  fileDropZone.classList.toggle("disabled", sendBtn.disabled);
 
   if (lanFilePeers.length === 0) {
     list.innerHTML = `<div class="hint">等同组设备出现在局域网后可发送文件。</div>`;
@@ -346,6 +349,102 @@ async function pickAndSendFiles() {
   }
 }
 
+async function sendFilePathStrings(paths) {
+  const cleanPaths = normalizePathStrings(paths);
+  if (cleanPaths.length === 0) return;
+
+  const targetDeviceIds = [...selectedFileTargets];
+  if (targetDeviceIds.length === 0) {
+    toast("先选择接收设备");
+    return;
+  }
+  try {
+    const entries = await invoke("cmd_send_file_paths", {
+      targetDeviceIds,
+      paths: cleanPaths,
+    });
+    if (Array.isArray(entries)) {
+      entries.forEach(appendOrReplaceFileEntry);
+      if (entries.length > 0) toast(`已处理 ${entries.length} 个文件任务`);
+    }
+  } catch (e) {
+    toast(`发送失败:${e}`);
+  }
+}
+
+async function sendImagePathStrings(paths) {
+  const imagePaths = normalizePathStrings(paths).filter(isSupportedDragImagePath);
+  if (imagePaths.length === 0) {
+    toast("拖入的不是 PNG/JPEG 图片");
+    return;
+  }
+  try {
+    const entries = await invoke("cmd_send_image_paths", { paths: imagePaths });
+    if (Array.isArray(entries)) {
+      entries.forEach(appendOrReplaceEntry);
+      if (entries.length > 0) toast(`已发送 ${entries.length} 张图片`);
+    }
+  } catch (e) {
+    toast(`发送失败:${e}`);
+  }
+}
+
+function normalizePathStrings(paths) {
+  return (Array.isArray(paths) ? paths : [])
+    .map((path) => String(path ?? "").trim())
+    .filter(Boolean);
+}
+
+function isSupportedDragImagePath(path) {
+  const name = String(path ?? "").split(/[\\/]/).pop() || "";
+  const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+  return SUPPORTED_DRAG_IMAGE_EXTENSIONS.has(ext);
+}
+
+function nativePoint(payload) {
+  const pos = payload?.position;
+  if (!pos || typeof pos.x !== "number" || typeof pos.y !== "number") return null;
+  const scale = window.devicePixelRatio || 1;
+  return { x: pos.x / scale, y: pos.y / scale };
+}
+
+function nativePointInside(el, payload) {
+  const point = nativePoint(payload);
+  if (!el || !point || el.classList.contains("hidden")) return false;
+  const rect = el.getBoundingClientRect();
+  return point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom;
+}
+
+function clearNativeDropHighlights() {
+  $("drop-zone").classList.remove("dragging");
+  $("file-drop-zone").classList.remove("dragging");
+}
+
+function updateNativeDropHighlights(payload) {
+  const imageDropZone = $("drop-zone");
+  const fileDropZone = $("file-drop-zone");
+  imageDropZone.classList.toggle("dragging", nativePointInside(imageDropZone, payload));
+  fileDropZone.classList.toggle("dragging", nativePointInside(fileDropZone, payload));
+}
+
+async function handleNativePathDrop(payload) {
+  clearNativeDropHighlights();
+  const paths = normalizePathStrings(payload?.paths);
+  if (paths.length === 0) return;
+
+  const imageDropZone = $("drop-zone");
+  const fileDropZone = $("file-drop-zone");
+  if (nativePointInside(imageDropZone, payload)) {
+    await sendImagePathStrings(paths);
+    return;
+  }
+  if (nativePointInside(fileDropZone, payload)) {
+    await sendFilePathStrings(paths);
+    return;
+  }
+  toast("拖到文件或图片区域");
+}
+
 async function revealFile(id) {
   const entry = fileHistory.find((e) => e.id === id);
   if (!entry?.path) {
@@ -510,12 +609,12 @@ async function init() {
     }
   });
 
-  // Drop zone — clickable for the picker, plus HTML5 drag-drop targets.
-  // Tauri 2 normally intercepts drag-drop at the OS layer; we set
-  // dragDropEnabled=false in tauri.conf.json so the standard browser
-  // events fire here with File objects on `dataTransfer.files`.
+  // Drop zones — clickable for native pickers; native path drops are handled
+  // through Tauri's `tauri://drag-*` events below.
   const dropZone = $("drop-zone");
+  const fileDropZone = $("file-drop-zone");
   dropZone.addEventListener("click", () => pickAndSendImages());
+  fileDropZone.addEventListener("click", () => pickAndSendFiles());
   $("btn-pick-files").addEventListener("click", () => pickAndSendFiles());
   $("btn-file-select-all").addEventListener("click", () => {
     if (selectedFileTargets.size === lanFilePeers.length && lanFilePeers.length > 0) {
@@ -527,20 +626,29 @@ async function init() {
     renderFileTransfer();
   });
 
-  // dragenter / dragover both must call preventDefault, otherwise drop
-  // never fires (browser defaults to "no drop allowed"). dragleave needs
-  // to be careful because moving over child elements re-fires it; we
-  // count enter/leave with a depth counter to only un-highlight on the
-  // final leave.
+  let lastNativeDropAt = 0;
+  await listen("tauri://drag-enter", (evt) => updateNativeDropHighlights(evt.payload));
+  await listen("tauri://drag-over", (evt) => updateNativeDropHighlights(evt.payload));
+  await listen("tauri://drag-leave", () => clearNativeDropHighlights());
+  await listen("tauri://drag-drop", async (evt) => {
+    lastNativeDropAt = Date.now();
+    await handleNativePathDrop(evt.payload);
+  });
+
+  // Browser-level drag/drop remains as a fallback for dev hosts that do not
+  // emit Tauri native path events.
   let dragDepth = 0;
-  ["dragenter", "dragover"].forEach((evt) => {
-    dropZone.addEventListener(evt, (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
-      dragDepth++;
-      dropZone.classList.add("dragging");
-    });
+  dropZone.addEventListener("dragenter", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    dragDepth++;
+    dropZone.classList.add("dragging");
+  });
+  dropZone.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
   });
   dropZone.addEventListener("dragleave", (e) => {
     e.preventDefault();
@@ -551,6 +659,7 @@ async function init() {
   dropZone.addEventListener("drop", (e) => {
     e.preventDefault();
     e.stopPropagation();
+    if (Date.now() - lastNativeDropAt < 750) return;
     dragDepth = 0;
     dropZone.classList.remove("dragging");
     const files = Array.from(e.dataTransfer?.files || []).filter((f) =>

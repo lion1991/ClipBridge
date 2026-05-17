@@ -18,7 +18,10 @@ use tauri::{
 };
 use tokio::sync::mpsc;
 
-use crate::bridge::{Bridge, FileTransferHistoryEntry, ImageHistoryEntry, LanPeerDto, UiState};
+use crate::bridge::{
+    pathbufs_from_drag_strings, Bridge, FileTransferHistoryEntry, ImageHistoryEntry, LanPeerDto,
+    UiState,
+};
 use crate::pairing::{PairingConfig, Store};
 
 struct AppState {
@@ -59,10 +62,12 @@ fn main() {
             cmd_quit,
             cmd_recent_images,
             cmd_send_image_bytes,
+            cmd_send_image_paths,
             cmd_save_image_to_file,
             cmd_file_receive_dir,
             cmd_recent_file_transfers,
             cmd_pick_and_send_files,
+            cmd_send_file_paths,
             cmd_reveal_file,
         ])
         .setup(move |app| {
@@ -295,6 +300,23 @@ fn cmd_send_image_bytes(
         .send_image_bytes(bytes)
 }
 
+#[tauri::command]
+async fn cmd_send_image_paths(
+    paths: Vec<String>,
+    app: AppHandle,
+) -> Result<Vec<ImageHistoryEntry>, String> {
+    let paths = pathbufs_from_drag_strings(paths);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app
+            .try_state::<AppState>()
+            .ok_or_else(|| "app state missing".to_string())?;
+        let bridge = state.bridge.lock().map_err(|e| e.to_string())?;
+        bridge.send_image_paths(paths)
+    })
+    .await
+    .map_err(|e| format!("send image task: {e}"))?
+}
+
 /// Save an image from history to a user-chosen file. The frontend passes
 /// the entry id and a default file name; we open a native Win32 save
 /// dialog (via `rfd`) and write the original PNG bytes verbatim — no
@@ -369,6 +391,27 @@ async fn cmd_pick_and_send_files(
     let Some(paths) = paths else {
         return Ok(Vec::new());
     };
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app
+            .try_state::<AppState>()
+            .ok_or_else(|| "app state missing".to_string())?;
+        let bridge = state.bridge.lock().map_err(|e| e.to_string())?;
+        bridge.send_files_to_peers(paths, target_device_ids)
+    })
+    .await
+    .map_err(|e| format!("send task: {e}"))?
+}
+
+#[tauri::command]
+async fn cmd_send_file_paths(
+    target_device_ids: Vec<String>,
+    paths: Vec<String>,
+    app: AppHandle,
+) -> Result<Vec<FileTransferHistoryEntry>, String> {
+    let paths = pathbufs_from_drag_strings(paths);
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app
             .try_state::<AppState>()

@@ -22,7 +22,7 @@
         "transparent": false,
         "center": true,
         "skipTaskbar": false,
-        "dragDropEnabled": false
+        "dragDropEnabled": true
       }
     ],
     "security": {
