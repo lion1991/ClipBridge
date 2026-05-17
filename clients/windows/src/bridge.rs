@@ -4,16 +4,17 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    fs,
     io::Cursor,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use clipbridge_core::{
-    sha256_hex, Client, ClipKind, ClipListener, ClipPayload, ConnectionState,
-};
+use clipbridge_core::{sha256_hex, Client, ClipKind, ClipListener, ClipPayload, ConnectionState};
+use directories::UserDirs;
 use image::{GenericImageView, ImageBuffer, ImageFormat, Rgba};
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -22,11 +23,8 @@ use tokio::sync::mpsc;
 use crate::clipboard_listener::ClipboardListener;
 use crate::pairing::{PairingConfig, Store};
 
-#[cfg(any(windows, test))]
-use std::path::Path;
-
 #[cfg(windows)]
-use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
+use std::{ffi::OsString, os::windows::ffi::OsStringExt};
 
 #[cfg(windows)]
 use windows::Win32::{
@@ -65,6 +63,44 @@ pub struct ImageHistoryEntry {
     pub thumbnail: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LanPeerDto {
+    pub device_id: String,
+    pub display_name: String,
+    pub candidate_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileTransferHistoryEntry {
+    pub id: String,
+    pub file_name: String,
+    pub device_name: String,
+    pub size_bytes: u64,
+    pub ts: u64,
+    /// "sent" or "received" — UI grouping key.
+    pub direction: &'static str,
+    /// "sending", "sent", "received", or "failed".
+    pub status: &'static str,
+    pub path: Option<String>,
+    pub message: Option<String>,
+}
+
+impl FileTransferHistoryEntry {
+    fn pending(id: String, file_name: String, device_name: String, size_bytes: u64) -> Self {
+        Self {
+            id,
+            file_name,
+            device_name,
+            size_bytes,
+            ts: now_millis(),
+            direction: "sent",
+            status: "sending",
+            path: None,
+            message: None,
+        }
+    }
+}
+
 /// Window during which a clipboard change matching the most recent remote
 /// write is treated as our own echo and skipped. Long enough that the OS
 /// `WM_CLIPBOARDUPDATE` (or 500 ms poll tick) fires while we still know it's
@@ -87,6 +123,7 @@ pub struct Bridge {
     expected_echo: Arc<Mutex<Option<(String, Instant)>>>,
     state_tx: mpsc::UnboundedSender<UiState>,
     image_tx: mpsc::UnboundedSender<ImageHistoryEntry>,
+    file_tx: mpsc::UnboundedSender<FileTransferHistoryEntry>,
     /// Pixel-content hashes (SHA-256 of decoded RGBA) of recent images,
     /// bounded LRU. Inserted on both publish and receive-write so neither
     /// side re-publishes its own write echo.
@@ -97,6 +134,7 @@ pub struct Bridge {
     /// All entries we've published over IPC. Replayed when the UI asks
     /// for recent images on startup.
     image_history: Arc<Mutex<VecDeque<ImageHistoryEntry>>>,
+    file_history: Arc<Mutex<VecDeque<FileTransferHistoryEntry>>>,
 
     // Native clipboard listener (Windows only). Held here so its Drop
     // signals the worker thread to stop on `stop()`.
@@ -108,6 +146,7 @@ impl Bridge {
     pub fn new(
         state_tx: mpsc::UnboundedSender<UiState>,
         image_tx: mpsc::UnboundedSender<ImageHistoryEntry>,
+        file_tx: mpsc::UnboundedSender<FileTransferHistoryEntry>,
     ) -> Self {
         Self {
             client: None,
@@ -117,9 +156,11 @@ impl Bridge {
             expected_echo: Arc::new(Mutex::new(None)),
             state_tx,
             image_tx,
+            file_tx,
             recent_image_hashes: Arc::new(Mutex::new(VecDeque::new())),
             image_bytes: Arc::new(Mutex::new(HashMap::new())),
             image_history: Arc::new(Mutex::new(VecDeque::new())),
+            file_history: Arc::new(Mutex::new(VecDeque::new())),
             #[cfg(windows)]
             native_listener: None,
         }
@@ -149,6 +190,16 @@ impl Bridge {
             listener.clone() as Arc<dyn ClipListener>,
         )
         .map_err(|e| format!("客户端启动失败:{e}"))?;
+
+        let receive_dir = default_file_receive_dir();
+        if let Err(e) = fs::create_dir_all(&receive_dir) {
+            eprintln!(
+                "[clipbridge] failed to create file receive dir {}: {e}",
+                receive_dir.display()
+            );
+        } else {
+            client.set_file_receive_dir(receive_dir.display().to_string());
+        }
 
         // Hand the listener a back-reference to the client so its receive
         // path can call fetch_image. Set after Client::new because the
@@ -198,7 +249,10 @@ impl Bridge {
         let device_name = device_name();
         let png = normalize_to_png(&bytes).ok_or_else(|| "图片解码失败".to_string())?;
         if png.bytes.len() > MAX_IMAGE_BYTES {
-            return Err(format!("图片 {}MB 超过 32MB 上限", png.bytes.len() / 1024 / 1024));
+            return Err(format!(
+                "图片 {}MB 超过 32MB 上限",
+                png.bytes.len() / 1024 / 1024
+            ));
         }
         if let Some(h) = pixel_hash_hex(&png.bytes) {
             // Insert (return value intentionally ignored — we publish either
@@ -206,12 +260,7 @@ impl Bridge {
             let _ = remember_hash(&self.recent_image_hashes, &h);
         }
         let entry = build_history_entry(&png, &device_name, "sent");
-        publish_image(
-            self.client.as_ref(),
-            &png,
-            &device_name,
-            entry.ts,
-        )?;
+        publish_image(self.client.as_ref(), &png, &device_name, entry.ts)?;
         store_history(
             &self.image_history,
             &self.image_bytes,
@@ -239,6 +288,171 @@ impl Bridge {
             .as_ref()
             .map(|c| c.lan_peers())
             .unwrap_or_default()
+    }
+
+    pub fn lan_file_peers(&self) -> Vec<LanPeerDto> {
+        self.drain_received_files();
+        self.client
+            .as_ref()
+            .map(|c| {
+                let mut peers: Vec<_> = c
+                    .lan_peer_records()
+                    .into_iter()
+                    .map(|p| LanPeerDto {
+                        device_id: p.device_id,
+                        display_name: p.display_name,
+                        candidate_count: p.candidate_count,
+                    })
+                    .collect();
+                peers.sort_by(|a, b| {
+                    a.display_name
+                        .cmp(&b.display_name)
+                        .then_with(|| a.device_id.cmp(&b.device_id))
+                });
+                peers
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn file_receive_dir(&self) -> String {
+        default_file_receive_dir().display().to_string()
+    }
+
+    pub fn recent_file_transfers(&self) -> Vec<FileTransferHistoryEntry> {
+        self.drain_received_files();
+        self.file_history
+            .lock()
+            .map(|h| h.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn send_files_to_peers(
+        &self,
+        paths: Vec<PathBuf>,
+        target_device_ids: Vec<String>,
+    ) -> Result<Vec<FileTransferHistoryEntry>, String> {
+        let client = self
+            .client
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "客户端未启动".to_string())?;
+        let targets: Vec<_> = target_device_ids
+            .into_iter()
+            .filter(|id| !id.trim().is_empty())
+            .collect();
+        if targets.is_empty() {
+            return Err("先选择接收设备".to_string());
+        }
+
+        let peer_names: HashMap<_, _> = client
+            .lan_peer_records()
+            .into_iter()
+            .map(|p| (p.device_id, p.display_name))
+            .collect();
+        let mut final_entries = Vec::new();
+
+        for path in paths {
+            let name = file_display_name(&path);
+            let metadata = fs::metadata(&path);
+            let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+
+            for target in &targets {
+                let target_name = peer_names
+                    .get(target)
+                    .cloned()
+                    .unwrap_or_else(|| target.chars().take(12).collect());
+                let local_id = uuid::Uuid::new_v4().to_string();
+                let pending = FileTransferHistoryEntry::pending(
+                    local_id.clone(),
+                    name.clone(),
+                    target_name.clone(),
+                    size,
+                );
+                store_file_history(&self.file_history, &self.file_tx, pending);
+
+                let final_entry = match metadata.as_ref() {
+                    Ok(meta) if meta.is_file() => match client.send_file_to_peer(
+                        target.clone(),
+                        path.display().to_string(),
+                        None,
+                    ) {
+                        Ok(sent) => FileTransferHistoryEntry {
+                            id: local_id,
+                            file_name: sent.file_name,
+                            device_name: target_name,
+                            size_bytes: sent.bytes_sent,
+                            ts: now_millis(),
+                            direction: "sent",
+                            status: "sent",
+                            path: None,
+                            message: None,
+                        },
+                        Err(e) => FileTransferHistoryEntry {
+                            id: local_id,
+                            file_name: name.clone(),
+                            device_name: target_name,
+                            size_bytes: size,
+                            ts: now_millis(),
+                            direction: "sent",
+                            status: "failed",
+                            path: None,
+                            message: Some(e.to_string()),
+                        },
+                    },
+                    Ok(_) => FileTransferHistoryEntry {
+                        id: local_id,
+                        file_name: name.clone(),
+                        device_name: target_name,
+                        size_bytes: 0,
+                        ts: now_millis(),
+                        direction: "sent",
+                        status: "failed",
+                        path: None,
+                        message: Some("只能发送普通文件".to_string()),
+                    },
+                    Err(e) => FileTransferHistoryEntry {
+                        id: local_id,
+                        file_name: name.clone(),
+                        device_name: target_name,
+                        size_bytes: 0,
+                        ts: now_millis(),
+                        direction: "sent",
+                        status: "failed",
+                        path: None,
+                        message: Some(format!("读取失败:{e}")),
+                    },
+                };
+                store_file_history(&self.file_history, &self.file_tx, final_entry.clone());
+                final_entries.push(final_entry);
+            }
+        }
+
+        Ok(final_entries)
+    }
+
+    fn drain_received_files(&self) -> Vec<FileTransferHistoryEntry> {
+        let Some(client) = self.client.as_ref() else {
+            return Vec::new();
+        };
+        let entries: Vec<_> = client
+            .take_received_files()
+            .into_iter()
+            .map(|file| FileTransferHistoryEntry {
+                id: file.transfer_id,
+                file_name: file.file_name,
+                device_name: "LAN 设备".to_string(),
+                size_bytes: file.size_bytes,
+                ts: now_millis(),
+                direction: "received",
+                status: "received",
+                path: Some(file.path),
+                message: None,
+            })
+            .collect();
+        for entry in &entries {
+            store_file_history(&self.file_history, &self.file_tx, entry.clone());
+        }
+        entries
     }
 
     /// Look up the full PNG bytes of an entry by id (for save-to-file).
@@ -432,7 +646,9 @@ fn try_publish_image(
         );
         return;
     }
-    let Some(h) = pixel_hash_hex(&png.bytes) else { return };
+    let Some(h) = pixel_hash_hex(&png.bytes) else {
+        return;
+    };
     if remember_hash(recent_image_hashes, &h) {
         return; // own echo or re-encoded duplicate
     }
@@ -485,6 +701,46 @@ fn store_history(
     let _ = image_tx.send(entry);
 }
 
+fn store_file_history(
+    file_history: &Arc<Mutex<VecDeque<FileTransferHistoryEntry>>>,
+    file_tx: &mpsc::UnboundedSender<FileTransferHistoryEntry>,
+    entry: FileTransferHistoryEntry,
+) {
+    if let Ok(mut h) = file_history.lock() {
+        if let Some(pos) = h.iter().position(|e| e.id == entry.id) {
+            h.remove(pos);
+        }
+        h.push_front(entry.clone());
+        while h.len() > HISTORY_LIMIT {
+            h.pop_back();
+        }
+    }
+    let _ = file_tx.send(entry);
+}
+
+fn file_display_name(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    raw.rsplit(['\\', '/'])
+        .next()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("file")
+        .to_string()
+}
+
+fn default_file_receive_dir() -> PathBuf {
+    UserDirs::new()
+        .and_then(|u| u.download_dir().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join("ClipBridge")
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Insert into the bounded LRU set. Returns true if the hash was already
 /// present (caller should skip), false if newly inserted.
 fn remember_hash(set: &Arc<Mutex<VecDeque<String>>>, hash: &str) -> bool {
@@ -534,7 +790,9 @@ fn read_clipboard_bitmap_image() -> Option<NormalizedPng> {
     let bytes = img.bytes.into_owned();
     let buffer: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_raw(width, height, bytes)?;
     let mut png = Vec::with_capacity(buffer.as_raw().len() / 4);
-    buffer.write_to(&mut Cursor::new(&mut png), ImageFormat::Png).ok()?;
+    buffer
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .ok()?;
     Some(NormalizedPng {
         bytes: png,
         mime: "image/png".to_string(),
@@ -740,49 +998,6 @@ fn device_name() -> String {
         .unwrap_or_else(|| "Windows".to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{fs, path::PathBuf};
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!(
-            "clipbridge-windows-{name}-{}-{nanos}",
-            std::process::id()
-        ))
-    }
-
-    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
-        let image = ImageBuffer::from_pixel(width, height, Rgba([42u8, 90, 210, 255]));
-        let mut png = Vec::new();
-        image
-            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
-            .expect("encode test png");
-        png
-    }
-
-    #[test]
-    fn normalizes_copied_png_file_from_path() {
-        let dir = temp_dir("png-file");
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let path = dir.join("copied.png");
-        let original = png_bytes(3, 2);
-        fs::write(&path, &original).expect("write png");
-
-        let png = normalize_image_file_at_path(&path).expect("image file should decode");
-
-        assert_eq!(png.mime, "image/png");
-        assert_eq!((png.width, png.height), (3, 2));
-        assert_eq!(png.bytes, original);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-}
-
 struct BridgeListener {
     state_tx: mpsc::UnboundedSender<UiState>,
     image_tx: mpsc::UnboundedSender<ImageHistoryEntry>,
@@ -854,7 +1069,9 @@ impl BridgeListener {
                     return;
                 }
             };
-            let Some(h) = pixel_hash_hex(&bytes) else { return };
+            let Some(h) = pixel_hash_hex(&bytes) else {
+                return;
+            };
             if remember_hash(&recent, &h) {
                 return; // already on our clipboard / in history
             }
@@ -886,5 +1103,79 @@ impl BridgeListener {
         // Drop the original `meta` to keep the borrow checker happy when
         // the closure captures `meta_clone`.
         let _ = meta;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, path::PathBuf};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "clipbridge-windows-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = ImageBuffer::from_pixel(width, height, Rgba([42u8, 90, 210, 255]));
+        let mut png = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .expect("encode test png");
+        png
+    }
+
+    #[test]
+    fn normalizes_copied_png_file_from_path() {
+        let dir = temp_dir("png-file");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("copied.png");
+        let original = png_bytes(3, 2);
+        fs::write(&path, &original).expect("write png");
+
+        let png = normalize_image_file_at_path(&path).expect("image file should decode");
+
+        assert_eq!(png.mime, "image/png");
+        assert_eq!((png.width, png.height), (3, 2));
+        assert_eq!(png.bytes, original);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_display_name_uses_path_basename() {
+        let path = PathBuf::from(r"C:\Users\matt\Downloads\report.pdf");
+
+        assert_eq!(file_display_name(&path), "report.pdf");
+    }
+
+    #[test]
+    fn file_history_upsert_replaces_existing_entry() {
+        let history = Arc::new(Mutex::new(VecDeque::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pending = FileTransferHistoryEntry::pending(
+            "local-1".into(),
+            "report.pdf".into(),
+            "SM-S9380".into(),
+            4096,
+        );
+        let sent = FileTransferHistoryEntry {
+            status: "sent",
+            ..pending.clone()
+        };
+
+        store_file_history(&history, &tx, pending);
+        store_file_history(&history, &tx, sent);
+
+        let snapshot: Vec<_> = history.lock().unwrap().iter().cloned().collect();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].status, "sent");
+        assert_eq!(snapshot[0].file_name, "report.pdf");
     }
 }

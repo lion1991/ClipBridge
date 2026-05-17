@@ -52,7 +52,26 @@
       </div>
     </main>
 
-    <main id="view-images" class="view hidden">
+    <main id="view-transfers" class="view hidden">
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>发送文件</h2>
+            <p id="file-target-summary" class="hint">暂无可用 LAN 设备</p>
+          </div>
+          <button id="btn-file-select-all">全选</button>
+        </div>
+        <div id="file-peer-list" class="peer-list"></div>
+        <button id="btn-pick-files" class="primary wide">选择文件发送…</button>
+        <p class="hint receive-path">接收目录 · <code id="file-receive-dir">Downloads\ClipBridge</code></p>
+      </section>
+
+      <section class="card">
+        <h2>文件记录</h2>
+        <div id="file-history-empty" class="hint">暂无文件传输记录</div>
+        <div id="file-history-list" class="file-history hidden"></div>
+      </section>
+
       <section class="card">
         <h2>发送图片</h2>
         <div id="drop-zone" class="drop-zone">
@@ -61,7 +80,7 @@
           <div class="drop-sub">或点击选择文件 · 支持多张, 最大 32MB / 张</div>
         </div>
         <p class="hint">在「同步」标签下复制图片也会自动同步。</p>
-        <input id="file-input" type="file" accept="image/*" multiple class="hidden" />
+        <input id="image-input" type="file" accept="image/*" multiple class="hidden" />
       </section>
 
       <section class="card">
@@ -82,9 +101,9 @@
         <span class="tab-icon">⇆</span>
         <span class="tab-label">同步</span>
       </button>
-      <button class="tab-btn" data-tab="images">
+      <button class="tab-btn" data-tab="transfers">
         <span class="tab-icon">▥</span>
-        <span class="tab-label">图片</span>
+        <span class="tab-label">传输</span>
       </button>
     </nav>
 

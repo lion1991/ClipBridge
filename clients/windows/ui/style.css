@@ -72,7 +72,7 @@ main.view {
 }
 
 /* Bottom tab bar — fixed so the content scrolls underneath. Shows two
- * destinations: the existing pairing/sync screen and the new image area. */
+ * destinations: the existing pairing/sync screen and the transfer area. */
 .bottom-tabs {
   position: fixed;
   bottom: 0;
@@ -157,6 +157,134 @@ main.view {
 .drop-zone .drop-sub {
   font-size: 11px;
   color: var(--text-tertiary);
+}
+
+.section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.section-head h2 {
+  margin-bottom: 4px;
+}
+
+.peer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 12px;
+}
+
+.peer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.peer-row input {
+  margin: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.peer-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.peer-name {
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.peer-meta,
+.file-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.wide {
+  width: 100%;
+}
+
+.receive-path {
+  margin-top: 10px;
+  margin-bottom: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-history {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.file-row {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.file-icon {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  color: var(--text-tertiary);
+}
+
+.file-main {
+  min-width: 0;
+}
+
+.file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-error {
+  margin-top: 2px;
+  color: var(--danger);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-row.failed {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+}
+
+.file-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.file-actions button {
+  padding: 4px 8px;
+  font-size: 11px;
 }
 
 /* Image grid for the recent-received / recent-sent sections. */
@@ -346,6 +474,16 @@ button {
 
 button:hover {
   background: var(--neutral-bg);
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+button:disabled:hover {
+  background: var(--surface-2);
+  border-color: var(--border);
 }
 
 button.primary {

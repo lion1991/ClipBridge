@@ -6,7 +6,7 @@ mod bridge;
 mod clipboard_listener;
 mod pairing;
 
-use std::sync::Mutex;
+use std::{path::PathBuf, sync::Mutex};
 
 use qrcode::{render::svg, QrCode};
 use serde::Serialize;
@@ -18,7 +18,7 @@ use tauri::{
 };
 use tokio::sync::mpsc;
 
-use crate::bridge::{Bridge, ImageHistoryEntry, UiState};
+use crate::bridge::{Bridge, FileTransferHistoryEntry, ImageHistoryEntry, LanPeerDto, UiState};
 use crate::pairing::{PairingConfig, Store};
 
 struct AppState {
@@ -35,15 +35,14 @@ struct PairingDto {
 fn main() {
     let (state_tx, mut state_rx) = mpsc::unbounded_channel::<UiState>();
     let (image_tx, mut image_rx) = mpsc::unbounded_channel::<ImageHistoryEntry>();
-    let bridge = Bridge::new(state_tx, image_tx);
+    let (file_tx, mut file_rx) = mpsc::unbounded_channel::<FileTransferHistoryEntry>();
+    let bridge = Bridge::new(state_tx, image_tx, file_tx);
 
     tauri::Builder::default()
-        .plugin(
-            tauri_plugin_autostart::init(
-                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-                None,
-            ),
-        )
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(AppState {
             bridge: Mutex::new(bridge),
             last_state: Mutex::new(UiState::Idle),
@@ -55,11 +54,16 @@ fn main() {
             cmd_generate_pairing,
             cmd_current_state,
             cmd_lan_peer_names,
+            cmd_lan_file_peers,
             cmd_show_window,
             cmd_quit,
             cmd_recent_images,
             cmd_send_image_bytes,
             cmd_save_image_to_file,
+            cmd_file_receive_dir,
+            cmd_recent_file_transfers,
+            cmd_pick_and_send_files,
+            cmd_reveal_file,
         ])
         .setup(move |app| {
             // Tray icon + menu.
@@ -108,6 +112,13 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 while let Some(entry) = image_rx.recv().await {
                     let _ = app_handle.emit("image-event", &entry);
+                }
+            });
+
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some(entry) = file_rx.recv().await {
+                    let _ = app_handle.emit("file-event", &entry);
                 }
             });
 
@@ -240,6 +251,15 @@ fn cmd_lan_peer_names(state: State<'_, AppState>) -> Vec<String> {
 }
 
 #[tauri::command]
+fn cmd_lan_file_peers(state: State<'_, AppState>) -> Vec<LanPeerDto> {
+    state
+        .bridge
+        .lock()
+        .map(|b| b.lan_file_peers())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
 fn cmd_show_window(app: AppHandle) {
     show_main_window(&app);
 }
@@ -313,6 +333,78 @@ async fn cmd_save_image_to_file(
     let Some(path) = chosen else { return Ok(None) };
     std::fs::write(&path, &bytes).map_err(|e| format!("写入失败:{e}"))?;
     Ok(Some(path.display().to_string()))
+}
+
+#[tauri::command]
+fn cmd_file_receive_dir(state: State<'_, AppState>) -> String {
+    state
+        .bridge
+        .lock()
+        .map(|b| b.file_receive_dir())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn cmd_recent_file_transfers(state: State<'_, AppState>) -> Vec<FileTransferHistoryEntry> {
+    state
+        .bridge
+        .lock()
+        .map(|b| b.recent_file_transfers())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+async fn cmd_pick_and_send_files(
+    target_device_ids: Vec<String>,
+    app: AppHandle,
+) -> Result<Vec<FileTransferHistoryEntry>, String> {
+    let paths = tauri::async_runtime::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("选择要发送的文件")
+            .pick_files()
+    })
+    .await
+    .map_err(|e| format!("dialog task: {e}"))?;
+
+    let Some(paths) = paths else {
+        return Ok(Vec::new());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app
+            .try_state::<AppState>()
+            .ok_or_else(|| "app state missing".to_string())?;
+        let bridge = state.bridge.lock().map_err(|e| e.to_string())?;
+        bridge.send_files_to_peers(paths, target_device_ids)
+    })
+    .await
+    .map_err(|e| format!("send task: {e}"))?
+}
+
+#[tauri::command]
+fn cmd_reveal_file(path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    if !path.exists() {
+        return Err("文件不存在".to_string());
+    }
+    reveal_file(path)
+}
+
+#[cfg(windows)]
+fn reveal_file(path: PathBuf) -> Result<(), String> {
+    use std::process::Command;
+
+    let mut arg = String::from("/select,");
+    arg.push_str(&path.display().to_string());
+    Command::new("explorer")
+        .arg(arg)
+        .spawn()
+        .map_err(|e| format!("打开资源管理器失败:{e}"))?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn reveal_file(_path: PathBuf) -> Result<(), String> {
+    Err("仅 Windows 客户端支持打开位置".to_string())
 }
 
 fn render_qr(text: &str) -> Option<String> {

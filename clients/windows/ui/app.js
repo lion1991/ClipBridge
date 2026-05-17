@@ -10,7 +10,7 @@ const errorBox = $("error");
 
 // Bottom tab routing — the two `<main class="view">` sections are
 // shown/hidden based on which tab is active. Cheaper than re-rendering;
-// the image grid keeps its scroll position when switching back.
+// the transfer grids keep their scroll position when switching back.
 function setActiveTab(tab) {
   document.querySelectorAll(".tab-btn").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.tab === tab);
@@ -110,12 +110,15 @@ function renderStatusPill() {
   label.textContent = text;
 }
 
-// ─── Image tab ───
+// ─── Transfer tab ───
 
 /** In-memory mirror of bridge::image_history. Bridge pushes via
  *  "image-event"; we also seed from cmd_recent_images on first show.
  *  Newest first. */
 const imageHistory = [];
+const fileHistory = [];
+let lanFilePeers = [];
+const selectedFileTargets = new Set();
 
 function formatSize(bytes) {
   const kb = Math.max(1, Math.round(bytes / 1024));
@@ -129,6 +132,99 @@ function relativeTime(tsMillis) {
   if (delta < 3_600_000) return Math.round(delta / 60_000) + " 分钟前";
   if (delta < 86_400_000) return Math.round(delta / 3_600_000) + " 小时前";
   return Math.round(delta / 86_400_000) + " 天前";
+}
+
+function renderFileTransfer() {
+  const summary = $("file-target-summary");
+  const list = $("file-peer-list");
+  const selectAll = $("btn-file-select-all");
+  const sendBtn = $("btn-pick-files");
+
+  const validIds = new Set(lanFilePeers.map((p) => p.device_id));
+  [...selectedFileTargets].forEach((id) => {
+    if (!validIds.has(id)) selectedFileTargets.delete(id);
+  });
+
+  const selectedCount = [...selectedFileTargets].filter((id) => validIds.has(id)).length;
+  if (lanFilePeers.length === 0) summary.textContent = "暂无可用 LAN 设备";
+  else if (selectedCount === 0) summary.textContent = "未选择设备";
+  else if (selectedCount === lanFilePeers.length) summary.textContent = `已选择全部 ${lanFilePeers.length} 台`;
+  else summary.textContent = `已选择 ${selectedCount}/${lanFilePeers.length} 台`;
+
+  selectAll.disabled = lanFilePeers.length === 0;
+  selectAll.textContent = selectedCount === lanFilePeers.length && lanFilePeers.length > 0 ? "清空" : "全选";
+  sendBtn.disabled = lanFilePeers.length === 0 || selectedCount === 0;
+
+  if (lanFilePeers.length === 0) {
+    list.innerHTML = `<div class="hint">等同组设备出现在局域网后可发送文件。</div>`;
+  } else {
+    list.innerHTML = lanFilePeers.map((peer) => `
+      <label class="peer-row">
+        <input type="checkbox" data-file-peer="${escapeHtml(peer.device_id)}" ${selectedFileTargets.has(peer.device_id) ? "checked" : ""} />
+        <span class="peer-main">
+          <span class="peer-name" title="${escapeHtml(peer.display_name)}">${escapeHtml(peer.display_name)}</span>
+          <span class="peer-meta">${peer.candidate_count} 个地址</span>
+        </span>
+      </label>
+    `).join("");
+    list.querySelectorAll("input[data-file-peer]").forEach((input) => {
+      input.addEventListener("change", () => {
+        if (input.checked) selectedFileTargets.add(input.dataset.filePeer);
+        else selectedFileTargets.delete(input.dataset.filePeer);
+        renderFileTransfer();
+      });
+    });
+  }
+
+  renderFileHistory();
+}
+
+function renderFileHistory() {
+  const list = $("file-history-list");
+  const empty = $("file-history-empty");
+  if (fileHistory.length === 0) {
+    list.classList.add("hidden");
+    empty.classList.remove("hidden");
+    list.innerHTML = "";
+    return;
+  }
+  empty.classList.add("hidden");
+  list.classList.remove("hidden");
+  list.innerHTML = fileHistory.map(fileRowHtml).join("");
+  list.querySelectorAll("button[data-reveal-file]").forEach((btn) => {
+    btn.addEventListener("click", () => revealFile(btn.dataset.revealFile));
+  });
+}
+
+function fileRowHtml(entry) {
+  const statusText = {
+    sending: "发送中",
+    sent: "已发送",
+    received: "已接收",
+    failed: "失败",
+  }[entry.status] || entry.status || "";
+  const reveal = entry.path && entry.status === "received"
+    ? `<button data-reveal-file="${entry.id}">打开位置</button>`
+    : "";
+  return `
+    <div class="file-row ${entry.status === "failed" ? "failed" : ""}">
+      <div class="file-icon">□</div>
+      <div class="file-main">
+        <div class="file-name" title="${escapeHtml(entry.file_name)}">${escapeHtml(entry.file_name)}</div>
+        <div class="file-meta">${escapeHtml(entry.device_name)} · ${formatSize(entry.size_bytes)} · ${statusText} · ${relativeTime(entry.ts)}</div>
+        ${entry.message ? `<div class="file-error">${escapeHtml(entry.message)}</div>` : ""}
+      </div>
+      <div class="file-actions">${reveal}</div>
+    </div>
+  `;
+}
+
+function appendOrReplaceFileEntry(entry) {
+  const idx = fileHistory.findIndex((e) => e.id === entry.id);
+  if (idx >= 0) fileHistory.splice(idx, 1);
+  fileHistory.unshift(entry);
+  if (fileHistory.length > 24) fileHistory.length = 24;
+  renderFileTransfer();
 }
 
 function renderImageHistory() {
@@ -194,7 +290,7 @@ function appendOrReplaceEntry(entry) {
 }
 
 async function pickAndSendImages() {
-  const input = $("file-input");
+  const input = $("image-input");
   // Reset value so re-selecting the same file fires `change` again.
   input.value = "";
   input.click();
@@ -233,6 +329,36 @@ async function saveImage(id) {
   }
 }
 
+async function pickAndSendFiles() {
+  const targetDeviceIds = [...selectedFileTargets];
+  if (targetDeviceIds.length === 0) {
+    toast("先选择接收设备");
+    return;
+  }
+  try {
+    const entries = await invoke("cmd_pick_and_send_files", { targetDeviceIds });
+    if (Array.isArray(entries)) {
+      entries.forEach(appendOrReplaceFileEntry);
+      if (entries.length > 0) toast(`已处理 ${entries.length} 个文件任务`);
+    }
+  } catch (e) {
+    toast(`发送失败:${e}`);
+  }
+}
+
+async function revealFile(id) {
+  const entry = fileHistory.find((e) => e.id === id);
+  if (!entry?.path) {
+    toast("文件路径已过期");
+    return;
+  }
+  try {
+    await invoke("cmd_reveal_file", { path: entry.path });
+  } catch (e) {
+    toast(`打开失败:${e}`);
+  }
+}
+
 async function init() {
   // Tab switching.
   document.querySelectorAll(".tab-btn").forEach((btn) => {
@@ -250,6 +376,12 @@ async function init() {
     try {
       const names = await invoke("cmd_lan_peer_names");
       setLanPeerNames(names);
+      const peers = await invoke("cmd_lan_file_peers");
+      lanFilePeers = Array.isArray(peers) ? peers : [];
+      if (lastLanPeerNames.length === 0 && lanFilePeers.length > 0) {
+        setLanPeerNames(lanFilePeers.map((p) => p.display_name));
+      }
+      renderFileTransfer();
     } catch (e) {
       // Bridge not started yet — keep the previous value.
     }
@@ -269,6 +401,23 @@ async function init() {
     }
   } catch (e) {
     console.warn("recent images:", e);
+  }
+
+  await listen("file-event", (evt) => appendOrReplaceFileEntry(evt.payload));
+  try {
+    const receiveDir = await invoke("cmd_file_receive_dir");
+    if (receiveDir) $("file-receive-dir").textContent = receiveDir;
+  } catch (e) {
+    console.warn("file receive dir:", e);
+  }
+  try {
+    const recentFiles = await invoke("cmd_recent_file_transfers");
+    if (Array.isArray(recentFiles)) {
+      fileHistory.splice(0, fileHistory.length, ...recentFiles);
+      renderFileTransfer();
+    }
+  } catch (e) {
+    console.warn("recent files:", e);
   }
 
   // Load existing pairing if any.
@@ -367,6 +516,16 @@ async function init() {
   // events fire here with File objects on `dataTransfer.files`.
   const dropZone = $("drop-zone");
   dropZone.addEventListener("click", () => pickAndSendImages());
+  $("btn-pick-files").addEventListener("click", () => pickAndSendFiles());
+  $("btn-file-select-all").addEventListener("click", () => {
+    if (selectedFileTargets.size === lanFilePeers.length && lanFilePeers.length > 0) {
+      selectedFileTargets.clear();
+    } else {
+      selectedFileTargets.clear();
+      lanFilePeers.forEach((peer) => selectedFileTargets.add(peer.device_id));
+    }
+    renderFileTransfer();
+  });
 
   // dragenter / dragover both must call preventDefault, otherwise drop
   // never fires (browser defaults to "no drop allowed"). dragleave needs
@@ -414,9 +573,11 @@ async function init() {
     });
   });
 
-  $("file-input").addEventListener("change", (e) => {
+  $("image-input").addEventListener("change", (e) => {
     handlePickedFiles(Array.from(e.target.files || []));
   });
+
+  renderFileTransfer();
 }
 
 init();
