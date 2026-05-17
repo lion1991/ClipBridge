@@ -9,8 +9,10 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.net.Uri
+import android.os.Environment
 import android.os.PowerManager
 import android.net.wifi.WifiManager
+import android.provider.OpenableColumns
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -32,6 +34,8 @@ import uniffi.clipbridge_core.ClipListener
 import uniffi.clipbridge_core.ClipPayload
 import uniffi.clipbridge_core.ConnectionState
 import uniffi.clipbridge_core.ImageMeta
+import java.io.File
+import java.util.UUID
 
 /**
  * Two paths to picking up clipboard changes on Android 10+, where background
@@ -182,6 +186,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         } else {
             lanActiveJob?.cancel()
             lanActiveJob = null
+            _lanFilePeers.value = emptyList()
             _lanPeerNames.value = emptyList()
             _lanPeerCount.value = 0
             releaseMulticastLock()
@@ -209,11 +214,45 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         lanCountJob = scope.launch {
             while (isActive) {
                 if (lanActive) {
-                    val names = client?.lanPeers().orEmpty().sorted()
-                    _lanPeerNames.value = names
-                    _lanPeerCount.value = names.size
+                    try {
+                        val records = client?.lanPeerRecords().orEmpty()
+                            .map {
+                                LanFilePeer(
+                                    deviceId = it.deviceId,
+                                    displayName = it.displayName,
+                                    candidateCount = it.candidateCount.toInt(),
+                                )
+                            }
+                            .sortedWith(compareBy<LanFilePeer> { it.displayName }.thenBy { it.deviceId })
+                        _lanFilePeers.value = records
+
+                        val names = client?.lanPeers().orEmpty().sorted()
+                        val displayNames = names.ifEmpty { records.map { it.displayName } }
+                        _lanPeerNames.value = displayNames
+                        _lanPeerCount.value = displayNames.size
+
+                        val received = client?.takeReceivedFiles().orEmpty()
+                        if (received.isNotEmpty()) {
+                            received.forEach { file ->
+                                appendFileTransferHistory(
+                                    FileTransferHistoryEntry(
+                                        id = file.transferId,
+                                        fileName = file.fileName,
+                                        deviceName = "LAN 设备",
+                                        sizeBytes = file.sizeBytes,
+                                        direction = FileTransferDirection.RECEIVED,
+                                        status = FileTransferStatus.RECEIVED,
+                                        path = file.path,
+                                    )
+                                )
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "LAN/file poll failed: ${t.message}")
+                    }
                     delay(LAN_COUNT_ACTIVE_INTERVAL_MS)
                 } else {
+                    _lanFilePeers.value = emptyList()
                     _lanPeerNames.value = emptyList()
                     _lanPeerCount.value = 0
                     delay(LAN_COUNT_IDLE_INTERVAL_MS)
@@ -296,6 +335,8 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         client = null
         releaseMulticastLock()
         _stateFlow.value = UiConnState.Idle
+        _lanFilePeers.value = emptyList()
+        _fileReceiveDir.value = ""
         return super.onUnbind(intent)
     }
 
@@ -582,6 +623,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             Log.e(TAG, "failed to start client", t)
             null
         }
+        client?.let { configureFileReceiving() }
         client?.setReconnectIdleMode(reconnectIdleMode)
         setLanActive(lanActive)
     }
@@ -589,8 +631,26 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private fun restartClient() {
         client?.stop()
         client = null
+        _lanFilePeers.value = emptyList()
+        _fileReceiveDir.value = ""
         releaseMulticastLock()
         startClient()
+    }
+
+    private fun configureFileReceiving() {
+        val base = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
+        val dir = File(base, "ClipBridge")
+        if (!dir.isDirectory && !dir.mkdirs()) {
+            Log.w(TAG, "failed to create file receive dir: ${dir.absolutePath}")
+            return
+        }
+        _fileReceiveDir.value = dir.absolutePath
+        try {
+            client?.setFileReceiveDir(dir.absolutePath)
+            Log.i(TAG, "file receive dir: ${dir.absolutePath}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "setFileReceiveDir failed: ${t.message}")
+        }
     }
 
     private fun acquireMulticastLock() {
@@ -641,6 +701,143 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             // Explicit user action — bypass dedup so re-picking the same
             // image actually re-sends.
             withContext(Dispatchers.Main) { publishImage(outbound, dedup = false) }
+        }
+    }
+
+    fun sendFilesToPeers(uris: List<Uri>, targetDeviceIds: List<String>) {
+        val targets = targetDeviceIds.distinct().filter { it.isNotBlank() }
+        if (uris.isEmpty() || targets.isEmpty()) return
+
+        activateLanTemporarily("file send")
+        scope.launch(Dispatchers.IO) {
+            val peerNames = _lanFilePeers.value.associate { it.deviceId to it.displayName }
+            for (uri in uris) {
+                val cached = try {
+                    copyUriToTransferCache(uri)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "failed to stage file for send: ${t.message}")
+                    null
+                }
+                if (cached == null) {
+                    appendFileTransferHistory(
+                        FileTransferHistoryEntry(
+                            id = UUID.randomUUID().toString(),
+                            fileName = sanitizeAndroidFileTransferName(queryDisplayName(uri)),
+                            deviceName = "LAN 设备",
+                            sizeBytes = 0UL,
+                            direction = FileTransferDirection.SENT,
+                            status = FileTransferStatus.FAILED,
+                            message = "无法读取文件",
+                        )
+                    )
+                    continue
+                }
+
+                try {
+                    for (target in targets) {
+                        sendCachedFileToTarget(
+                            cached = cached,
+                            targetDeviceId = target,
+                            targetName = peerNames[target] ?: target.take(12),
+                        )
+                    }
+                } finally {
+                    cached.file.delete()
+                    cached.file.parentFile?.delete()
+                }
+            }
+        }
+    }
+
+    private data class CachedTransferFile(
+        val file: File,
+        val displayName: String,
+        val mimeType: String?,
+        val sizeBytes: ULong,
+    )
+
+    private fun copyUriToTransferCache(uri: Uri): CachedTransferFile? {
+        val displayName = sanitizeAndroidFileTransferName(queryDisplayName(uri))
+        val dir = File(File(cacheDir, "clipbridge_file_sends"), UUID.randomUUID().toString())
+        if (!dir.isDirectory && !dir.mkdirs()) return null
+        val outFile = File(dir, displayName)
+        val input = contentResolver.openInputStream(uri) ?: return null
+        input.use { source ->
+            outFile.outputStream().use { target ->
+                source.copyTo(target, bufferSize = 256 * 1024)
+            }
+        }
+        return CachedTransferFile(
+            file = outFile,
+            displayName = displayName,
+            mimeType = contentResolver.getType(uri),
+            sizeBytes = outFile.length().coerceAtLeast(0L).toULong(),
+        )
+    }
+
+    private fun queryDisplayName(uri: Uri): String {
+        val projection = arrayOf(OpenableColumns.DISPLAY_NAME)
+        val fromProvider = runCatching {
+            contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) cursor.getString(idx) else null
+                } else {
+                    null
+                }
+            }
+        }.getOrNull()
+        return fromProvider
+            ?: uri.lastPathSegment?.substringAfterLast('/')?.substringAfterLast('\\')
+            ?: "file"
+    }
+
+    private fun sendCachedFileToTarget(
+        cached: CachedTransferFile,
+        targetDeviceId: String,
+        targetName: String,
+    ) {
+        val localId = UUID.randomUUID().toString()
+        appendFileTransferHistory(
+            FileTransferHistoryEntry(
+                id = localId,
+                fileName = cached.displayName,
+                deviceName = targetName,
+                sizeBytes = cached.sizeBytes,
+                direction = FileTransferDirection.SENT,
+                status = FileTransferStatus.SENDING,
+            )
+        )
+
+        try {
+            val sent = client?.sendFileToPeer(
+                targetDeviceId = targetDeviceId,
+                sourcePath = cached.file.absolutePath,
+                mimeType = cached.mimeType,
+            ) ?: error("客户端未启动")
+            upsertFileTransferHistory(
+                FileTransferHistoryEntry(
+                    id = localId,
+                    fileName = sent.fileName,
+                    deviceName = targetName,
+                    sizeBytes = sent.bytesSent,
+                    direction = FileTransferDirection.SENT,
+                    status = FileTransferStatus.SENT,
+                )
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "sendFileToPeer failed: ${t.message}")
+            upsertFileTransferHistory(
+                FileTransferHistoryEntry(
+                    id = localId,
+                    fileName = cached.displayName,
+                    deviceName = targetName,
+                    sizeBytes = cached.sizeBytes,
+                    direction = FileTransferDirection.SENT,
+                    status = FileTransferStatus.FAILED,
+                    message = t.message ?: "发送失败",
+                )
+            )
         }
     }
 
@@ -743,6 +940,12 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         private val _lanPeerNames = MutableStateFlow<List<String>>(emptyList())
         val lanPeerNames: StateFlow<List<String>> = _lanPeerNames.asStateFlow()
 
+        private val _lanFilePeers = MutableStateFlow<List<LanFilePeer>>(emptyList())
+        val lanFilePeers: StateFlow<List<LanFilePeer>> = _lanFilePeers.asStateFlow()
+
+        private val _fileReceiveDir = MutableStateFlow("")
+        val fileReceiveDir: StateFlow<String> = _fileReceiveDir.asStateFlow()
+
         // Image traffic history surfaced to the UI's image transfer card.
         // Newest first, capped at HISTORY_LIMIT. Sent and received both
         // appear here so the user can save / re-share their own outbound
@@ -751,6 +954,11 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         private const val HISTORY_LIMIT = 12
         private val _imageHistory = MutableStateFlow<List<ImageHistoryEntry>>(emptyList())
         val imageHistory: StateFlow<List<ImageHistoryEntry>> = _imageHistory.asStateFlow()
+
+        private val _fileTransferHistory =
+            MutableStateFlow<List<FileTransferHistoryEntry>>(emptyList())
+        val fileTransferHistory: StateFlow<List<FileTransferHistoryEntry>> =
+            _fileTransferHistory.asStateFlow()
 
         internal fun appendImageHistory(entry: ImageHistoryEntry) {
             val combined = (listOf(entry) + _imageHistory.value)
@@ -761,6 +969,23 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
 
         internal fun clearImageHistory() {
             _imageHistory.value = emptyList()
+        }
+
+        internal fun appendFileTransferHistory(entry: FileTransferHistoryEntry) {
+            val combined = (listOf(entry) + _fileTransferHistory.value)
+                .distinctBy { it.id }
+                .take(HISTORY_LIMIT)
+            _fileTransferHistory.value = combined
+        }
+
+        internal fun upsertFileTransferHistory(entry: FileTransferHistoryEntry) {
+            val current = _fileTransferHistory.value
+            val replaced = current.map { if (it.id == entry.id) entry else it }
+            _fileTransferHistory.value = if (current.any { it.id == entry.id }) {
+                replaced
+            } else {
+                (listOf(entry) + current).take(HISTORY_LIMIT)
+            }
         }
 
         // Weak handle to the live AccessibilityService instance for the UI

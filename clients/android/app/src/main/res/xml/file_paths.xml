@@ -2,11 +2,13 @@
 <!--
   FileProvider roots for ClipBridge.
 
-  We expose only the cache subdirectory `clipbridge_images/` so image
-  payloads we receive from peers can be handed to the system clipboard as
-  content:// URIs. Cache files are GC'd by Android under storage pressure;
-  we don't need to keep them past the user's next paste.
+  Keep exposed roots narrow: cached image/share payloads, staged outbound
+  file copies, and the app-scoped ClipBridge download folder used by LAN
+  file receive.
 -->
 <paths>
     <cache-path name="clipbridge_images" path="clipbridge_images/" />
+    <cache-path name="clipbridge_file_sends" path="clipbridge_file_sends/" />
+    <files-path name="clipbridge_internal_downloads" path="ClipBridge/" />
+    <external-files-path name="clipbridge_downloads" path="Download/ClipBridge/" />
 </paths>

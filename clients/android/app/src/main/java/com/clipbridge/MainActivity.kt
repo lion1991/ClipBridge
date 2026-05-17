@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.webkit.MimeTypeMap
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -48,7 +49,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AdminPanelSettings
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.PhotoLibrary
@@ -62,6 +67,7 @@ import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
@@ -71,6 +77,7 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -206,6 +213,7 @@ private fun PairingScreen(
 
     val connState by ClipBridgeAccessibilityService.stateFlow.collectAsStateWithLifecycle()
     val lanPeerNames by ClipBridgeAccessibilityService.lanPeerNames.collectAsStateWithLifecycle()
+    val lanFilePeers by ClipBridgeAccessibilityService.lanFilePeers.collectAsStateWithLifecycle()
 
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
@@ -244,7 +252,39 @@ private fun PairingScreen(
         }
     }
 
+    var selectedFileTargets by remember { mutableStateOf<Set<String>>(emptySet()) }
+    LaunchedEffect(lanFilePeers) {
+        val currentIds = lanFilePeers.map { it.deviceId }.toSet()
+        selectedFileTargets = selectedFileTargets.filter { it in currentIds }.toSet()
+    }
+    val pickFilesLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        if (selectedFileTargets.isEmpty()) {
+            scope.launch { snackbarHostState.showSnackbar("先选择接收设备") }
+            return@rememberLauncherForActivityResult
+        }
+        uris.forEach { uri ->
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
+        }
+        ClipBridgeAccessibilityService.activeService()?.sendFilesToPeers(
+            uris = uris,
+            targetDeviceIds = selectedFileTargets.toList(),
+        ) ?: scope.launch {
+            snackbarHostState.showSnackbar("无障碍服务未启动, 无法发送")
+        }
+    }
+
     val imageHistory by ClipBridgeAccessibilityService.imageHistory.collectAsStateWithLifecycle()
+    val fileTransferHistory by ClipBridgeAccessibilityService.fileTransferHistory
+        .collectAsStateWithLifecycle()
+    val fileReceiveDir by ClipBridgeAccessibilityService.fileReceiveDir.collectAsStateWithLifecycle()
     var selectedTab by remember { mutableStateOf(BottomTab.Sync) }
 
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
@@ -269,7 +309,7 @@ private fun PairingScreen(
                     Text(
                         when (selectedTab) {
                             BottomTab.Sync -> "ClipBridge"
-                            BottomTab.Images -> "图片"
+                            BottomTab.Transfers -> "传输"
                         },
                         style = MaterialTheme.typography.titleLarge,
                     )
@@ -288,10 +328,10 @@ private fun PairingScreen(
                     label = { Text("同步") },
                 )
                 NavigationBarItem(
-                    selected = selectedTab == BottomTab.Images,
-                    onClick = { selectedTab = BottomTab.Images },
-                    icon = { Icon(Icons.Filled.PhotoLibrary, contentDescription = null) },
-                    label = { Text("图片") },
+                    selected = selectedTab == BottomTab.Transfers,
+                    onClick = { selectedTab = BottomTab.Transfers },
+                    icon = { Icon(Icons.Filled.AttachFile, contentDescription = null) },
+                    label = { Text("传输") },
                 )
             }
         },
@@ -366,10 +406,33 @@ private fun PairingScreen(
                     toast("已重置配对")
                 },
             )
-            BottomTab.Images -> ImagesTabContent(
+            BottomTab.Transfers -> TransferTabContent(
                 padding = padding,
                 isPaired = isPaired,
-                history = imageHistory,
+                filePeers = lanFilePeers,
+                selectedFileTargets = selectedFileTargets,
+                fileReceiveDir = fileReceiveDir,
+                fileHistory = fileTransferHistory,
+                imageHistory = imageHistory,
+                onToggleFileTarget = { id ->
+                    selectedFileTargets = if (id in selectedFileTargets) {
+                        selectedFileTargets - id
+                    } else {
+                        selectedFileTargets + id
+                    }
+                },
+                onSelectAllFileTargets = {
+                    selectedFileTargets = if (selectedFileTargets.size == lanFilePeers.size) {
+                        emptySet()
+                    } else {
+                        lanFilePeers.map { it.deviceId }.toSet()
+                    }
+                },
+                onPickFiles = {
+                    pickFilesLauncher.launch(arrayOf("*/*"))
+                },
+                onOpenFile = { path -> openFile(context, path) },
+                onShareFile = { path -> shareFile(context, path) },
                 onPickFromGallery = {
                     pickMediaLauncher.launch(
                         PickVisualMediaRequest(
@@ -405,7 +468,7 @@ private fun PairingScreen(
     }
 }
 
-private enum class BottomTab { Sync, Images }
+private enum class BottomTab { Sync, Transfers }
 
 @Composable
 private fun SyncTabContent(
@@ -477,10 +540,19 @@ private fun SyncTabContent(
 }
 
 @Composable
-private fun ImagesTabContent(
+private fun TransferTabContent(
     padding: androidx.compose.foundation.layout.PaddingValues,
     isPaired: Boolean,
-    history: List<ImageHistoryEntry>,
+    filePeers: List<LanFilePeer>,
+    selectedFileTargets: Set<String>,
+    fileReceiveDir: String,
+    fileHistory: List<FileTransferHistoryEntry>,
+    imageHistory: List<ImageHistoryEntry>,
+    onToggleFileTarget: (String) -> Unit,
+    onSelectAllFileTargets: () -> Unit,
+    onPickFiles: () -> Unit,
+    onOpenFile: (String) -> Unit,
+    onShareFile: (String) -> Unit,
     onPickFromGallery: () -> Unit,
     onSaveToGallery: (ImageHistoryEntry) -> Unit,
     onCopyToClipboard: (ImageHistoryEntry) -> Unit,
@@ -522,10 +594,22 @@ private fun ImagesTabContent(
             return@Column
         }
 
+        FileTransferCard(
+            peers = filePeers,
+            selectedDeviceIds = selectedFileTargets,
+            receiveDir = fileReceiveDir,
+            history = fileHistory,
+            onToggleTarget = onToggleFileTarget,
+            onSelectAllTargets = onSelectAllFileTargets,
+            onPickFiles = onPickFiles,
+            onOpenFile = onOpenFile,
+            onShareFile = onShareFile,
+        )
+
         // Two sub-sections: received and sent. Keeps the user mental model
         // aligned with iOS's "最近收到 / 最近发送" cards.
-        val received = history.filter { it.direction == ImageHistoryEntry.Direction.RECEIVED }
-        val sent = history.filter { it.direction == ImageHistoryEntry.Direction.SENT }
+        val received = imageHistory.filter { it.direction == ImageHistoryEntry.Direction.RECEIVED }
+        val sent = imageHistory.filter { it.direction == ImageHistoryEntry.Direction.SENT }
 
         ImageTransferCard(
             title = "最近收到",
@@ -547,6 +631,239 @@ private fun ImagesTabContent(
             onCopyToClipboard = onCopyToClipboard,
             onShare = onShare,
         )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun FileTransferCard(
+    peers: List<LanFilePeer>,
+    selectedDeviceIds: Set<String>,
+    receiveDir: String,
+    history: List<FileTransferHistoryEntry>,
+    onToggleTarget: (String) -> Unit,
+    onSelectAllTargets: () -> Unit,
+    onPickFiles: () -> Unit,
+    onOpenFile: (String) -> Unit,
+    onShareFile: (String) -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        shape = RoundedCornerShape(20.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Filled.AttachFile,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("文件", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        fileTransferTargetSummary(peers, selectedDeviceIds),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                TextButton(
+                    onClick = onSelectAllTargets,
+                    enabled = peers.isNotEmpty(),
+                ) {
+                    Text(if (selectedDeviceIds.size == peers.size && peers.isNotEmpty()) "清空" else "全选")
+                }
+            }
+
+            if (peers.isEmpty()) {
+                Text(
+                    "暂无可发送的 LAN 设备",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    peers.forEach { peer ->
+                        FilePeerRow(
+                            peer = peer,
+                            selected = peer.deviceId in selectedDeviceIds,
+                            onToggle = { onToggleTarget(peer.deviceId) },
+                        )
+                    }
+                }
+            }
+
+            Button(
+                onClick = onPickFiles,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = peers.isNotEmpty() && selectedDeviceIds.isNotEmpty(),
+            ) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.Send,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("选择文件发送")
+            }
+
+            if (receiveDir.isNotBlank()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Filled.FolderOpen,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "接收目录: $receiveDir",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+
+            Divider()
+
+            if (history.isEmpty()) {
+                Text(
+                    "暂无文件传输记录",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    history.take(8).forEach { entry ->
+                        FileTransferHistoryRow(
+                            entry = entry,
+                            onOpen = { entry.path?.let(onOpenFile) },
+                            onShare = { entry.path?.let(onShareFile) },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FilePeerRow(
+    peer: LanFilePeer,
+    selected: Boolean,
+    onToggle: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable { onToggle() },
+        color = MaterialTheme.colorScheme.surface,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Checkbox(checked = selected, onCheckedChange = { onToggle() })
+            Column(Modifier.weight(1f)) {
+                Text(
+                    peer.displayName,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    "${peer.candidateCount} 个地址",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun FileTransferHistoryRow(
+    entry: FileTransferHistoryEntry,
+    onOpen: () -> Unit,
+    onShare: () -> Unit,
+) {
+    val statusColor = when (entry.status) {
+        FileTransferStatus.FAILED -> MaterialTheme.colorScheme.error
+        FileTransferStatus.SENDING -> MaterialTheme.colorScheme.primary
+        FileTransferStatus.SENT,
+        FileTransferStatus.RECEIVED -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surface,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.InsertDriveFile,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(22.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    entry.fileName,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    "${entry.deviceName} · ${entry.sizeLabel} · ${entry.status.label}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = statusColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                entry.message?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            if (entry.path != null && entry.status == FileTransferStatus.RECEIVED) {
+                IconButton(onClick = onOpen, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.OpenInNew,
+                        contentDescription = "打开",
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+                IconButton(onClick = onShare, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        Icons.Filled.Share,
+                        contentDescription = "分享",
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -1179,6 +1496,45 @@ private fun shareImage(context: Context, entry: ImageHistoryEntry) {
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
     context.startActivity(Intent.createChooser(send, "分享图片"))
+}
+
+private fun openFile(context: Context, path: String) {
+    val file = File(path)
+    if (!file.isFile) return
+    val uri = FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.fileprovider",
+        file,
+    )
+    val view = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, mimeTypeForFile(file))
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    runCatching {
+        context.startActivity(Intent.createChooser(view, "打开文件"))
+    }
+}
+
+private fun shareFile(context: Context, path: String) {
+    val file = File(path)
+    if (!file.isFile) return
+    val uri = FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.fileprovider",
+        file,
+    )
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = mimeTypeForFile(file)
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(send, "分享文件"))
+}
+
+private fun mimeTypeForFile(file: File): String {
+    val ext = file.extension.lowercase()
+    return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+        ?: "application/octet-stream"
 }
 
 @Suppress("BatteryLife") // we sideload — Play Store policy doesn't apply
