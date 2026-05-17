@@ -50,10 +50,12 @@ clients/ios/
 ├── ClipBridge.xcodeproj    # xcodegen 生成,Git 忽略
 ├── Sources/
 │   ├── App.swift           # @main + AppDelegate + 协调器单例
-│   ├── ContentView.swift   # 主屏:状态 pill + 配对入口卡片
+│   ├── ContentView.swift   # 主屏:同步状态、文件/图片传输入口和历史
+│   ├── FilePickerSheet.swift # 系统文件选择器
+│   ├── FileTransferModels.swift # 文件传输 UI 模型和格式化
 │   ├── PairingScreen.swift # Sheet 弹层:扫码 / 高级 JSON / 重置
 │   ├── PairingConfig.swift # 配对配置(与 Mac/Win/Android 互通)
-│   ├── BridgeCoordinator.swift # 包裹 Rust Client,UIPasteboard 轮询,后台静默音频
+│   ├── BridgeCoordinator.swift # 包裹 Rust Client,UIPasteboard/文件传输协调,后台静默音频
 │   └── ClipbridgeCore/
 │       └── clipbridge_core.swift  # UniFFI 生成的 Swift 胶水,被编进 app 主模块
 └── Resources/
@@ -70,6 +72,6 @@ clients/ios/
   LaunchServices 注册失败(error 181 / "将应用添加至图标缓存失败"),所以
   这里必须有一张 1024×1024、不带 alpha 通道的 PNG。换正式图标时记得保留
   这两个属性。
-- **同 LAN 直连**还没做(Mac/Win 也都没做),全部走公网中继。后续如果做
-  LAN bypass,iOS 上 `NSLocalNetworkUsageDescription` + Bonjour
-  service 这套 entitlements TrollStore 也覆盖。
+- **LAN 文件传输只覆盖主 App 前台**: 发送使用系统文件选择器,接收保存到
+  `Documents/ClipBridge`,并通过 Files App / 分享面板打开。键盘扩展不参与
+  文件传输,也不保证后台接收。

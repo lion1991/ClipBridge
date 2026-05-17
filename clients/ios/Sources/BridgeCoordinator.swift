@@ -1,6 +1,7 @@
 import Combine
 import CryptoKit
 import UIKit
+import UniformTypeIdentifiers
 // Swift glue from clipbridge_core.swift is compiled into this same target,
 // so the types (Client, ClipPayload, ClipListener, ConnectionState, …) are
 // already in scope and don't need an explicit import.
@@ -49,8 +50,11 @@ final class BridgeCoordinator: ObservableObject {
     /// keyboard extension's own polling (separate process, separate state)
     /// — bridging those would need an App Group cache, deferred.
     @Published private(set) var sentClips: [ClipPayload] = []
+    @Published private(set) var lanFilePeers: [LanPeerRecord] = []
+    @Published private(set) var fileTransferHistory: [FileTransferHistoryEntry] = []
 
     private static let recentLimit = 3
+    private static let fileHistoryLimit = 40
 
     /// Hard cap on outbound image bytes — must match the relay's default
     /// `CLIPBRIDGE_BLOB_MAX_BYTES`. Going over fails fast with a status
@@ -91,6 +95,7 @@ final class BridgeCoordinator: ObservableObject {
     /// Serial so a slow upload can't be lapped by the next poll's upload of
     /// the same clip — also keeps the relay from seeing reordered PUTs.
     private let blobQueue = DispatchQueue(label: "com.clipbridge.blob", qos: .userInitiated)
+    private let fileQueue = DispatchQueue(label: "com.clipbridge.files", qos: .userInitiated)
 
     /// SHA-256 hashes of recently-seen clipboard content. Inserted on
     /// publish and on receive-write so the next poll round skips both our
@@ -166,6 +171,8 @@ final class BridgeCoordinator: ObservableObject {
         // pairing's first connect populates from a clean slate.
         recentClips = []
         sentClips = []
+        lanFilePeers = []
+        fileTransferHistory = []
     }
 
     /// Manually pull recent clips from the relay's 5-min cache. Used by
@@ -173,6 +180,7 @@ final class BridgeCoordinator: ObservableObject {
     /// on reconnect, so most of the time this is redundant.
     func refreshRecent() {
         try? client?.fetchRecent()
+        refreshFileTransferState()
     }
 
     /// Public entry point for the picker-driven send: hand us raw bytes
@@ -203,6 +211,71 @@ final class BridgeCoordinator: ObservableObject {
             uiImage: image
         )
         sendImage(clip)
+    }
+
+    func sendFiles(urls: [URL], to targetIds: Set<String>) {
+        let peers = lanFilePeers.filter { targetIds.contains($0.deviceId) }
+        guard !peers.isEmpty else {
+            showTransientError("请选择 LAN 设备")
+            return
+        }
+        guard !urls.isEmpty else { return }
+
+        for url in urls {
+            guard isRegularFileURL(url) else {
+                showTransientError("只能发送普通文件: \(url.lastPathComponent)")
+                continue
+            }
+            queueFileSends(url: url, peers: peers)
+        }
+    }
+
+    private func queueFileSends(url: URL, peers: [LanPeerRecord]) {
+        let size = fileByteSize(url)
+        let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+
+        for peer in peers {
+            let id = UUID()
+            upsertFileTransferEntry(FileTransferHistoryEntry(
+                id: id,
+                direction: .sent,
+                fileName: url.lastPathComponent,
+                fileURL: url,
+                deviceName: peer.displayName,
+                sizeBytes: size,
+                status: .sending
+            ))
+
+            fileQueue.async { [weak self] in
+                guard let self else { return }
+                guard let client = self.client else {
+                    DispatchQueue.main.async {
+                        self.updateFileTransferEntry(id: id, status: .failed("未连接"))
+                    }
+                    return
+                }
+                do {
+                    let sent = try client.sendFileToPeer(
+                        targetDeviceId: peer.deviceId,
+                        sourcePath: url.path,
+                        mimeType: mime
+                    )
+                    DispatchQueue.main.async {
+                        self.updateFileTransferEntry(
+                            id: id,
+                            sizeBytes: sent.bytesSent,
+                            status: .completed
+                        )
+                    }
+                } catch {
+                    let message = self.friendlyErrorMessage(error)
+                    DispatchQueue.main.async {
+                        self.updateFileTransferEntry(id: id, status: .failed(message))
+                    }
+                    self.showTransientError("文件发送失败: \(message)")
+                }
+            }
+        }
     }
 
     /// Re-paste a previously-seen clip onto the local pasteboard from the
@@ -281,6 +354,7 @@ final class BridgeCoordinator: ObservableObject {
                 deviceName: UIDevice.current.name,
                 listener: listener
             )
+            configureFileReceiving()
             status = .connecting
         } catch {
             status = .error("客户端启动失败: \(error)")
@@ -295,6 +369,24 @@ final class BridgeCoordinator: ObservableObject {
         client?.stop()
         client = nil
         listener = nil
+        lanFilePeers = []
+    }
+
+    var fileReceiveDirectory: URL {
+        iOSFileReceiveDirectory()
+    }
+
+    private func configureFileReceiving() {
+        let folder = fileReceiveDirectory
+        do {
+            try FileManager.default.createDirectory(
+                at: folder,
+                withIntermediateDirectories: true
+            )
+            client?.setFileReceiveDir(dir: folder.path)
+        } catch {
+            status = .error("文件接收目录不可用: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Pasteboard
@@ -317,10 +409,36 @@ final class BridgeCoordinator: ObservableObject {
                 if names != self.lanPeerNames {
                     self.lanPeerNames = names
                 }
+                self.refreshFileTransferState()
             }
         }
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer
+    }
+
+    private func refreshFileTransferState() {
+        guard let client else {
+            if !lanFilePeers.isEmpty { lanFilePeers = [] }
+            return
+        }
+
+        let peers = client.lanPeerRecords()
+            .filter { $0.candidateCount > 0 }
+            .sorted {
+                if $0.displayName == $1.displayName {
+                    return $0.deviceId < $1.deviceId
+                }
+                return $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+            }
+        if peers != lanFilePeers {
+            lanFilePeers = peers
+        }
+
+        let completed = client.takeReceivedFiles()
+        guard !completed.isEmpty else { return }
+        for record in completed {
+            upsertFileTransferEntry(FileTransferHistoryEntry(received: record))
+        }
     }
 
     private func checkPasteboard() {
@@ -464,6 +582,30 @@ final class BridgeCoordinator: ObservableObject {
             combined.sort { $0.ts > $1.ts }
             self.sentClips = Array(combined.prefix(Self.recentLimit))
         }
+    }
+
+    private func upsertFileTransferEntry(_ entry: FileTransferHistoryEntry) {
+        if let index = fileTransferHistory.firstIndex(where: { $0.id == entry.id }) {
+            fileTransferHistory.remove(at: index)
+        }
+        fileTransferHistory.insert(entry, at: 0)
+        if fileTransferHistory.count > Self.fileHistoryLimit {
+            fileTransferHistory.removeLast(fileTransferHistory.count - Self.fileHistoryLimit)
+        }
+    }
+
+    private func updateFileTransferEntry(
+        id: UUID,
+        sizeBytes: UInt64? = nil,
+        status: FileTransferStatus
+    ) {
+        guard let index = fileTransferHistory.firstIndex(where: { $0.id == id }) else { return }
+        var updated = fileTransferHistory
+        if let sizeBytes {
+            updated[index].sizeBytes = sizeBytes
+        }
+        updated[index].status = status
+        fileTransferHistory = updated
     }
 
     fileprivate func handleIncoming(payload: ClipPayload) {

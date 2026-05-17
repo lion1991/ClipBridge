@@ -42,6 +42,8 @@ targets:
         UILaunchScreen:
           UIColorName: ""
         UIRequiresFullScreen: false
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         # 加 audio 后台模式 + AudioKeepalive 静音环让主 App 在 background
@@ -157,3 +159,18 @@ targets:
       - framework: ../../build/ios/ClipbridgeCore.xcframework
         embed: false
         codeSign: false
+
+  ClipBridgeTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - Tests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.clipbridge.ios.tests
+        CODE_SIGNING_ALLOWED: "NO"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/ClipBridge.app/ClipBridge"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+    dependencies:
+      - target: ClipBridge

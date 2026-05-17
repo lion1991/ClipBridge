@@ -5,14 +5,16 @@ struct ContentView: View {
     @EnvironmentObject var coordinator: BridgeCoordinator
     @State private var showPairing = false
     @State private var showPhotoPicker = false
+    @State private var showFilePicker = false
+    @State private var selectedFileTargetIds: Set<String> = []
     @State private var saveToast: String?
 
     var body: some View {
         TabView {
             syncTab
                 .tabItem { Label("同步", systemImage: "doc.on.clipboard") }
-            imagesTab
-                .tabItem { Label("图片", systemImage: "photo.on.rectangle.angled") }
+            transferTab
+                .tabItem { Label("传输", systemImage: "tray.and.arrow.up") }
         }
     }
 
@@ -64,13 +66,20 @@ struct ContentView: View {
         .navigationViewStyle(.stack)
     }
 
-    // MARK: - Images tab (send hero, image-only history with save/share)
+    // MARK: - Transfer tab (LAN files + image transfer)
 
-    private var imagesTab: some View {
+    private var transferTab: some View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 16) {
                     if coordinator.hasPairing {
+                        FileTransferCard(
+                            peers: coordinator.lanFilePeers,
+                            selectedIds: $selectedFileTargetIds,
+                            receiveDirectory: coordinator.fileReceiveDirectory,
+                            onPickFiles: { showFilePicker = true }
+                        )
+                        FileTransferHistoryCard(entries: coordinator.fileTransferHistory)
                         ImageTransferCard(onSendImage: { showPhotoPicker = true })
                         ClipHistoryCard(
                             title: "最近收到",
@@ -102,12 +111,21 @@ struct ContentView: View {
                 .padding(20)
             }
             .refreshable { coordinator.refreshRecent() }
-            .navigationTitle("图片")
+            .navigationTitle("传输")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showPhotoPicker) {
                 PhotoPickerSheet(isPresented: $showPhotoPicker) { bytes in
                     coordinator.sendImageBytes(bytes)
                 }
+            }
+            .sheet(isPresented: $showFilePicker) {
+                FilePickerSheet(isPresented: $showFilePicker) { urls in
+                    coordinator.sendFiles(urls: urls, to: selectedFileTargetIds)
+                }
+            }
+            .onChange(of: coordinator.lanFilePeers) { peers in
+                let validIds = Set(peers.map(\.deviceId))
+                selectedFileTargetIds = selectedFileTargetIds.intersection(validIds)
             }
             .overlay(alignment: .bottom) {
                 if let toast = saveToast {
@@ -177,6 +195,233 @@ struct ImageTransferCard: View {
             )
         }
         .buttonStyle(.plain)
+    }
+}
+
+struct FileTransferCard: View {
+    let peers: [LanPeerRecord]
+    @Binding var selectedIds: Set<String>
+    let receiveDirectory: URL
+    let onPickFiles: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("发送文件")
+                        .font(.subheadline.weight(.semibold))
+                    Text(fileTransferTargetSummary(peers: peers, selectedIds: selectedIds))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button(allSelected ? "清空" : "全选") {
+                    if allSelected {
+                        selectedIds.removeAll()
+                    } else {
+                        selectedIds = Set(peers.map(\.deviceId))
+                    }
+                }
+                .font(.caption.weight(.medium))
+                .disabled(peers.isEmpty)
+            }
+
+            if peers.isEmpty {
+                HStack(spacing: 10) {
+                    Image(systemName: "wifi.slash")
+                        .foregroundColor(.secondary)
+                    Text("等同组设备出现在局域网后可发送文件")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+                .padding(12)
+                .background(rowBackground)
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(peers, id: \.deviceId) { peer in
+                        Button {
+                            toggle(peer.deviceId)
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: selectedIds.contains(peer.deviceId)
+                                      ? "checkmark.circle.fill"
+                                      : "circle")
+                                    .foregroundColor(selectedIds.contains(peer.deviceId) ? .accentColor : .secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(peer.displayName)
+                                        .font(.callout.weight(.medium))
+                                        .foregroundColor(.primary)
+                                        .lineLimit(1)
+                                    Text("\(peer.candidateCount) 个地址")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer()
+                            }
+                            .padding(12)
+                            .background(rowBackground)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            Button(action: onPickFiles) {
+                Label("选择文件发送", systemImage: "doc.badge.plus")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(selectedIds.isEmpty)
+
+            HStack(spacing: 6) {
+                Image(systemName: "folder")
+                Text("接收目录 · \(receiveDirectory.lastPathComponent)")
+                    .lineLimit(1)
+            }
+            .font(.caption2)
+            .foregroundColor(.secondary)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(uiColor: .secondarySystemBackground))
+        )
+    }
+
+    private var allSelected: Bool {
+        !peers.isEmpty && Set(peers.map(\.deviceId)).isSubset(of: selectedIds)
+    }
+
+    private var rowBackground: some View {
+        RoundedRectangle(cornerRadius: 12)
+            .fill(Color(uiColor: .tertiarySystemBackground))
+    }
+
+    private func toggle(_ id: String) {
+        if selectedIds.contains(id) {
+            selectedIds.remove(id)
+        } else {
+            selectedIds.insert(id)
+        }
+    }
+}
+
+struct FileTransferHistoryCard: View {
+    let entries: [FileTransferHistoryEntry]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("文件记录")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("\(entries.count)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 10)
+
+            if entries.isEmpty {
+                Text("暂无文件传输记录")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 14)
+            } else {
+                ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
+                    FileTransferRow(entry: entry)
+                    if index < entries.count - 1 {
+                        Divider().padding(.leading, 16)
+                    }
+                }
+                .padding(.bottom, 6)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(uiColor: .secondarySystemBackground))
+        )
+    }
+}
+
+private struct FileTransferRow: View {
+    let entry: FileTransferHistoryEntry
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: iconName)
+                .font(.title3)
+                .foregroundColor(iconColor)
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(iconColor.opacity(0.12)))
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(entry.fileName)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 6)
+                    Text(entry.status.label)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundColor(statusColor)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(statusColor.opacity(0.12)))
+                }
+                Text("\(entry.deviceName) · \(entry.sizeLabel) · \(relative(entry.date))")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                if let detail = entry.status.detail {
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundColor(.red)
+                        .lineLimit(2)
+                }
+            }
+
+            if let url = entry.fileURL, FileManager.default.fileExists(atPath: url.path) {
+                Button {
+                    presentFileShareSheet(url)
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                        .padding(6)
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    private var iconName: String {
+        entry.direction == .received ? "arrow.down.doc" : "arrow.up.doc"
+    }
+
+    private var iconColor: Color {
+        entry.direction == .received ? .green : .accentColor
+    }
+
+    private var statusColor: Color {
+        switch entry.status {
+        case .sending: return .accentColor
+        case .completed: return .green
+        case .failed: return .red
+        }
+    }
+
+    private func relative(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: date, relativeTo: Date())
     }
 }
 
@@ -516,6 +761,25 @@ private func topViewController() -> UIViewController? {
         top = presented
     }
     return top
+}
+
+private func presentFileShareSheet(_ url: URL) {
+    guard let top = topViewController() else { return }
+    let activity = UIActivityViewController(
+        activityItems: [url],
+        applicationActivities: nil
+    )
+    if let popover = activity.popoverPresentationController {
+        popover.sourceView = top.view
+        popover.sourceRect = CGRect(
+            x: top.view.bounds.midX,
+            y: top.view.bounds.midY,
+            width: 1,
+            height: 1
+        )
+        popover.permittedArrowDirections = []
+    }
+    top.present(activity, animated: true)
 }
 
 #Preview {
