@@ -1,7 +1,9 @@
 package com.clipbridge
 
+import android.view.accessibility.AccessibilityEvent
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MainActivityTest {
@@ -43,9 +45,50 @@ class MainActivityTest {
     }
 
     @Test
+    fun enabledAccessibilityServicesWithAddsClipBridgeWithoutDroppingExistingServices() {
+        val current = "com.example/.OtherService:com.vendor/.AssistService"
+        val clipBridge = "com.clipbridge/.ClipBridgeAccessibilityService"
+
+        assertEquals(
+            "com.example/.OtherService:com.vendor/.AssistService:com.clipbridge/.ClipBridgeAccessibilityService",
+            enabledAccessibilityServicesWith(current, clipBridge),
+        )
+    }
+
+    @Test
+    fun enabledAccessibilityServicesWithIsCaseInsensitiveAndIdempotent() {
+        val current = "com.example/.OtherService:COM.CLIPBRIDGE/.ClipBridgeAccessibilityService"
+        val clipBridge = "com.clipbridge/.ClipBridgeAccessibilityService"
+
+        assertEquals(
+            "com.example/.OtherService:COM.CLIPBRIDGE/.ClipBridgeAccessibilityService",
+            enabledAccessibilityServicesWith(current, clipBridge),
+        )
+        assertEquals(
+            "",
+            enabledAccessibilityServicesWith("", ""),
+        )
+    }
+
+    @Test
     fun fileTransferSizeLabelUsesCompactUnits() {
         assertEquals("1 KB", fileTransferSizeLabel(1UL))
         assertEquals("900 KB", fileTransferSizeLabel(900UL * 1024UL))
         assertEquals("1.5 MB", fileTransferSizeLabel(1536UL * 1024UL))
+    }
+
+    @Test
+    fun selectedViewEventsAreNotTreatedAsClipboardSelections() {
+        assertFalse(
+            shouldRememberAccessibilitySelection(AccessibilityEvent.TYPE_VIEW_SELECTED),
+        )
+        assertTrue(
+            shouldRememberAccessibilitySelection(
+                AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED,
+            ),
+        )
+        assertTrue(
+            shouldRememberAccessibilitySelection(AccessibilityEvent.TYPE_VIEW_LONG_CLICKED),
+        )
     }
 }

@@ -1,9 +1,14 @@
 package com.clipbridge
 
+import android.Manifest
 import android.content.ClipData
+import android.content.ComponentName
+import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.IBinder
+import android.os.Process
+import android.provider.Settings
 import android.util.Log
 import rikka.shizuku.Shizuku
 import rikka.shizuku.ShizukuBinderWrapper
@@ -22,6 +27,7 @@ import rikka.shizuku.SystemServiceHelper
 object ShizukuBridge {
     private const val TAG = "ShizukuBridge"
     private const val SHELL_PKG = "com.android.shell"
+    private const val PER_USER_RANGE = 100000
 
     enum class State { UNAVAILABLE, NOT_AUTHORIZED, READY }
 
@@ -102,18 +108,89 @@ object ShizukuBridge {
             val rawBinder = SystemServiceHelper.getSystemService("clipboard")
                 ?: return@runCatching null
             val proxy: IBinder = ShizukuBinderWrapper(rawBinder)
-            val clipboard: Any = asInterface(proxy) ?: return@runCatching null
+            val clipboard: Any = asInterface("android.content.IClipboard\$Stub", proxy)
+                ?: return@runCatching null
             val clip = invokeGetPrimaryClip(clipboard) ?: return@runCatching null
             extractClip(clip)
         }.onFailure { Log.w(TAG, "readPrimaryClip failed", it) }.getOrNull()
+    }
+
+    fun enableAccessibilityService(context: Context, serviceClass: Class<*>): Boolean {
+        if (state() != State.READY) return false
+        val appContext = context.applicationContext
+        val serviceName = ComponentName(appContext, serviceClass).flattenToString()
+        val resolver = appContext.contentResolver
+        val current = Settings.Secure.getString(
+            resolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+        )
+        if (isAccessibilityServiceEnabledInSetting(current, serviceName)) return true
+        if (!ensureWriteSecureSettingsPermission(appContext)) return false
+
+        val updated = enabledAccessibilityServicesWith(current, serviceName)
+        if (updated.isEmpty()) return false
+
+        return runCatching {
+            val wroteServices = Settings.Secure.putString(
+                resolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                updated,
+            )
+            val wroteEnabled = Settings.Secure.putString(
+                resolver,
+                Settings.Secure.ACCESSIBILITY_ENABLED,
+                "1",
+            )
+            val after = Settings.Secure.getString(
+                resolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+            )
+            wroteServices && wroteEnabled &&
+                isAccessibilityServiceEnabledInSetting(after, serviceName)
+        }.onFailure {
+            Log.w(TAG, "enableAccessibilityService failed", it)
+        }.getOrDefault(false)
     }
 
     /** Convenience for the text-only path that pre-existed the image work. */
     fun readPrimaryClipText(): String? =
         (readPrimaryClip() as? Clip.Text)?.value
 
-    private fun asInterface(binder: IBinder): Any? {
-        val stubClass = Class.forName("android.content.IClipboard\$Stub")
+    private fun ensureWriteSecureSettingsPermission(context: Context): Boolean {
+        if (context.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return true
+        }
+        if (state() != State.READY) return false
+
+        return runCatching {
+            val rawBinder = SystemServiceHelper.getSystemService("package")
+                ?: return@runCatching false
+            val proxy: IBinder = ShizukuBinderWrapper(rawBinder)
+            val packageManager = asInterface("android.content.pm.IPackageManager\$Stub", proxy)
+                ?: return@runCatching false
+            val grantRuntimePermission = packageManager.javaClass.getMethod(
+                "grantRuntimePermission",
+                String::class.java,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+            )
+            grantRuntimePermission.invoke(
+                packageManager,
+                context.packageName,
+                Manifest.permission.WRITE_SECURE_SETTINGS,
+                Process.myUid() / PER_USER_RANGE,
+            )
+            context.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) ==
+                PackageManager.PERMISSION_GRANTED
+        }.onFailure {
+            Log.w(TAG, "grant WRITE_SECURE_SETTINGS via Shizuku failed", it)
+        }.getOrDefault(false)
+    }
+
+    private fun asInterface(stubClassName: String, binder: IBinder): Any? {
+        val stubClass = Class.forName(stubClassName)
         val asInterface = stubClass.getMethod("asInterface", IBinder::class.java)
         return asInterface.invoke(null, binder)
     }

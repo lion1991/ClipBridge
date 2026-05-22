@@ -98,6 +98,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -179,6 +180,7 @@ private fun PairingScreen(
     var batteryOptDisabled by remember { mutableStateOf(isBatteryOptimizationDisabled(context)) }
     var shizukuState by remember { mutableStateOf(ShizukuBridge.state()) }
     var imageReadGranted by remember { mutableStateOf(isImageReadGranted(context)) }
+    var autoEnableAttemptToken by remember { mutableIntStateOf(0) }
 
     val imagePermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -223,6 +225,7 @@ private fun PairingScreen(
                 batteryOptDisabled = isBatteryOptimizationDisabled(context)
                 shizukuState = ShizukuBridge.state()
                 imageReadGranted = isImageReadGranted(context)
+                autoEnableAttemptToken += 1
                 ClipBridgeAccessibilityService.activeService()?.onHostAppForeground()
             }
         }
@@ -230,9 +233,26 @@ private fun PairingScreen(
         onDispose { lifecycle.removeObserver(observer) }
     }
     DisposableEffect(Unit) {
-        val l = ShizukuBridge.StateListener { s -> shizukuState = s }
+        val l = ShizukuBridge.StateListener { s ->
+            shizukuState = s
+            if (s == ShizukuBridge.State.READY) autoEnableAttemptToken += 1
+        }
         ShizukuBridge.addStateListener(l)
         onDispose { ShizukuBridge.removeStateListener(l) }
+    }
+    LaunchedEffect(shizukuState, asEnabled, autoEnableAttemptToken) {
+        if (!asEnabled && shizukuState == ShizukuBridge.State.READY) {
+            val enabled = withContext(Dispatchers.IO) {
+                ShizukuBridge.enableAccessibilityService(
+                    context.applicationContext,
+                    ClipBridgeAccessibilityService::class.java,
+                )
+            }
+            asEnabled = enabled || isAccessibilityEnabled(context)
+            if (asEnabled) {
+                ClipBridgeAccessibilityService.activeService()?.onHostAppForeground()
+            }
+        }
     }
 
     val pickMediaLauncher = rememberLauncherForActivityResult(
@@ -1287,9 +1307,7 @@ private fun isAccessibilityEnabled(context: Context): Boolean {
         context.contentResolver,
         Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
     ).orEmpty()
-    return enabled
-        .split(':')
-        .any { it.equals(expected, ignoreCase = true) }
+    return isAccessibilityServiceEnabledInSetting(enabled, expected)
 }
 
 private fun isBatteryOptimizationDisabled(context: Context): Boolean {

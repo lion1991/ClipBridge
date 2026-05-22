@@ -41,10 +41,10 @@ import java.util.UUID
  * Two paths to picking up clipboard changes on Android 10+, where background
  * `ClipboardManager.getPrimaryClip()` is blocked:
  *
- *   - **On-demand Shizuku read (preferred)**: after a remote write, ask the
- *     IClipboard system service through Shizuku's shell-uid binder for the
- *     current primary clip. This catches system clipboard state without
- *     keeping an always-on polling loop alive in standby.
+ *   - **On-demand Shizuku read (preferred)**: after a copy toast or remote
+ *     write, ask the IClipboard system service through Shizuku's shell-uid
+ *     binder for the current primary clip. This catches system clipboard
+ *     state without keeping an always-on polling loop alive in standby.
  *   - **Accessibility events (fallback)**: cache the latest text selection and
  *     publish it when a "copied" toast fires. Works without Shizuku but misses
  *     copies that don't go through the long-press toolbar.
@@ -312,12 +312,10 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val e = event ?: return
-        when (e.eventType) {
-            AccessibilityEvent.TYPE_VIEW_SELECTED,
-            AccessibilityEvent.TYPE_VIEW_LONG_CLICKED,
-            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> rememberSelection(e)
-
-            AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> maybeHandleCopyToast(e)
+        if (shouldRememberAccessibilitySelection(e.eventType)) {
+            rememberSelection(e)
+        } else if (e.eventType == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) {
+            maybeHandleCopyToast(e)
         }
     }
 
@@ -391,6 +389,11 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private fun maybeHandleCopyToast(event: AccessibilityEvent) {
         val text = event.text?.joinToString(" ") ?: return
         if (!looksLikeCopyToast(text)) return
+
+        if (ShizukuBridge.state() == ShizukuBridge.State.READY) {
+            triggerShizukuClipboardRead("copy toast")
+            return
+        }
 
         val sel = lastSelection
         if (sel.isNullOrEmpty()) {

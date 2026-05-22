@@ -89,6 +89,31 @@ class ClipBridgeAccessibilityServicePolicyTest {
             screenOffBody.contains("setLanActive(false)"),
         )
     }
+
+    @Test
+    fun mainActivityAutoEnablesAccessibilityWhenShizukuBecomesReady() {
+        assertTrue(
+            "Cold start should retry automatic accessibility enablement when Shizuku becomes READY, including binder-delayed starts.",
+            mainActivitySource.contains("autoEnableAttemptToken") &&
+                mainActivitySource.contains("ShizukuBridge.enableAccessibilityService("),
+        )
+    }
+
+    @Test
+    fun copyToastPrefersShizukuClipboardReadOverCachedAccessibilitySelection() {
+        val body = serviceSource.functionBody("private fun maybeHandleCopyToast")
+
+        assertTrue(
+            "When Shizuku is ready, a copy toast should read the real system clipboard instead of publishing a cached UI selection.",
+            body.contains("ShizukuBridge.State.READY") &&
+                body.contains("triggerShizukuClipboardRead(\"copy toast\")"),
+        )
+        assertTrue(
+            "The Shizuku read must happen before the accessibility selection fallback can publish.",
+            body.indexOf("triggerShizukuClipboardRead(\"copy toast\")") <
+                body.indexOf("publish(sel)"),
+        )
+    }
 }
 
 private fun String.functionBody(signature: String): String {
