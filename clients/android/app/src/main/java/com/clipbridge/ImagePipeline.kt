@@ -63,9 +63,11 @@ object ImagePipeline {
 
     /**
      * Convert a freshly-read URI from the system clipboard into an
-     * `Outbound` ready to send. Re-encodes to PNG when the source isn't
-     * already PNG, so receivers on Win/Android don't need a HEIC decoder.
-     * Returns null on any failure.
+     * `Outbound` ready to send. Encoding is chosen by `encodeForWire`:
+     * compact PNG/JPEG sources that fit the relay cap go verbatim; anything
+     * else is re-encoded (lossless PNG when it fits, otherwise JPEG) so a
+     * large image still sends instead of being dropped. Returns null on any
+     * failure.
      *
      * Common failure: SecurityException on `openInputStream` for
      * `content://media/...` URIs — the background accessibility service
@@ -76,7 +78,6 @@ object ImagePipeline {
      */
     fun outboundFromUri(ctx: Context, uri: Uri): Outbound? {
         return runCatching {
-            val mime = ctx.contentResolver.getType(uri) ?: "image/*"
             val raw: ByteArray = try {
                 ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
             } catch (se: SecurityException) {
@@ -85,23 +86,63 @@ object ImagePipeline {
                 null
             } ?: return@runCatching null
 
-            // Normalize to PNG unless already PNG — keeps the wire format
-            // predictable across platforms. JPEG re-encode would lose
-            // quality, but for clipboard images PNG is the safe bet.
-            val (bytes, finalMime) = if (mime == "image/png") {
-                raw to "image/png"
-            } else {
-                val bmp = BitmapFactory.decodeByteArray(raw, 0, raw.size)
-                    ?: return@runCatching null
-                val out = ByteArrayOutputStream(raw.size)
-                bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
-                bmp.recycle()
-                out.toByteArray() to "image/png"
-            }
+            val (bytes, finalMime) = encodeForWire(raw) ?: return@runCatching null
             val (w, h) = bitmapBounds(bytes) ?: return@runCatching null
             Outbound(bytes, finalMime, w.toUInt(), h.toUInt())
         }.onFailure { Log.w(TAG, "outboundFromUri failed", it) }.getOrNull()
     }
+
+    /**
+     * Pick the wire encoding for an outbound image. Keep the original bytes
+     * when they're already a compact, cross-platform format (PNG/JPEG) that
+     * fits the relay's per-blob cap, and only fall back to JPEG when lossless
+     * would exceed it — so a big screenshot or a JPEG photo still sends
+     * instead of ballooning to an over-cap PNG and being dropped. Mirrors the
+     * macOS/iOS clients. Returns null if the bytes can't be decoded.
+     */
+    private fun encodeForWire(raw: ByteArray): Pair<ByteArray, String>? {
+        // 1. Already a compact, cross-platform format that fits — send as-is.
+        if (isPng(raw) && raw.size <= MAX_IMAGE_BYTES) return raw to "image/png"
+        if (isJpeg(raw) && raw.size <= MAX_IMAGE_BYTES) return raw to "image/jpeg"
+        // 2. Otherwise (re-)encode. Decode to a bitmap.
+        val bmp = runCatching { BitmapFactory.decodeByteArray(raw, 0, raw.size) }
+            .getOrNull() ?: return null
+        try {
+            // Prefer lossless PNG when it fits (screenshots, line art, text).
+            // Skip for a PNG source already over the cap — PNG→PNG won't shrink
+            // it, so go straight to JPEG.
+            if (!isPng(raw)) {
+                val png = ByteArrayOutputStream(raw.size)
+                    .also { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    .toByteArray()
+                if (png.size <= MAX_IMAGE_BYTES) return png to "image/png"
+            }
+            // Too big for lossless — JPEG, stepping quality down until it fits.
+            for (q in intArrayOf(92, 85, 75, 60)) {
+                val jpeg = ByteArrayOutputStream()
+                    .also { bmp.compress(Bitmap.CompressFormat.JPEG, q, it) }
+                    .toByteArray()
+                if (jpeg.size <= MAX_IMAGE_BYTES) return jpeg to "image/jpeg"
+            }
+            // Even aggressive JPEG won't fit — smallest attempt so the size
+            // guard reports a realistic number rather than the raw bytes.
+            val jpeg = ByteArrayOutputStream()
+                .also { bmp.compress(Bitmap.CompressFormat.JPEG, 50, it) }
+                .toByteArray()
+            return jpeg to "image/jpeg"
+        } finally {
+            bmp.recycle()
+        }
+    }
+
+    /** PNG magic-number check. */
+    private fun isPng(b: ByteArray): Boolean =
+        b.size >= 8 && b[0] == 0x89.toByte() && b[1] == 0x50.toByte() &&
+            b[2] == 0x4E.toByte() && b[3] == 0x47.toByte()
+
+    /** JPEG magic-number check (SOI marker `FF D8 FF`). */
+    private fun isJpeg(b: ByteArray): Boolean =
+        b.size >= 3 && b[0] == 0xFF.toByte() && b[1] == 0xD8.toByte() && b[2] == 0xFF.toByte()
 
     // -------------------- Write --------------------
 

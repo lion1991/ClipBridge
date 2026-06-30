@@ -17,6 +17,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# cargo 产物可能被全局 ~/.cargo 的 target-dir 重定向到仓库外，取真实路径。
+TARGET_ROOT="$(cargo metadata --no-deps --format-version 1 | jq -r '.target_directory')"
+[ -n "$TARGET_ROOT" ] && [ "$TARGET_ROOT" != "null" ] || TARGET_ROOT="$ROOT/target"
+
 if [[ -z "${ANDROID_NDK_HOME:-}" ]]; then
   if [[ -d "$HOME/Library/Android/sdk/ndk" ]]; then
     NDK_VER="$(ls -1 "$HOME/Library/Android/sdk/ndk" | sort -V | tail -1)"
@@ -59,7 +63,7 @@ KOTLIN_OUT="$ROOT/clients/android/app/src/main/java"
 mkdir -p "$KOTLIN_OUT"
 cargo build -p clipbridge-core
 cargo run -p uniffi-bindgen -- generate \
-  --library "target/debug/libclipbridge_core.dylib" \
+  --library "$TARGET_ROOT/debug/libclipbridge_core.dylib" \
   --language kotlin \
   --out-dir "$KOTLIN_OUT"
 

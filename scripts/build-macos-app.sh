@@ -19,6 +19,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# cargo's target dir may be redirected outside the repo (global
+# CARGO_TARGET_DIR / ~/.cargo/config), so the freshly-built .a / .dylib won't
+# be under ./target. Resolve the real path for the lipo + bindgen steps.
+TARGET_ROOT="$(cargo metadata --no-deps --format-version 1 | jq -r '.target_directory')"
+[ -n "$TARGET_ROOT" ] && [ "$TARGET_ROOT" != "null" ] || TARGET_ROOT="$ROOT/target"
+
 NATIVE_ARCH=$(uname -m)
 ARCHS=("$NATIVE_ARCH")
 MAKE_DMG=1
@@ -67,13 +73,13 @@ echo "    -> x86_64-apple-darwin"
 cargo build --release -p clipbridge-core --target x86_64-apple-darwin >/dev/null
 
 lipo -create \
-  "target/aarch64-apple-darwin/$PROFILE_DIR/libclipbridge_core.a" \
-  "target/x86_64-apple-darwin/$PROFILE_DIR/libclipbridge_core.a" \
+  "$TARGET_ROOT/aarch64-apple-darwin/$PROFILE_DIR/libclipbridge_core.a" \
+  "$TARGET_ROOT/x86_64-apple-darwin/$PROFILE_DIR/libclipbridge_core.a" \
   -output "$XCF_OUT/universal/libclipbridge_core.a"
 
 echo "    -> swift bindings"
 cargo run -p uniffi-bindgen -- generate \
-  --library "target/aarch64-apple-darwin/$PROFILE_DIR/libclipbridge_core.dylib" \
+  --library "$TARGET_ROOT/aarch64-apple-darwin/$PROFILE_DIR/libclipbridge_core.dylib" \
   --language swift \
   --out-dir "$XCF_OUT" >/dev/null
 

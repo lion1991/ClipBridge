@@ -463,8 +463,11 @@ final class BridgeCoordinator: ObservableObject {
 
     private func sendImage(_ image: ClipboardImage) {
         guard image.bytes.count <= maxImageBytes else {
+            // Reached only when even aggressive JPEG re-encoding (see
+            // `encodeImageForWire`) couldn't get under the relay's per-blob
+            // cap — i.e. a genuinely enormous image.
             let mb = image.bytes.count / 1024 / 1024
-            onStateChange(.error("图片 \(mb)MB 超过 32MB 上限,未发送"))
+            onStateChange(.error("图片压缩后仍 \(mb)MB,超过 32MB 上限,未发送"))
             return
         }
         let deviceName = Self.deviceName
@@ -544,9 +547,17 @@ final class BridgeCoordinator: ObservableObject {
                 deviceName: payload.deviceName,
                 ts: payload.ts
             )
+            // The pasteboard path assumes PNG; a peer may now send JPEG, so
+            // normalize to PNG for the *local* clipboard (size is local-only
+            // here — the wire bloat we avoid on send doesn't matter). The
+            // history `entry` above keeps the raw bytes + real mime, so
+            // auto-save still picks the right extension.
+            let clipboardPNG = pngForClipboard(from: bytes)
             let tiff = tiffRep(from: bytes)
             DispatchQueue.main.async {
-                self.applyImageToPasteboard(png: bytes, tiff: tiff, pixelHash: pixelHash)
+                if let clipboardPNG {
+                    self.applyImageToPasteboard(png: clipboardPNG, tiff: tiff, pixelHash: pixelHash)
+                }
                 self.appendReceived(entry)
             }
             // Auto-save outside the main queue — file I/O is sync and we
@@ -570,10 +581,15 @@ final class BridgeCoordinator: ObservableObject {
     ///     other device, possibly looping via Universal Clipboard).
     func rePasteImageToClipboard(_ data: Data) {
         blobQueue.async { [weak self] in
+            guard let self else { return }
+            // History bytes can now be JPEG — convert to PNG so the `.png`
+            // pasteboard write isn't a mislabeled blob.
+            let png = self.pngForClipboard(from: data)
             let pixelHash = imagePixelHashHex(data)
-            let tiff = self?.tiffRep(from: data)
+            let tiff = self.tiffRep(from: data)
             DispatchQueue.main.async {
-                self?.applyImageToPasteboard(png: data, tiff: tiff, pixelHash: pixelHash)
+                guard let png else { return }
+                self.applyImageToPasteboard(png: png, tiff: tiff, pixelHash: pixelHash)
             }
         }
     }
@@ -585,6 +601,18 @@ final class BridgeCoordinator: ObservableObject {
     private func tiffRep(from png: Data) -> Data? {
         guard let rep = NSBitmapImageRep(data: png) else { return nil }
         return rep.representation(using: .tiff, properties: [:])
+    }
+
+    /// Normalize received image bytes to PNG for the local pasteboard. The
+    /// macOS clipboard write and our poll round-trip assume PNG, but a peer
+    /// can now send JPEG (it preserved a compact source, or fell back from an
+    /// over-cap PNG). Re-encoding here costs no wire bytes — the clipboard is
+    /// local. PNG passes through untouched so the existing "raw bytes
+    /// literally" dedup still holds. nil if undecodable.
+    private func pngForClipboard(from data: Data) -> Data? {
+        if isPNGData(data) { return data }
+        guard let rep = NSBitmapImageRep(data: data) else { return nil }
+        return rep.representation(using: .png, properties: [:])
     }
 
     /// Guarded pasteboard write shared by inbound delivery and manual
@@ -932,23 +960,19 @@ private func readClipboardImage() -> ClipboardImage? {
         return fromFile
     }
 
-    var pngData: Data?
+    // Hand the raw pasteboard bytes to `clipboardImage`, which picks the
+    // wire encoding: PNG stays PNG; TIFF becomes PNG — or JPEG if the
+    // lossless form would exceed the relay's per-blob cap. We standardize
+    // away from TIFF so receivers don't need a TIFF decoder (matters for
+    // non-Apple platforms), but no longer force a possibly-oversized PNG
+    // that would trip the 32MB guard and drop the clip entirely.
     if types.contains(.png), let data = pb.data(forType: .png), !data.isEmpty {
-        pngData = data
-    } else if types.contains(.tiff),
-              let tiff = pb.data(forType: .tiff),
-              !tiff.isEmpty,
-              let rep = NSBitmapImageRep(data: tiff),
-              let png = rep.representation(using: .png, properties: [:])
-    {
-        // Both PNG and TIFF are lossless, so re-encoding TIFF→PNG is fine
-        // for fidelity. We standardize on PNG so receivers don't need a
-        // TIFF decoder (matters for non-Apple platforms).
-        pngData = png
+        return clipboardImage(from: data, sourceExtension: "png")
     }
-
-    guard let data = pngData else { return nil }
-    return clipboardImage(from: data, sourceExtension: "png")
+    if types.contains(.tiff), let tiff = pb.data(forType: .tiff), !tiff.isEmpty {
+        return clipboardImage(from: tiff, sourceExtension: "tiff")
+    }
+    return nil
 }
 
 private func readImageFileFromPasteboard(
@@ -993,28 +1017,87 @@ private func readImageFileFromPasteboard(
 
 private func clipboardImage(from data: Data, sourceExtension: String?) -> ClipboardImage? {
     guard let image = NSImage(data: data) else { return nil }
-    let normalized: (bytes: Data, mime: String) = {
-        if sourceExtension?.lowercased() == "png" {
-            return (data, "image/png")
-        }
-        if let rep = NSBitmapImageRep(data: data),
-           let png = rep.representation(using: .png, properties: [:]) {
-            return (png, "image/png")
-        }
-        if let tiff = image.tiffRepresentation,
-           let rep = NSBitmapImageRep(data: tiff),
-           let png = rep.representation(using: .png, properties: [:]) {
-            return (png, "image/png")
-        }
-        return (data, "application/octet-stream")
-    }()
+    guard let wire = encodeImageForWire(data: data, sourceExtension: sourceExtension, image: image)
+    else { return nil }
     let size = image.size
     return ClipboardImage(
-        bytes: normalized.bytes,
-        mime: normalized.mime,
+        bytes: wire.bytes,
+        mime: wire.mime,
         width: UInt32(size.width.rounded()),
         height: UInt32(size.height.rounded())
     )
+}
+
+/// Choose the wire encoding for an outbound image. Keep it lossless and in
+/// its original format when that already fits under the relay's per-blob cap
+/// (`maxImageBytes`), and only fall back to JPEG when lossless would blow
+/// past the cap — so a big screenshot or a copied JPEG photo still sends
+/// instead of being dropped with "超过 32MB 上限".
+///
+///  - PNG / JPEG sources that already fit are sent verbatim: no re-encode,
+///    no bloat (a few-MB JPEG used to balloon to tens of MB as PNG).
+///  - TIFF / raw clipboard images, and anything over the cap, are encoded —
+///    lossless PNG when it fits, otherwise JPEG at descending quality.
+///
+/// Returns nil only when the bytes can't be decoded. If even aggressive JPEG
+/// can't fit, the smallest attempt is returned so the caller's size guard
+/// reports a realistic number rather than passing raw bytes through.
+private func encodeImageForWire(
+    data: Data,
+    sourceExtension: String?,
+    image: NSImage
+) -> (bytes: Data, mime: String)? {
+    let ext = sourceExtension?.lowercased()
+    // 1. Already a compact, cross-platform format that fits — send as-is.
+    if ext == "png", data.count <= maxImageBytes {
+        return (data, "image/png")
+    }
+    if (ext == "jpg" || ext == "jpeg"), data.count <= maxImageBytes {
+        return (data, "image/jpeg")
+    }
+    // 2. Otherwise we have to (re-)encode. Decode to a bitmap rep.
+    guard let rep = bitmapRep(from: data, image: image) else { return nil }
+    // Prefer lossless PNG when it fits (screenshots, line art, text). Skip
+    // this for a PNG source already over the cap — re-encoding PNG→PNG won't
+    // shrink it, so go straight to JPEG.
+    if ext != "png",
+       let png = rep.representation(using: .png, properties: [:]),
+       png.count <= maxImageBytes {
+        return (png, "image/png")
+    }
+    // Too big for lossless — JPEG, stepping quality down until it fits.
+    for quality in [0.92, 0.85, 0.75, 0.6] {
+        if let jpeg = rep.representation(
+            using: .jpeg,
+            properties: [.compressionFactor: quality]
+        ), jpeg.count <= maxImageBytes {
+            return (jpeg, "image/jpeg")
+        }
+    }
+    // Even aggressive JPEG won't fit. Return the smallest attempt so the send
+    // guard rejects it with a realistic size instead of raw bytes.
+    if let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.5]) {
+        return (jpeg, "image/jpeg")
+    }
+    return nil
+}
+
+/// Decode `data` to an `NSBitmapImageRep`, falling back through the NSImage's
+/// TIFF representation for formats `NSBitmapImageRep(data:)` won't take
+/// directly. Mirrors the old `clipboardImage` decode chain.
+private func bitmapRep(from data: Data, image: NSImage) -> NSBitmapImageRep? {
+    if let rep = NSBitmapImageRep(data: data) { return rep }
+    if let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) {
+        return rep
+    }
+    return nil
+}
+
+/// PNG magic-number check, so already-PNG bytes can go to the pasteboard
+/// verbatim instead of paying a decode+re-encode round-trip.
+private func isPNGData(_ data: Data) -> Bool {
+    let signature: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    return data.count >= signature.count && data.prefix(signature.count).elementsEqual(signature)
 }
 
 private func nowMillis() -> UInt64 {

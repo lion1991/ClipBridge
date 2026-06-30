@@ -13,6 +13,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# cargo 产物可能被全局 ~/.cargo 的 target-dir 重定向到仓库外，取真实路径。
+TARGET_ROOT="$(cargo metadata --no-deps --format-version 1 | jq -r '.target_directory')"
+[ -n "$TARGET_ROOT" ] && [ "$TARGET_ROOT" != "null" ] || TARGET_ROOT="$ROOT/target"
+
 OUT="$ROOT/build/ios"
 mkdir -p "$OUT"
 
@@ -38,7 +42,7 @@ PROFILE="release"
   echo "    -> swift bindings"
   cargo build -p clipbridge-core >/dev/null
   cargo run -p uniffi-bindgen -- generate \
-    --library "target/debug/libclipbridge_core.dylib" \
+    --library "$TARGET_ROOT/debug/libclipbridge_core.dylib" \
     --language swift \
     --out-dir "$XCF_OUT" >/dev/null
 
@@ -47,9 +51,9 @@ PROFILE="release"
 
   rm -rf "$XCF_OUT/ClipbridgeCore.xcframework"
   xcodebuild -create-xcframework \
-    -library "target/aarch64-apple-ios/$PROFILE/libclipbridge_core.a" \
+    -library "$TARGET_ROOT/aarch64-apple-ios/$PROFILE/libclipbridge_core.a" \
     -headers "$XCF_HEADERS" \
-    -library "target/aarch64-apple-ios-sim/$PROFILE/libclipbridge_core.a" \
+    -library "$TARGET_ROOT/aarch64-apple-ios-sim/$PROFILE/libclipbridge_core.a" \
     -headers "$XCF_HEADERS" \
     -output "$XCF_OUT/ClipbridgeCore.xcframework" >/dev/null
 
@@ -107,7 +111,12 @@ fi
 # blob" and TrollStore's signApp returns -67062 (errSecCSBadObjectFormat)
 # which silently drops the .appex from the install. Procursus ldid writes
 # both. Detect the upstream variant and refuse to build with it.
-if ! ldid 2>&1 | grep -q "procursus"; then
+# Capture the banner first: `ldid 2>&1 | grep -q` is racy under `pipefail`
+# because grep -q closes the pipe on its first match, ldid then dies on
+# SIGPIPE (exit 141), and pipefail makes the whole pipeline "fail" — flipping
+# this check into the saurik branch even on a procursus build. A here-string
+# has no pipe, so no SIGPIPE race.
+if ! grep -q "procursus" <<<"$(ldid 2>&1 || true)"; then
   cat <<EOF >&2
 ldid is the saurik build, which doesn't emit DER entitlements. The
 keyboard extension will install but its entitlements will be silently

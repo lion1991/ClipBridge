@@ -85,7 +85,7 @@ struct ImageTransferView: View {
         VStack(alignment: .leading, spacing: 10) {
             sectionHeader("paperplane", "发送图片")
             dropZone
-            Label("单张上限 32MB · 自动转 PNG 发送", systemImage: "info.circle")
+            Label("单张上限 32MB · 优先无损,过大自动转 JPEG", systemImage: "info.circle")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }

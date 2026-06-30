@@ -57,9 +57,10 @@ final class BridgeCoordinator: ObservableObject {
     private static let fileHistoryLimit = 40
 
     /// Hard cap on outbound image bytes — must match the relay's default
-    /// `CLIPBRIDGE_BLOB_MAX_BYTES`. Going over fails fast with a status
-    /// message rather than getting silently downscaled.
-    private static let maxImageBytes = 32 * 1024 * 1024
+    /// `CLIPBRIDGE_BLOB_MAX_BYTES`. `encodeImageForWire` keeps payloads under
+    /// it by falling back to JPEG; only a genuinely enormous image fails fast.
+    /// `fileprivate` so the free image-encoding helpers can read it.
+    fileprivate static let maxImageBytes = 32 * 1024 * 1024
 
     private var client: Client?
     private var listener: Listener?
@@ -195,17 +196,18 @@ final class BridgeCoordinator: ObservableObject {
             }
             return
         }
-        // Re-encode to PNG so receivers on Win/Android don't need a HEIC
-        // decoder. Skip when source is already PNG.
-        let (pngBytes, mime): (Data, String) = {
-            if bytes.starts(with: [0x89, 0x50, 0x4e, 0x47]) {
-                return (bytes, "image/png")
+        // Pick the wire encoding: keep PNG/JPEG sources verbatim when they fit
+        // the relay cap (no HEIC ships — Win/Android need no HEIC decoder), and
+        // fall back to JPEG only when lossless would exceed the cap.
+        guard let wire = encodeImageForWire(sourceData: bytes, image: image) else {
+            DispatchQueue.main.async {
+                self.status = .error("图片编码失败")
             }
-            return (image.pngData() ?? bytes, "image/png")
-        }()
+            return
+        }
         let clip = ClipboardImage(
-            bytes: pngBytes,
-            mime: mime,
+            bytes: wire.bytes,
+            mime: wire.mime,
             width: UInt32(image.size.width.rounded()),
             height: UInt32(image.size.height.rounded()),
             uiImage: image
@@ -325,13 +327,20 @@ final class BridgeCoordinator: ObservableObject {
     /// receiving apps that strict-match on either UTI find what they want.
     /// Some IM apps (WeChat, etc.) only check the parent type.
     private func writeImageBytesToPasteboard(_ bytes: Data) {
+        // The `public.png` UTI below assumes PNG. A peer may now send JPEG
+        // (it preserved a compact source, or fell back from an over-cap PNG),
+        // so normalize non-PNG bytes to PNG for the *local* pasteboard —
+        // re-encoding here costs no wire bytes, and strict `public.png`
+        // consumers (WeChat, etc.) still get a valid PNG. PNG passes through
+        // untouched so the "raw bytes literally" dedup still holds.
+        let png = pngForPasteboard(bytes)
         // Both hashes: pixel hash for cross-encoding dedup, byte hash as
         // a cheap belt-and-suspenders for the no-re-encode case.
-        if let ph = imagePixelHashHex(bytes) { seenHashes.insert(ph) }
-        seenHashes.insert(sha256Hex(bytes))
+        if let ph = imagePixelHashHex(png) { seenHashes.insert(ph) }
+        seenHashes.insert(sha256Hex(png))
         UIPasteboard.general.setItems([[
-            "public.png": bytes,
-            "public.image": bytes,
+            "public.png": png,
+            "public.image": png,
         ]])
         lastChangeCount = UIPasteboard.general.changeCount
         enterQuietWindow()
@@ -517,9 +526,12 @@ final class BridgeCoordinator: ObservableObject {
 
     private func sendImage(_ image: ClipboardImage) {
         guard image.bytes.count <= Self.maxImageBytes else {
+            // Reached only when even aggressive JPEG re-encoding (see
+            // `encodeImageForWire`) couldn't get under the relay's per-blob
+            // cap — i.e. a genuinely enormous image.
             let mb = image.bytes.count / 1024 / 1024
             DispatchQueue.main.async {
-                self.status = .error("图片 \(mb)MB 超过 32MB 上限,未发送")
+                self.status = .error("图片压缩后仍 \(mb)MB,超过 32MB 上限,未发送")
             }
             return
         }
@@ -850,22 +862,23 @@ func imagePixelHashHex(_ data: Data) -> String? {
     return sha256Hex(buffer)
 }
 
-/// Read whatever image rep is on the pasteboard and normalize to PNG bytes.
+/// Read whatever image rep is on the pasteboard and pick its wire encoding.
 /// Returns nil when no usable image is present (some apps advertise image
 /// types as part of a drag promise without actually providing data).
 private func readClipboardImage() -> ClipboardImage? {
     let pb = UIPasteboard.general
 
-    // Prefer raw PNG when the pasteboard actually has one — saves a
-    // round-trip through UIImage decoding/re-encoding, which would
-    // otherwise discard color profiles for some screenshots.
+    // Prefer the raw PNG the pasteboard advertises — `encodeImageForWire`
+    // sends it verbatim when it fits (no decode/re-encode that would discard
+    // color profiles), and only falls back to JPEG if it's over the cap.
     if let png = pb.data(forPasteboardType: "public.png"),
        !png.isEmpty,
-       let img = UIImage(data: png)
+       let img = UIImage(data: png),
+       let wire = encodeImageForWire(sourceData: png, image: img)
     {
         return ClipboardImage(
-            bytes: png,
-            mime: "image/png",
+            bytes: wire.bytes,
+            mime: wire.mime,
             width: UInt32(img.size.width.rounded()),
             height: UInt32(img.size.height.rounded()),
             uiImage: img
@@ -873,12 +886,12 @@ private func readClipboardImage() -> ClipboardImage? {
     }
 
     // Fall back to the high-level image accessor (covers HEIC, JPEG,
-    // synthesized images from drag/drop). Re-encode to PNG so receivers
-    // on Android / Windows don't need a HEIC decoder.
-    if let img = pb.image, let png = img.pngData() {
+    // synthesized images from drag/drop). No original encoded bytes here, so
+    // encode from the decoded image — PNG if it fits, otherwise JPEG.
+    if let img = pb.image, let wire = encodeImageForWire(sourceData: nil, image: img) {
         return ClipboardImage(
-            bytes: png,
-            mime: "image/png",
+            bytes: wire.bytes,
+            mime: wire.mime,
             width: UInt32(img.size.width.rounded()),
             height: UInt32(img.size.height.rounded()),
             uiImage: img
@@ -886,4 +899,63 @@ private func readClipboardImage() -> ClipboardImage? {
     }
 
     return nil
+}
+
+/// Choose the wire encoding for an outbound image. Mirrors the macOS client:
+/// keep the original format when it's already compact + cross-platform and
+/// fits under the relay's per-blob cap, and only fall back to JPEG when
+/// lossless would exceed the cap — so a big screenshot or a HEIC/JPEG photo
+/// still sends instead of being dropped with "超过 32MB 上限".
+///
+///  - PNG / JPEG sources that already fit are sent verbatim (no re-encode,
+///    no bloat — a few-MB JPEG used to balloon to tens of MB as PNG).
+///  - Otherwise: lossless PNG when it fits, else JPEG at descending quality.
+///
+/// `sourceData` is the original encoded bytes when available (nil for a
+/// decoded-only `UIImage`). Returns nil if encoding fails entirely; if even
+/// aggressive JPEG can't fit, the smallest attempt is returned so the send
+/// guard reports a realistic size.
+private func encodeImageForWire(sourceData: Data?, image: UIImage) -> (bytes: Data, mime: String)? {
+    let cap = BridgeCoordinator.maxImageBytes
+    if let sourceData {
+        if isPNGData(sourceData), sourceData.count <= cap { return (sourceData, "image/png") }
+        if isJPEGData(sourceData), sourceData.count <= cap { return (sourceData, "image/jpeg") }
+    }
+    // Prefer lossless PNG when it fits. Skip for a PNG source already over the
+    // cap — PNG→PNG won't shrink it, so go straight to JPEG.
+    let sourceIsPNG = sourceData.map(isPNGData) ?? false
+    if !sourceIsPNG, let png = image.pngData(), png.count <= cap {
+        return (png, "image/png")
+    }
+    for quality in [0.92, 0.85, 0.75, 0.6] as [CGFloat] {
+        if let jpeg = image.jpegData(compressionQuality: quality), jpeg.count <= cap {
+            return (jpeg, "image/jpeg")
+        }
+    }
+    // Even aggressive JPEG won't fit — smallest attempt so the guard reports a
+    // realistic size rather than passing raw bytes through.
+    if let jpeg = image.jpegData(compressionQuality: 0.5) { return (jpeg, "image/jpeg") }
+    return nil
+}
+
+/// Ensure PNG bytes for the local pasteboard. Already-PNG passes through
+/// (preserving the byte-exact dedup round-trip); other formats (JPEG) are
+/// decoded and re-encoded to PNG. Falls back to the original bytes if the
+/// re-encode fails. Clipboard size is local-only, so the wire bloat we avoid
+/// on send doesn't matter here.
+private func pngForPasteboard(_ data: Data) -> Data {
+    if isPNGData(data) { return data }
+    return UIImage(data: data)?.pngData() ?? data
+}
+
+/// PNG magic-number check.
+private func isPNGData(_ data: Data) -> Bool {
+    let signature: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    return data.count >= signature.count && data.prefix(signature.count).elementsEqual(signature)
+}
+
+/// JPEG magic-number check (SOI marker `FF D8 FF`).
+private func isJPEGData(_ data: Data) -> Bool {
+    let signature: [UInt8] = [0xFF, 0xD8, 0xFF]
+    return data.count >= signature.count && data.prefix(signature.count).elementsEqual(signature)
 }

@@ -15,7 +15,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use clipbridge_core::{sha256_hex, Client, ClipKind, ClipListener, ClipPayload, ConnectionState};
 use directories::UserDirs;
-use image::{GenericImageView, ImageBuffer, ImageFormat, Rgba};
+use image::{GenericImageView, ImageBuffer, ImageEncoder, ImageFormat, Rgba};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
@@ -247,10 +247,12 @@ impl Bridge {
     /// happening to land in the same instant doesn't double-publish.
     pub fn send_image_bytes(&self, bytes: Vec<u8>) -> Result<ImageHistoryEntry, String> {
         let device_name = device_name();
-        let png = normalize_to_png(&bytes).ok_or_else(|| "图片解码失败".to_string())?;
+        let png = encode_for_wire(&bytes).ok_or_else(|| "图片解码失败".to_string())?;
         if png.bytes.len() > MAX_IMAGE_BYTES {
+            // Reached only when even aggressive JPEG re-encoding couldn't get
+            // under the relay's per-blob cap — a genuinely enormous image.
             return Err(format!(
-                "图片 {}MB 超过 32MB 上限",
+                "图片压缩后仍 {}MB,超过 32MB 上限",
                 png.bytes.len() / 1024 / 1024
             ));
         }
@@ -821,6 +823,9 @@ fn read_clipboard_text() -> Option<String> {
 }
 
 /// Normalised image data ready for blob upload + history storage.
+/// An outbound image encoded for the wire. Despite the name, `bytes` may be
+/// JPEG (not just PNG) — `mime` is the source of truth. We fall back to JPEG
+/// when a lossless PNG would exceed the relay's per-blob cap.
 struct NormalizedPng {
     bytes: Vec<u8>,
     mime: String,
@@ -828,10 +833,10 @@ struct NormalizedPng {
     height: u32,
 }
 
-/// Read whatever image is currently on the clipboard, encoded as PNG.
-/// Returns None when the clipboard has no image, the read fails, or the
-/// PNG encoding fails (rare, but arboard hands us non-stride RGBA so a
-/// malformed buffer would).
+/// Read whatever image is currently on the clipboard, encoded for the wire
+/// (PNG, or JPEG when lossless would exceed the cap). Returns None when the
+/// clipboard has no image, the read fails, or encoding fails (rare, but
+/// arboard hands us non-stride RGBA so a malformed buffer would).
 fn read_clipboard_image() -> Option<NormalizedPng> {
     read_clipboard_bitmap_image().or_else(read_clipboard_image_file)
 }
@@ -843,16 +848,9 @@ fn read_clipboard_bitmap_image() -> Option<NormalizedPng> {
     let height = img.height as u32;
     let bytes = img.bytes.into_owned();
     let buffer: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_raw(width, height, bytes)?;
-    let mut png = Vec::with_capacity(buffer.as_raw().len() / 4);
-    buffer
-        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
-        .ok()?;
-    Some(NormalizedPng {
-        bytes: png,
-        mime: "image/png".to_string(),
-        width,
-        height,
-    })
+    // Raw clipboard bitmap has no original compressed form — encode it,
+    // preferring lossless PNG and falling back to JPEG if PNG exceeds the cap.
+    encode_dynamic_for_wire(&image::DynamicImage::ImageRgba8(buffer), false)
 }
 
 #[cfg(windows)]
@@ -884,7 +882,7 @@ fn normalize_image_file_at_path(path: &Path) -> Option<NormalizedPng> {
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
-    normalize_to_png(&bytes)
+    encode_for_wire(&bytes)
 }
 
 fn is_supported_clipboard_image_file(path: &Path) -> bool {
@@ -952,30 +950,80 @@ fn clipboard_file_paths_from_hdrop() -> Option<Vec<PathBuf>> {
     }
 }
 
-/// Decode arbitrary image bytes (PNG/JPEG/etc.) → re-encode as PNG. Used
-/// for the picker path where the user hands us a file from disk.
-fn normalize_to_png(bytes: &[u8]) -> Option<NormalizedPng> {
-    // Fast path — already PNG.
-    if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47]) {
-        let img = image::load_from_memory(bytes).ok()?;
-        let (w, h) = img.dimensions();
+/// Choose the wire encoding for an outbound image from its original encoded
+/// bytes. Keep PNG/JPEG verbatim when it already fits the relay's per-blob
+/// cap; otherwise decode and re-encode — lossless PNG when it fits, else JPEG
+/// at descending quality. Mirrors the macOS/iOS clients. Used for the picker
+/// and clipboard-file paths where the user hands us encoded bytes.
+fn encode_for_wire(bytes: &[u8]) -> Option<NormalizedPng> {
+    let is_png = bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47]);
+    let is_jpeg = bytes.starts_with(&[0xff, 0xd8, 0xff]);
+    // Already a compact, cross-platform format that fits — send verbatim.
+    if (is_png || is_jpeg) && bytes.len() <= MAX_IMAGE_BYTES {
+        let (width, height) = image::load_from_memory(bytes).ok()?.dimensions();
+        let mime = if is_png { "image/png" } else { "image/jpeg" };
         return Some(NormalizedPng {
             bytes: bytes.to_vec(),
-            mime: "image/png".to_string(),
-            width: w,
-            height: h,
+            mime: mime.to_string(),
+            width,
+            height,
         });
     }
     let img = image::load_from_memory(bytes).ok()?;
-    let rgba = img.to_rgba8();
-    let (width, height) = rgba.dimensions();
-    let mut png = Vec::new();
-    image::DynamicImage::ImageRgba8(rgba)
-        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
-        .ok()?;
+    // A source already in a compressed format but over the cap won't shrink as
+    // PNG — skip straight to JPEG in that case.
+    encode_dynamic_for_wire(&img, is_png || is_jpeg)
+}
+
+/// Encode an already-decoded image for the wire: lossless PNG when it fits the
+/// cap, else JPEG at descending quality. `skip_png` short-circuits the PNG
+/// attempt when the caller knows lossless won't fit. Returns the smallest JPEG
+/// attempt (still possibly over cap) so the send guard can report a realistic
+/// size rather than failing silently.
+fn encode_dynamic_for_wire(img: &image::DynamicImage, skip_png: bool) -> Option<NormalizedPng> {
+    let (width, height) = img.dimensions();
+    if !skip_png {
+        let mut png = Vec::new();
+        if img
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .is_ok()
+            && png.len() <= MAX_IMAGE_BYTES
+        {
+            return Some(NormalizedPng {
+                bytes: png,
+                mime: "image/png".to_string(),
+                width,
+                height,
+            });
+        }
+    }
+    // JPEG can't carry alpha — flatten to RGB once and reuse for each attempt.
+    let rgb = img.to_rgb8();
+    let encode_jpeg = |quality: u8| -> Option<Vec<u8>> {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality)
+            .write_image(rgb.as_raw(), width, height, image::ExtendedColorType::Rgb8)
+            .ok()?;
+        Some(jpeg)
+    };
+    for quality in [92u8, 85, 75, 60] {
+        if let Some(jpeg) = encode_jpeg(quality) {
+            if jpeg.len() <= MAX_IMAGE_BYTES {
+                return Some(NormalizedPng {
+                    bytes: jpeg,
+                    mime: "image/jpeg".to_string(),
+                    width,
+                    height,
+                });
+            }
+        }
+    }
+    // Even aggressive JPEG won't fit — smallest attempt so the guard reports a
+    // realistic size.
+    let jpeg = encode_jpeg(50)?;
     Some(NormalizedPng {
-        bytes: png,
-        mime: "image/png".to_string(),
+        bytes: jpeg,
+        mime: "image/jpeg".to_string(),
         width,
         height,
     })
