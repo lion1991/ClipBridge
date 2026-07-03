@@ -12,8 +12,16 @@
 # Install for end user:
 #   double-click ClipBridge.dmg → drag ClipBridge.app onto Applications
 #
-# First launch from /Applications shows Gatekeeper warning (we only ad-hoc
-# sign). Right-click → Open once and macOS remembers the choice.
+# Codesigning: by default the script picks the best identity in your keychain
+# (Developer ID Application > Apple Development > ad-hoc). Override with
+#   CODESIGN_IDENTITY="Apple Development: ..."  ./scripts/build-macos-app.sh
+# or CODESIGN_IDENTITY=- for a forced ad-hoc build.
+#
+# An Apple Development identity gives a STABLE code signature, so macOS keeps
+# the Local Network (mDNS) grant and the SMAppService login item across
+# rebuilds instead of re-prompting each time. It still shows a Gatekeeper
+# warning on machines outside your team (right-click → Open once); only a
+# Developer ID + notarization removes that for public distribution.
 
 set -euo pipefail
 
@@ -172,8 +180,44 @@ cat >"$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "==> 4/4 ad-hoc codesign"
-codesign --force --deep --sign - "$APP" >/dev/null
+# Resolve a signing identity. CODESIGN_IDENTITY overrides everything; otherwise
+# prefer a distributable Developer ID, then a stable Apple Development identity,
+# then ad-hoc ("-"). We resolve to the cert's SHA-1 hash so duplicate identities
+# with the same display name don't make codesign fail as ambiguous.
+resolve_codesign_identity() {
+  if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
+    printf '%s' "$CODESIGN_IDENTITY"
+    return
+  fi
+  local list line
+  list="$(security find-identity -v -p codesigning 2>/dev/null)"
+  line="$(printf '%s\n' "$list" | grep 'Developer ID Application' | head -1)"
+  [[ -z "$line" ]] && line="$(printf '%s\n' "$list" | grep 'Apple Development' | head -1)"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line" | awk '{print $2}'
+  else
+    printf '%s' '-'
+  fi
+}
+
+SIGN_ID="$(resolve_codesign_identity)"
+SIGN_NAME=""
+IS_DEVELOPER_ID=0
+CODESIGN_FLAGS=(--force --deep --sign "$SIGN_ID")
+if [[ "$SIGN_ID" == "-" ]]; then
+  echo "==> 4/4 ad-hoc codesign (no signing certificate found in keychain)"
+else
+  SIGN_NAME="$(security find-identity -v -p codesigning 2>/dev/null \
+    | grep -i "$SIGN_ID" | head -1 | sed -E 's/^ *[0-9]+\) *[0-9A-F]+ *//')"
+  echo "==> 4/4 codesign with ${SIGN_NAME:-$SIGN_ID}"
+  # Hardened runtime + a secure timestamp are hard prerequisites for
+  # notarization; harmless on a plain Apple Development build too.
+  CODESIGN_FLAGS+=(--options runtime --timestamp)
+  [[ "$SIGN_NAME" == *"Developer ID Application"* ]] && IS_DEVELOPER_ID=1
+fi
+codesign "${CODESIGN_FLAGS[@]}" "$APP" >/dev/null
+# Surface which authority actually ended up on the bundle.
+codesign -dvv "$APP" 2>&1 | grep -E '^(Authority|Signature|TeamIdentifier)=' || true
 
 DMG=""
 if [[ $MAKE_DMG -eq 1 ]]; then
@@ -199,6 +243,31 @@ if [[ $MAKE_DMG -eq 1 ]]; then
   rm -rf "$STAGE"
 fi
 
+# Notarize + staple so Gatekeeper clears the DMG with no warning on any Mac,
+# even offline. Needs a Developer ID signature (checked above) plus one-time
+# credentials stored in the keychain:
+#   xcrun notarytool store-credentials clipbridge-notary \
+#     --apple-id <your-apple-id> --team-id ZCQQCL9863 --password <app-specific-pw>
+# (app-specific password: appleid.apple.com → Sign-In & Security → App-Specific
+# Passwords). Override the profile with NOTARY_PROFILE; set NOTARIZE=0 to skip.
+NOTARY_PROFILE="${NOTARY_PROFILE:-clipbridge-notary}"
+if [[ -n "$DMG" && $IS_DEVELOPER_ID -eq 1 && "${NOTARIZE:-1}" != "0" ]]; then
+  if xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+    echo "==> notarizing DMG (profile: $NOTARY_PROFILE) — this can take a minute"
+    xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+    echo "    -> stapling ticket onto DMG"
+    xcrun stapler staple "$DMG"
+    xcrun stapler validate "$DMG" && echo "    ✓ notarized & stapled"
+  else
+    echo "    [skip notarize] keychain profile '$NOTARY_PROFILE' not found. Set it up once with:"
+    echo "      xcrun notarytool store-credentials $NOTARY_PROFILE \\"
+    echo "        --apple-id <your-apple-id> --team-id ZCQQCL9863 --password <app-specific-password>"
+    echo "    The DMG is signed and usable, just not notarized (Gatekeeper will still warn on other Macs)."
+  fi
+elif [[ -n "$DMG" && $IS_DEVELOPER_ID -eq 0 && "${NOTARIZE:-1}" != "0" ]]; then
+  echo "    [skip notarize] not a Developer ID signature; notarization requires one."
+fi
+
 # Drop the staging executable used for assembly (the .app keeps its own copy).
 rm -f "$EXEC"
 
@@ -216,4 +285,14 @@ if [[ -n "$DMG" ]]; then
 fi
 echo "Try direct:  open '$APP'"
 echo "Autostart:   状态栏菜单 → 开机自启 (使用 SMAppService 注册 Login Item)"
-echo "Note:        First launch may need Right-click → Open (Gatekeeper)"
+if [[ -n "$DMG" ]] && xcrun stapler validate "$DMG" >/dev/null 2>&1; then
+  echo "Gatekeeper:  ✓ notarized & stapled — opens with no warning on any Mac"
+else
+  echo "Note:        First launch may need Right-click → Open (Gatekeeper)"
+fi
+
+# Pop the DMG open in Finder for a quick drag-to-install. Skip with NO_OPEN=1
+# (e.g. CI or a headless release run).
+if [[ -n "$DMG" && "${NO_OPEN:-0}" != "1" ]]; then
+  open "$DMG"
+fi
