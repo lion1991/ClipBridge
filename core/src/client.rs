@@ -110,6 +110,11 @@ enum Cmd {
 
 const IDLE_RECONNECT_INITIAL: Duration = Duration::from_secs(5);
 const IDLE_RECONNECT_MAX: Duration = Duration::from_secs(5 * 60);
+/// A session that survived at least this long counts as stable: its clean
+/// close reconnects immediately and resets the failure backoff. Anything
+/// shorter is treated as relay flapping. The in-session idle timeout is 60s,
+/// so idle-triggered reconnects always qualify as stable.
+const RECONNECT_STABLE_SESSION: Duration = Duration::from_secs(30);
 
 #[derive(uniffi::Object)]
 pub struct Client {
@@ -624,6 +629,7 @@ async fn run(config: ClientRun) {
         IdleReconnectBackoff::new(IDLE_RECONNECT_INITIAL, IDLE_RECONNECT_MAX);
     loop {
         listener.on_state(ConnectionState::Connecting);
+        let session_started = tokio::time::Instant::now();
         match session(
             SessionCtx {
                 relay_url: &relay_url,
@@ -646,7 +652,9 @@ async fn run(config: ClientRun) {
             }
             Ok(SessionExit::Reconnect) => {
                 listener.on_state(ConnectionState::Disconnected);
-                backoff = Duration::from_secs(1);
+                if session_started.elapsed() >= RECONNECT_STABLE_SESSION {
+                    backoff = Duration::from_secs(1);
+                }
                 if let Some(delay) = reconnect_delay_for_mode(
                     reconnect_idle_mode.load(Ordering::Relaxed),
                     &mut idle_reconnect_backoff,
@@ -664,6 +672,17 @@ async fn run(config: ClientRun) {
                     if !reconnect_idle_mode.load(Ordering::Relaxed) {
                         idle_reconnect_backoff.reset();
                     }
+                } else if session_started.elapsed() < RECONNECT_STABLE_SESSION {
+                    // A clean close this soon after connecting means the relay
+                    // (or a proxy in front of it) is dropping us right after
+                    // the handshake. Reconnecting instantly would hammer it
+                    // with a TLS+WS+Join storm, so back off like a failure.
+                    tracing::warn!(
+                        ?backoff,
+                        "session closed shortly after connect; backing off"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
             }
             Err(e) => {
@@ -671,6 +690,9 @@ async fn run(config: ClientRun) {
                 listener.on_state(ConnectionState::Error {
                     message: e.to_string(),
                 });
+                if session_started.elapsed() >= RECONNECT_STABLE_SESSION {
+                    backoff = Duration::from_secs(1);
+                }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }

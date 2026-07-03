@@ -101,6 +101,11 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     @Volatile private var reconnectIdleMode: Boolean = false
     @Volatile private var lanActive: Boolean = true
 
+    // Latest remote image clip received while the screen was off. Fetched
+    // on screen-on; cleared whenever a newer clip (remote text or a local
+    // copy) makes flushing it wrong.
+    @Volatile private var pendingRemoteImage: ClipPayload? = null
+
     init {
         _stateFlow.value = UiConnState.Idle
     }
@@ -174,6 +179,11 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             lanActiveJob?.cancel()
             lanActiveJob = null
             setLanActive(true)
+            pendingRemoteImage?.let {
+                pendingRemoteImage = null
+                Log.i(TAG, "screen on, fetching deferred remote image")
+                handleRemoteImage(it)
+            }
         }
         Log.i(TAG, "reconnect idle mode: $enabled")
     }
@@ -476,6 +486,8 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         }
         lastPublished = text
         lastPublishedAt = now
+        // A fresh local copy outranks any image fetch deferred while locked.
+        pendingRemoteImage = null
         val payload = ClipPayload(
             kind = ClipKind.TEXT,
             content = text,
@@ -526,6 +538,8 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         // we don't care about the return value here; we just want it in.
         if (!dedup) rememberImageHash(h)
 
+        // A fresh local copy outranks any image fetch deferred while locked.
+        pendingRemoteImage = null
         activateLanTemporarily("local image")
         val deviceName = android.os.Build.MODEL ?: "Android"
         val ts = System.currentTimeMillis()
@@ -856,10 +870,18 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     }
 
     private fun handleRemoteClip(payload: ClipPayload) {
-        activateLanTemporarily("remote clip")
+        // Deliberately no activateLanTemporarily here: the clip already
+        // reached us (relay WS, or an already-open LAN path), so there is
+        // nothing LAN could speed up — image fetches fall back to the relay
+        // when no LAN peer is connected. Waking LAN on every remote receive
+        // let a chatty peer keep multicast + pings running through the whole
+        // screen-off period.
         when (payload.kind) {
             ClipKind.TEXT -> {
                 Log.i(TAG, "remote text clip (${payload.content.length} chars)")
+                // Newer text supersedes any image fetch deferred while the
+                // screen was off — flushing it later would clobber this clip.
+                pendingRemoteImage = null
                 // Mark as expected echo *before* writing so the resulting
                 // OnPrimaryClipChangedListener / Shizuku tick recognises it.
                 expectedEcho = payload.content
@@ -877,6 +899,17 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         val meta = payload.image
         if (meta == null) {
             Log.w(TAG, "image clip missing meta, skipping")
+            return
+        }
+        if (reconnectIdleMode) {
+            // Screen is off: nobody can paste right now and the clipboard
+            // only holds the latest item, so defer the (up to 32MB) blob
+            // download until wake. Keeping just the newest meta means N
+            // images copied while locked cost one download instead of N;
+            // superseded ones never hit the network (they also skip the
+            // image history — acceptable for a locked device).
+            pendingRemoteImage = payload
+            Log.i(TAG, "screen off, deferring remote image fetch (${meta.sizeBytes}B)")
             return
         }
         Log.i(TAG, "remote image clip (${meta.width}×${meta.height}, ${meta.sizeBytes}B)")
