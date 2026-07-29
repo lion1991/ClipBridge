@@ -70,14 +70,13 @@ class ClipBridgeAccessibilityServicePolicyTest {
     }
 
     @Test
-    fun leaveStandbyRestoresRelayLanAndRefreshes() {
+    fun leaveStandbyRestoresRelayAndAppliesLanNetworkPolicy() {
         val body = serviceSource.functionBody("private fun leaveStandby(reason: String, immediate: Boolean = false)")
 
         assertTrue(
-            "Leaving standby should clear idle mode, activate LAN, refresh LAN, and fetch recent.",
+            "Leaving standby should resume the relay, apply the current LAN network policy, and fetch recent.",
             body.contains("setReconnectIdleMode(false)") &&
-                body.contains("setLanActive(true)") &&
-                body.contains("refreshLanNow()") &&
+                body.contains("applyLanTransportPolicy(") &&
                 body.contains("fetchRecent()"),
         )
         assertTrue(

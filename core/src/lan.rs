@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{DaemonStatus, ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -620,9 +620,39 @@ async fn wait_until_flag(flag: &AtomicBool, want: bool, notify: &Notify) {
 /// the browse forwarder so the discover task exits.
 struct TransportGuard {
     port: u16,
-    _daemon: ServiceDaemon,
-    _forwarder: Option<JoinHandle<()>>,
-    _cancel_tx: tokio::sync::oneshot::Sender<()>,
+    daemon: ServiceDaemon,
+    forwarder: Option<JoinHandle<()>>,
+    cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for TransportGuard {
+    fn drop(&mut self) {
+        // ServiceDaemon is a cloneable command handle; dropping it alone
+        // leaves the daemon thread and multicast sockets running.
+        drop(self.cancel_tx.take());
+        let shutdown_complete = match self.daemon.shutdown() {
+            Ok(status_rx) => matches!(
+                status_rx.recv_timeout(Duration::from_secs(1)),
+                Ok(DaemonStatus::Shutdown)
+            ),
+            Err(e) => {
+                tracing::warn!(?e, port = self.port, "mDNS daemon shutdown request failed");
+                false
+            }
+        };
+        if !shutdown_complete {
+            tracing::warn!(
+                port = self.port,
+                "mDNS daemon did not confirm shutdown within timeout"
+            );
+            return;
+        }
+        if let Some(forwarder) = self.forwarder.take() {
+            if forwarder.join().is_err() {
+                tracing::warn!(port = self.port, "mDNS forwarder thread panicked");
+            }
+        }
+    }
 }
 
 struct TransportStart {
@@ -887,9 +917,9 @@ async fn start_transport(cfg: TransportStart) -> Result<TransportGuard, LanError
 
     Ok(TransportGuard {
         port: bound_port,
-        _daemon: daemon,
-        _forwarder: forwarder,
-        _cancel_tx: cancel_tx,
+        daemon,
+        forwarder,
+        cancel_tx: Some(cancel_tx),
     })
 }
 
@@ -2947,6 +2977,31 @@ mod tests {
         assert_ne!(port2, 0);
         // Port may coincidentally match after rebind; either way transport is up.
         let _ = port1;
+    }
+
+    #[test]
+    fn transport_guard_drop_shuts_down_mdns_daemon() {
+        let daemon = ServiceDaemon::new().expect("daemon");
+        let observer = daemon.clone();
+        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel();
+        let guard = TransportGuard {
+            port: 0,
+            daemon,
+            forwarder: None,
+            cancel_tx: Some(cancel_tx),
+        };
+
+        drop(guard);
+
+        let status = observer
+            .status()
+            .expect("status receiver")
+            .recv_timeout(Duration::from_secs(1))
+            .expect("daemon status");
+        if status != mdns_sd::DaemonStatus::Shutdown {
+            let _ = observer.shutdown();
+        }
+        assert_eq!(status, mdns_sd::DaemonStatus::Shutdown);
     }
 
     /// Two nodes on localhost discover each other via mDNS and exchange

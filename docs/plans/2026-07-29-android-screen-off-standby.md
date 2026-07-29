@@ -3,13 +3,20 @@
 > Reviewed 2026-07-28 against `core/src/client.rs`, `core/src/lan.rs`,
 > `ClipBridgeAccessibilityService.kt`, and `relay/src/hub.rs`. All claims
 > below are verified against source unless marked as a decision point.
+>
+> Follow-up verified 2026-07-29 on a Samsung SM-S9380: the first hard-suspend
+> implementation still leaked an `mdns-sd` daemon on every LAN teardown
+> because dropping `ServiceDaemon` does not shut it down. The Android service
+> also enabled LAN discovery on a cellular default network. Both defects are
+> covered by regression tests and the device checks recorded below.
 
 ## Goal
 
-Fix ClipBridge Android battery/network waste while the screen is off. Today
-"standby" only flips flags; mDNS, TCP listen, live peer sockets, and the relay
-WebSocket keep the process and radio warm for hours. Standby must **actually
-tear down hot paths**, then rebuild cleanly on wake / app foreground.
+Fix ClipBridge Android battery/network waste while the screen is off. Before
+the hard-suspend work, "standby" only flipped flags; mDNS, TCP listen, live
+peer sockets, and the relay WebSocket kept the process and radio warm for
+hours. Standby must **actually tear down hot paths**, then rebuild cleanly on
+wake / app foreground.
 
 ## Problem (measured)
 
@@ -20,9 +27,20 @@ OEM battery UI after ~6h screen-off background:
 - Huge Wi‑Fi / cellular packet counters.
 - Wake locks = 0 (no classic WakeLock; waste is socket + mDNS + service residency).
 
-Root cause in current code:
+Follow-up device evidence on mobile data after the first fix:
 
-| Path | On `SCREEN_OFF` today |
+- Android `netstats detail` attributed about 124.3 GB / 1.89 billion received
+  packets to the app UID on the physical mobile layer across the affected
+  buckets. VPN-layer accounting explains why the OEM UI displayed more than
+  3 billion packets.
+- Average received packet size was about 65 bytes, consistent with a
+  control-packet storm rather than clipboard or file payload.
+- One lock/unlock cycle increased the process from two leaked
+  `mDNS_daemon`/`clipbridge-mdns` thread pairs to three.
+
+Root cause in the original implementation:
+
+| Path | Original `SCREEN_OFF` behavior |
 |------|------------------------|
 | `setReconnectIdleMode(true)` | Sets flag; slows **post-disconnect** WS reconnect only |
 | `setLanActive(false)` | Atomic flag + notify; stops **new** dials and **active** pings |
@@ -45,8 +63,9 @@ Root cause in current code:
    - Keep accessibility service alive so pairing/config and on-wake hooks still work.
 
 2. **Screen on / user present / host app foreground**  
-   - Leave standby: reconnect relay, restore LAN.  
-   - `refreshLanNow()` so LAN re-advertises promptly.  
+   - Leave standby: reconnect relay. Restore LAN only when the current default
+     network is Wi-Fi or Ethernet; cellular remains relay-only.
+   - `refreshLanNow()` so LAN re-advertises promptly when LAN is enabled.
    - Catch-up rides the WS reconnect itself — `session()` already auto-sends
      `FetchRecent` on every connect (`client.rs`); the host-side
      `fetchRecent()` call is defensive redundancy, keep it but don't treat
@@ -54,7 +73,7 @@ Root cause in current code:
 
 3. **Local activity while screen off** (copy toast, send file/image from residual UI)  
    - Open a **bounded wake window** (existing ~60s, possibly 90–120s for file send).  
-   - The window is a **temporary full wake**: LAN up **and** relay reconnected
+   - The window reconnects relay and enables LAN only on Wi-Fi/Ethernet
      (the WS must be up for the publish / blob upload to leave the device).  
    - Window end + still screen-off → tear down again.
 
@@ -118,14 +137,16 @@ new API and keep the policy tests simple.
      ▼                                              │
  ┌────────┐  SCREEN_OFF, or wake-window timer  ┌────┴────┐
  │ ACTIVE │ ─────────────────────────────────► │ STANDBY │
- │ lan+ws │  expires while still screen-off    │ no lan  │
- └────────┘                                    │ no ws   │
-                                               └─────────┘
+ │ ws; LAN│  expires while still screen-off    │ no lan  │
+ │ on LAN │                                     │ no ws   │
+ └────────┘                                    └─────────┘
 ```
 
 Mapping to existing flags:
 
-- `ACTIVE`: `reconnectIdleMode=false`, `lanActive=true` (relay connected, LAN up).  
+- `ACTIVE`: `reconnectIdleMode=false`,
+  `lanActive=defaultNetwork.isWifiOrEthernet` (relay connected; LAN is never
+  started for a cellular-only default network).
 - `STANDBY`: `reconnectIdleMode=true` (= hard WS suspend after PR2), `lanActive=false` (= real LAN teardown after PR1).  
 - **Temporary wake while locked** is not a third mode: call `leaveStandby()`,
   then schedule `enterStandby()` after `LAN_ACTIVE_WINDOW_MS` if the device
@@ -141,8 +162,10 @@ On `lan_active` **false → true / true → false**, `LanNode` must:
 
 **Suspend (`false`):**
 
-1. Shut down the mDNS daemon (unregister + stop browse; the forwarder thread
-   exits when the browse channel closes).  
+1. Shut down the mDNS daemon explicitly with `ServiceDaemon::shutdown()`
+   (unregister + stop browse), wait for shutdown confirmation, then join the
+   browse forwarder. Dropping the command handle alone does not close the
+   daemon or its multicast sockets.
 2. Abort the accept loop and close the listener. Note the restructure this
    implies: today the spawned accept task **owns** the listener (moved into
    the closure) and no `JoinHandle` is kept for accept/discover/reconciler
@@ -234,9 +257,10 @@ Constants to document:
 
 2. `SCREEN_ON` / `USER_PRESENT` → `leaveStandby()`  
    - `setReconnectIdleMode(false)`  
-   - `setLanActive(true)`  
-   - `refreshLanNow()` after LAN resume completes (see resume ordering in A);
-     `fetchRecent()` kept as defensive redundancy  
+   - apply the current default-network policy:
+     `setLanActive(isWifiOrEthernet)`
+   - `refreshLanNow()` after LAN resume completes when LAN is enabled (see
+     resume ordering in A); `fetchRecent()` kept as defensive redundancy
    - flush deferred remote image (already)
 
 3. `activateLanTemporarily(reason)` while screen off → becomes **temporary
@@ -250,7 +274,12 @@ Constants to document:
 
 4. `onHostAppForeground()`: same as leaveStandby (already close).
 
-5. Policy tests: update strings that currently only assert flag names; add
+5. Register a default-network callback and re-apply LAN policy on
+   availability, capability, and loss events. Re-read the current default
+   network before applying the policy so callback ordering during handover
+   cannot re-enable LAN for a stale network.
+
+6. Policy tests: update strings that currently only assert flag names; add
    expectations for suspend APIs / no Ping-echo keep-alive as expressed in
    source contracts.
 
@@ -319,7 +348,10 @@ UI (optional, small): connection badge may show Disconnected while locked; avoid
 ### Android policy tests (source contracts)
 
 - Standby path calls LAN off + idle on.  
-- Wake / foreground: idle off, LAN on, refresh (+ defensive fetchRecent).  
+- Wake / foreground: idle off, LAN follows Wi-Fi/Ethernet availability,
+  refresh when enabled (+ defensive fetchRecent).
+- Cellular-only default network keeps LAN/mDNS disabled while relay remains
+  available.
 - Wake window = full `leaveStandby()`, re-enters standby after timeout if still non-interactive.  
 - Remote clip handler still must **not** open a wake window for every receive.
 
@@ -332,6 +364,21 @@ UI (optional, small): connection badge may show Disconnected while locked; avoid
 5. File send from Mac to locked phone: expected fail; unlock + both active works.  
 6. Rapid lock/unlock: no crash, no reconnect storm, MulticastLock not leaked.  
 7. **Change pairing config while phone is locked** → client restarts without hanging (exercises `stop()` under hard suspend on-device).
+8. Switch Wi-Fi off while awake and wait for cellular default: no
+   `mDNS_daemon`/`clipbridge-mdns` thread and no held MulticastLock; relay
+   reconnects. Switch Wi-Fi on: exactly one daemon/forwarder pair returns.
+
+### 2026-07-29 device verification
+
+- New APK installed successfully on the SM-S9380.
+- Wi-Fi awake: exactly one `mDNS_daemon`/`clipbridge-mdns` thread pair.
+- Screen off: both threads and the MulticastLock disappeared.
+- Screen on: exactly one new pair returned; repeated teardown/resume no longer
+  accumulated daemon threads.
+- Cellular-only, awake, stabilized 10-second sample: received 512 bytes /
+  8 packets and sent 632 bytes / 10 packets, with 0% sampled process CPU and
+  no mDNS threads. This is a bounded validation, not a substitute for the
+  one-hour-plus soak that exposed the original defect.
 
 ## PR plan (DAG)
 
@@ -397,6 +444,8 @@ PR1 core LAN real suspend/resume
 | Lock/unlock thrash | Debounce leaveStandby ~300–500ms; reuse single client |
 | File transfer mid-lock | Wake window; or reject with clear error |
 | Doze throttles window timer / restricts network | Accept: window may stretch, locked-phone publish is best-effort |
+| mDNS daemon survives LAN teardown | Call `ServiceDaemon::shutdown()`, wait for `Shutdown`, join the forwarder; regression test the guard drop |
+| Cellular/VPN path carries LAN discovery traffic | Enable LAN only for a Wi-Fi/Ethernet default network; re-evaluate through `ConnectivityManager.NetworkCallback` |
 | Changing idle semantics for future platforms | Verified only Android calls the setters; document; `set_power_mode` split if ever needed |
 | AS still shows long "后台" time | Expected; success metric is CPU + packets, not background minutes |
 
@@ -404,6 +453,7 @@ PR1 core LAN real suspend/resume
 
 - Screen-off 6h soak: CPU attributed time **≪** wall time (order-of-magnitude drop from ~5h/6h).  
 - Wi‑Fi/cellular packet counts during pure standby near zero (aside from OS noise).  
+- Cellular while active is relay-only: zero mDNS threads and no MulticastLock.
 - Unlock → text sync within a few seconds of reconnect; backlog coverage per PR0 window.  
 - Existing screen-on LAN + relay behavior unchanged.  
 - Policy unit tests green.
@@ -411,12 +461,13 @@ PR1 core LAN real suspend/resume
 ## Implementation notes (code anchors)
 
 - Android: `clients/android/.../ClipBridgeAccessibilityService.kt`  
-  (`setReconnectIdleMode`, `setLanActive`, `activateLanTemporarily`, `onHostAppForeground`)  
+  (`setReconnectIdleMode`, `applyLanTransportPolicy`,
+  `registerNetworkStateCallback`, `activateLanTemporarily`,
+  `onHostAppForeground`)
 - Core client: `core/src/client.rs` (`set_reconnect_idle_mode`, `run` reconnect loop +
   `wait_for_idle_reconnect_delay`, `session` — auto-`FetchRecent` on join, `Cmd::Stop` handling)  
-- Core LAN: `core/src/lan.rs` (`LanNode::spawn` — accept/discover/reconciler tasks own their
-  resources with no handles kept; `run_peer` — Ping echo in both the classify path and the
-  read loop, `out_rx` branch gated on `lan_active`, `lan_mode_notify` branch currently log-only)  
+- Core LAN: `core/src/lan.rs` (`TransportGuard::drop` — explicit mDNS daemon
+  shutdown and forwarder join; `LanNode::spawn`; `run_peer`)
 - Relay: `relay/src/hub.rs` (`RECENT_CAP`, `RECENT_TTL`) — PR0  
 - Tests: `ClipBridgeAccessibilityServicePolicyTest.kt` + new core tests
 
@@ -434,3 +485,8 @@ PR1 core LAN real suspend/resume
   (extend cache TTL/limits); must be decided before PR2. Without it, hard
   suspend regresses clip delivery vs today's soft idle.  
 - Temporary wake window retained for user-initiated work while locked.
+- **Cellular is relay-only.** LAN/mDNS is enabled only when the default network
+  exposes Wi-Fi or Ethernet transport (2026-07-29 follow-up).
+- **mDNS shutdown must be explicit.** Owning or dropping an `mdns-sd`
+  `ServiceDaemon` handle is not a lifecycle boundary; the transport guard
+  requests shutdown and waits for confirmation (2026-07-29 follow-up).

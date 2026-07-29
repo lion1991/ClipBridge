@@ -8,6 +8,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Environment
 import android.os.PowerManager
@@ -60,6 +63,8 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private var clipListener: ClipboardManager.OnPrimaryClipChangedListener? = null
     private var prefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
     private var screenReceiver: BroadcastReceiver? = null
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
     // Held only while Android LAN mode is active. Screen-off standby releases
     // it; transfer activity opens a short LAN window so mDNS/TCP LAN paths can
     // wake briefly without keeping Wi-Fi multicast hot all night.
@@ -101,6 +106,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private var leaveStandbyDebounceJob: Job? = null
     @Volatile private var reconnectIdleMode: Boolean = false
     @Volatile private var lanActive: Boolean = true
+    @Volatile private var hasLanNetwork: Boolean = false
 
     // Latest remote image clip received while the screen was off. Fetched
     // on screen-on; cleared whenever a newer clip (remote text or a local
@@ -132,6 +138,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         prefs.registerOnSharedPreferenceChangeListener(prefsListener)
 
         ShizukuBridge.register()
+        registerNetworkStateCallback()
         registerScreenStateReceiver()
         startLanCountPoller()
         startClient()
@@ -159,7 +166,9 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         if (isScreenOffForStandby()) {
             enterStandby()
         } else {
-            leaveStandby(reason = "service connected")
+            // Set the initial LAN policy before Client starts so a
+            // mobile-only launch does not retain the default true state.
+            leaveStandby(reason = "service connected", immediate = true)
         }
     }
 
@@ -173,6 +182,89 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private fun isScreenOffForStandby(): Boolean {
         val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return false
         return !pm.isInteractive
+    }
+
+    private fun registerNetworkStateCallback() {
+        if (networkCallback != null) return
+        val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return
+        connectivityManager = manager
+        hasLanNetwork = manager.activeNetwork
+            ?.let(manager::getNetworkCapabilities)
+            ?.isLanCapable()
+            ?: false
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                refreshLanNetworkAvailability("default network available")
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                capabilities: NetworkCapabilities,
+            ) {
+                refreshLanNetworkAvailability("default network capabilities changed")
+            }
+
+            override fun onLost(network: Network) {
+                refreshLanNetworkAvailability("default network lost")
+            }
+        }
+        networkCallback = callback
+        try {
+            manager.registerDefaultNetworkCallback(callback)
+        } catch (t: Throwable) {
+            networkCallback = null
+            Log.w(TAG, "network callback registration failed: ${t.message}")
+        }
+    }
+
+    private fun unregisterNetworkStateCallback() {
+        val callback = networkCallback ?: return
+        try {
+            connectivityManager?.unregisterNetworkCallback(callback)
+        } catch (_: Throwable) {
+        }
+        networkCallback = null
+        connectivityManager = null
+    }
+
+    private fun refreshLanNetworkAvailability(reason: String) {
+        scope.launch(Dispatchers.Main) {
+            val manager = connectivityManager ?: return@launch
+            hasLanNetwork = manager.activeNetwork
+                ?.let(manager::getNetworkCapabilities)
+                ?.isLanCapable()
+                ?: false
+            applyLanTransportPolicy(reason = reason, refresh = hasLanNetwork)
+        }
+    }
+
+    private fun applyLanTransportPolicy(reason: String, refresh: Boolean) {
+        val enabled = shouldEnableLanTransport(
+            isTransportAwake = !reconnectIdleMode,
+            hasLanNetwork = hasLanNetwork,
+        )
+        val changed = lanActive != enabled
+        lanActive = enabled
+        client?.setLanActive(enabled)
+        if (enabled) {
+            if (client != null) acquireMulticastLock()
+            if (refresh) {
+                try {
+                    client?.refreshLanNow()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "LAN refresh failed after network change: ${t.message}")
+                }
+            }
+        } else {
+            _lanFilePeers.value = emptyList()
+            _lanPeerNames.value = emptyList()
+            _lanPeerCount.value = 0
+            releaseMulticastLock()
+        }
+        if (changed) {
+            Log.i(TAG, "LAN transport active=$enabled: $reason")
+        }
     }
 
     /**
@@ -208,17 +300,12 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         lanActiveJob = null
         val run = {
             reconnectIdleMode = false
-            lanActive = true
             client?.setReconnectIdleMode(false)
-            client?.setLanActive(true)
-            if (client != null) acquireMulticastLock()
+            applyLanTransportPolicy(reason = reason, refresh = true)
             try {
-                // Ordering: LAN resume completes in core then refresh so we
-                // advertise the new port rather than a stale suspended one.
-                client?.refreshLanNow()
                 client?.fetchRecent()
             } catch (t: Throwable) {
-                Log.w(TAG, "leaveStandby refresh failed: ${t.message}")
+                Log.w(TAG, "leaveStandby fetch failed: ${t.message}")
             }
             pendingRemoteImage?.let {
                 pendingRemoteImage = null
@@ -382,6 +469,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         leaveStandbyDebounceJob = null
         lanCountJob?.cancel()
         lanCountJob = null
+        unregisterNetworkStateCallback()
         scope.cancel()
         ShizukuBridge.unregister()
         clipListener?.let { clipboard?.removePrimaryClipChangedListener(it) }
@@ -1131,3 +1219,7 @@ sealed class UiConnState {
     data object Disconnected : UiConnState()
     data class Error(val message: String) : UiConnState()
 }
+
+private fun NetworkCapabilities.isLanCapable(): Boolean =
+    hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+        hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
