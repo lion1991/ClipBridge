@@ -19,7 +19,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -560,9 +560,13 @@ struct KnownPeer {
     candidates: Vec<SocketAddr>,
 }
 
-/// Owns the mDNS daemon, accept loop, and per-peer connection tasks. Drop
-/// to tear everything down — the broadcast sender closes, peer tasks see
-/// EOF and exit, and the daemon's own thread is shut down by `Drop`.
+/// Owns LAN transport state shared across suspend/resume cycles.
+///
+/// The mDNS daemon, TCP listener, accept loop, and discover loop are
+/// started/stopped by a lifecycle task when [`LanNodeConfig::lan_active`]
+/// flips. Peer sessions exit via `lan_mode_notify` on suspend. Dropping
+/// this struct tears down the outer handle; the worker runtime abort
+/// kills remaining tasks when the client stops.
 pub struct LanNode {
     out_tx: broadcast::Sender<OutgoingLan>,
     /// Live count of peers currently in a Hello-completed session. Bumped
@@ -573,31 +577,320 @@ pub struct LanNode {
     /// the FFI layer can also render "局域网: Mac, iPhone" instead of
     /// just a count, which makes mesh asymmetry visible across devices.
     peers: PeerRegistry,
-    /// Kept alive so the daemon and its background thread stay up. The
-    /// `mdns_sd::ServiceDaemon::Drop` impl unregisters the service and
-    /// stops the daemon.
-    _daemon: ServiceDaemon,
-    /// Forwarder thread that bridges flume's sync receiver to a tokio
-    /// channel. Joined when its event_tx closes (i.e. when daemon drops).
-    _forwarder: Option<JoinHandle<()>>,
-    /// TCP port the LAN listener is bound to. Advertised to the relay so
-    /// rendezvous peers learn where to dial us.
-    port: u16,
+    /// TCP port the LAN listener is bound to while active (0 while
+    /// suspended). Re-bound to a new random port on every resume.
+    port: Arc<AtomicU16>,
     /// This device's id, kept for the control-link tiebreak when ingesting
     /// relay-learned peers (mirrors the mDNS discover path's tiebreak).
     self_device_id: String,
     /// The same `known_peers` map the mDNS discover loop feeds and the
     /// reconciler dials from. `ingest_relay_peers` writes relay-learned
     /// entries here under a `relay:` key namespace so they get dialed
-    /// exactly like mDNS-discovered peers.
+    /// exactly like mDNS-discovered peers. Cleared on each suspend.
     known_peers: Arc<Mutex<HashMap<String, KnownPeer>>>,
     /// The same map `fetch_image` reads for blob-fetch addresses. Relay-
     /// learned entries are added/removed here too so LAN image pull works
-    /// for peers found via the relay, not just via mDNS.
+    /// for peers found via the relay, not just via mDNS. Cleared on
+    /// each suspend.
     peer_addrs: PeerAddrs,
     /// Wakes the reconciler immediately when relay/mDNS learns a new peer.
     /// Without this, startup can sit relay-only until the next 5s tick.
     reconcile_notify: Arc<Notify>,
+}
+
+/// Park until `flag == want`. The waiter is registered (`enable()`) before
+/// the flag is re-checked, so a store + `notify_waiters` landing between
+/// check and park cannot be lost — a plain check-then-`notified().await`
+/// has a window where a missed suspend notify would leave mDNS + the
+/// listener hot through the whole screen-off period.
+async fn wait_until_flag(flag: &AtomicBool, want: bool, notify: &Notify) {
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if flag.load(Ordering::Relaxed) == want {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// RAII guard for one active LAN transport generation. Dropping it
+/// cancels the accept loop (via oneshot), unregisters mDNS, and stops
+/// the browse forwarder so the discover task exits.
+struct TransportGuard {
+    port: u16,
+    _daemon: ServiceDaemon,
+    _forwarder: Option<JoinHandle<()>>,
+    _cancel_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+struct TransportStart {
+    group_id: String,
+    device_id: String,
+    device_name: String,
+    key: [u8; KEY_LEN],
+    inbound: mpsc::UnboundedSender<IncomingLanClip>,
+    peer_count: Arc<AtomicUsize>,
+    peers: PeerRegistry,
+    blob_cache: SharedBlobCache,
+    peer_addrs: PeerAddrs,
+    file_receive_dir: SharedFileReceiveDir,
+    file_inbound: mpsc::UnboundedSender<ReceivedFile>,
+    lan_active: Arc<AtomicBool>,
+    lan_mode_notify: Arc<Notify>,
+    known_peers: Arc<Mutex<HashMap<String, KnownPeer>>>,
+    out_tx: broadcast::Sender<OutgoingLan>,
+    port: Arc<AtomicU16>,
+    reconcile_notify: Arc<Notify>,
+}
+
+/// Bind listener + register mDNS + spawn accept/discover for one generation.
+async fn start_transport(cfg: TransportStart) -> Result<TransportGuard, LanError> {
+    let TransportStart {
+        group_id,
+        device_id,
+        device_name,
+        key,
+        inbound,
+        peer_count,
+        peers,
+        blob_cache,
+        peer_addrs,
+        file_receive_dir,
+        file_inbound,
+        lan_active,
+        lan_mode_notify,
+        known_peers,
+        out_tx,
+        port,
+        reconcile_notify,
+    } = cfg;
+
+    let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
+    let bound_port = listener.local_addr()?.port();
+    port.store(bound_port, Ordering::Relaxed);
+
+    let daemon = ServiceDaemon::new()?;
+    let fingerprint = group_fingerprint(&group_id);
+
+    // Properties (TXT record) — only the things peers need before they
+    // open a TCP connection. The raw group_id is intentionally absent.
+    let mut props: HashMap<String, String> = HashMap::new();
+    props.insert("v".into(), PROTO_VERSION.to_string());
+    props.insert("gid".into(), fingerprint.clone());
+    props.insert("did".into(), device_id.clone());
+
+    // mDNS instance names must be unique within the service type. iOS
+    // runs the keyboard extension in a separate process from the main
+    // app but they share the same `device_id` (per App Group), so we
+    // tack on a per-process random suffix to keep registrations from
+    // colliding. Receivers dedup on the `did` TXT property + clip ts,
+    // so seeing the same logical device under two instances is fine.
+    let mut suffix = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut suffix);
+    let suffix = format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        suffix[0], suffix[1], suffix[2], suffix[3]
+    );
+    let instance = format!("{}-{}", short_id(&device_id), suffix);
+    let hostname = format!("clipbridge-{}.local.", instance);
+    let service =
+        ServiceInfo::new(SERVICE_TYPE, &instance, &hostname, "", bound_port, Some(props))?
+            .enable_addr_auto();
+    daemon.register(service)?;
+
+    let browse_rx = daemon.browse(SERVICE_TYPE)?;
+
+    // mdns-sd's browse() returns a sync flume::Receiver. Forward it
+    // into a tokio channel via a tiny std thread so the main loop can
+    // `select!` on it without blocking the runtime worker.
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<ServiceEvent>();
+    let forwarder = std::thread::Builder::new()
+        .name("clipbridge-mdns-forwarder".into())
+        .spawn(move || {
+            while let Ok(ev) = browse_rx.recv() {
+                if event_tx.send(ev).is_err() {
+                    break; // tokio side gone — daemon being torn down
+                }
+            }
+        })
+        .ok();
+
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Accept loop: inbound connections from peers that found us first.
+    // Cancelled when TransportGuard drops (oneshot closed).
+    {
+        let accept_key = key;
+        let device_id = device_id.clone();
+        let device_name = device_name.clone();
+        let inbound = inbound.clone();
+        let out_tx = out_tx.clone();
+        let peer_count = peer_count.clone();
+        let peers = peers.clone();
+        let blob_cache = blob_cache.clone();
+        let file_receive_dir = file_receive_dir.clone();
+        let file_inbound = file_inbound.clone();
+        let lan_active = lan_active.clone();
+        let lan_mode_notify = lan_mode_notify.clone();
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    biased;
+                    _ = &mut cancel_rx => break,
+                    result = listener.accept() => result,
+                };
+                let (stream, addr) = match accepted {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(?e, "lan accept failed");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                if !lan_active.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let device_id = device_id.clone();
+                let device_name = device_name.clone();
+                let inbound = inbound.clone();
+                let out_rx = out_tx.subscribe();
+                let peer_count = peer_count.clone();
+                let peers = peers.clone();
+                let blob_cache = blob_cache.clone();
+                let file_receive_dir = file_receive_dir.clone();
+                let file_inbound = file_inbound.clone();
+                let lan_active = lan_active.clone();
+                let lan_mode_notify = lan_mode_notify.clone();
+                let registry_key = format!("inbound:{addr}");
+                tokio::spawn(async move {
+                    let peer = PeerRunContext {
+                        key: accept_key,
+                        self_device_id: device_id,
+                        self_device_name: device_name,
+                        inbound,
+                        out_rx,
+                        expected_peer: None,
+                        peer_count,
+                        peers,
+                        blob_cache,
+                        registry_key,
+                        file_receive_dir,
+                        file_inbound,
+                        lan_active,
+                        lan_mode_notify,
+                    };
+                    if let Err(e) = run_peer(stream, addr, peer).await {
+                        tracing::debug!(?e, %addr, "lan peer (inbound) ended");
+                    }
+                });
+            }
+        });
+    }
+
+    // Discover loop: feed `known_peers` from mDNS events. Exits when the
+    // daemon is dropped (browse channel closes → forwarder ends → event_tx
+    // drops → this recv returns None).
+    {
+        let device_id = device_id.clone();
+        let known_peers = known_peers.clone();
+        let peer_addrs = peer_addrs.clone();
+        let reconcile_notify = reconcile_notify.clone();
+        tokio::spawn(async move {
+            let mut event_rx = event_rx;
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    ServiceEvent::ServiceResolved(info) => {
+                        let props = info.get_properties();
+                        let peer_gid = props.get_property_val_str("gid").unwrap_or("");
+                        let peer_did = props.get_property_val_str("did").unwrap_or("");
+                        if peer_gid != fingerprint {
+                            continue;
+                        }
+                        if peer_did.is_empty() {
+                            continue;
+                        }
+                        let svc_port = info.get_port();
+                        let local_networks = local_private_networks();
+                        // mDNS gives us a HashSet of addresses with
+                        // unstable iteration order. iOS in particular
+                        // publishes IPv6 link-local on awdl0/utun that
+                        // need %scope to dial. Filter & sort: drop
+                        // link-local v6, IPv4 first, global v6 second.
+                        let mut candidates: Vec<SocketAddr> = info
+                            .get_addresses()
+                            .iter()
+                            .copied()
+                            .filter(|a| !is_unroutable(a))
+                            .map(|a| SocketAddr::new(a, svc_port))
+                            .collect();
+                        drop_local_interface_candidates(&mut candidates, &local_networks);
+                        sort_candidates_for_dial(&mut candidates, &local_networks);
+                        if candidates.is_empty() {
+                            continue;
+                        }
+                        let fullname = info.get_fullname().to_string();
+                        // Cache addresses on *both* sides regardless of
+                        // the control-link tiebreak below: the blob
+                        // fetcher dials whoever has the bytes, which can
+                        // be the side that never initiates the control
+                        // connection. Keyed by the mDNS instance
+                        // `fullname` (not `did`) so the same device's
+                        // multiple processes (iOS app + keyboard share a
+                        // did) stay distinct entries, and so a
+                        // `ServiceRemoved` — which only carries the
+                        // fullname — can purge the right one.
+                        if let Ok(mut a) = peer_addrs.lock() {
+                            a.insert(
+                                fullname.clone(),
+                                PeerAddrEntry {
+                                    device_id: peer_did.to_string(),
+                                    display_name: None,
+                                    candidates: candidates.clone(),
+                                },
+                            );
+                        }
+                        // Lexicographic tiebreak: only the side with the
+                        // larger device_id initiates the *control* link.
+                        // Equal ids (same physical device — iOS main app
+                        // vs keyboard) also short-circuit here.
+                        if device_id.as_str() <= peer_did {
+                            continue;
+                        }
+                        let mut g = known_peers.lock().await;
+                        g.insert(
+                            fullname,
+                            KnownPeer {
+                                peer_did: peer_did.to_string(),
+                                candidates,
+                            },
+                        );
+                        reconcile_notify.notify_one();
+                    }
+                    ServiceEvent::ServiceRemoved(_, fullname) => {
+                        // mDNS TTL expired with no re-announcement —
+                        // peer is presumed gone. Stop reconnect retries
+                        // and drop its cached blob-fetch addresses so
+                        // `fetch_image` doesn't burn a dial timeout on a
+                        // stale instance before falling back to relay.
+                        known_peers.lock().await.remove(&fullname);
+                        if let Ok(mut a) = peer_addrs.lock() {
+                            a.remove(&fullname);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    Ok(TransportGuard {
+        port: bound_port,
+        _daemon: daemon,
+        _forwarder: forwarder,
+        _cancel_tx: cancel_tx,
+    })
 }
 
 pub(crate) struct LanNodeConfig {
@@ -617,14 +910,14 @@ pub(crate) struct LanNodeConfig {
 }
 
 impl LanNode {
-    /// Bind a TCP listener on a random port, register an mDNS service for
-    /// it, browse for other peers, and start forwarding clips.
+    /// Start the LAN node: shared maps + reconciler always live; the mDNS
+    /// daemon / TCP listener / accept+discover loops are owned by a
+    /// lifecycle task that tears them down on `lan_active=false` and
+    /// rebuilds them on resume (new random port each time).
     ///
-    /// Must be called from within a tokio runtime context — spawns long-
-    /// lived tasks via `tokio::spawn`. `peer_count` and `peers` are
-    /// shared with the owner so they can be polled from outside the
-    /// runtime (FFI getters). `device_name` is sent to peers in our
-    /// Hello so they can render us in their UI peer list.
+    /// Must be called from within a tokio runtime context. When the host
+    /// starts active (default), the first transport generation is brought
+    /// up before this returns so `port()` is immediately valid.
     pub(crate) async fn spawn(config: LanNodeConfig) -> Result<Self, LanError> {
         let LanNodeConfig {
             group_id,
@@ -642,239 +935,21 @@ impl LanNode {
             lan_mode_notify,
         } = config;
 
-        let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
-        let port = listener.local_addr()?.port();
-
-        let daemon = ServiceDaemon::new()?;
-        let fingerprint = group_fingerprint(&group_id);
-
-        // Properties (TXT record) — only the things peers need before they
-        // open a TCP connection. The raw group_id is intentionally absent.
-        let mut props: HashMap<String, String> = HashMap::new();
-        props.insert("v".into(), PROTO_VERSION.to_string());
-        props.insert("gid".into(), fingerprint.clone());
-        props.insert("did".into(), device_id.clone());
-
-        // mDNS instance names must be unique within the service type. iOS
-        // runs the keyboard extension in a separate process from the main
-        // app but they share the same `device_id` (per App Group), so we
-        // tack on a per-process random suffix to keep registrations from
-        // colliding. Receivers dedup on the `did` TXT property + clip ts,
-        // so seeing the same logical device under two instances is fine.
-        let mut suffix = [0u8; 4];
-        rand::thread_rng().fill_bytes(&mut suffix);
-        let suffix = format!(
-            "{:02x}{:02x}{:02x}{:02x}",
-            suffix[0], suffix[1], suffix[2], suffix[3]
-        );
-        let instance = format!("{}-{}", short_id(&device_id), suffix);
-        let hostname = format!("clipbridge-{}.local.", instance);
-        let service = ServiceInfo::new(SERVICE_TYPE, &instance, &hostname, "", port, Some(props))?
-            .enable_addr_auto();
-        daemon.register(service)?;
-
-        let browse_rx = daemon.browse(SERVICE_TYPE)?;
-
-        // mdns-sd's browse() returns a sync flume::Receiver. Forward it
-        // into a tokio channel via a tiny std thread so the main loop can
-        // `select!` on it without blocking the runtime worker.
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<ServiceEvent>();
-        let forwarder = std::thread::Builder::new()
-            .name("clipbridge-mdns-forwarder".into())
-            .spawn(move || {
-                while let Ok(ev) = browse_rx.recv() {
-                    if event_tx.send(ev).is_err() {
-                        break; // tokio side gone — daemon being torn down
-                    }
-                }
-            })
-            .ok();
-
         let (out_tx, _) = broadcast::channel::<OutgoingLan>(OUT_BUFFER);
-        // `peer_count` is provided by the caller so the FFI side can read
-        // it from outside the tokio runtime that owns this LanNode.
-
         // Currently-dialing-or-connected outbound peers. Keyed by mDNS
         // instance fullname so two processes on one device count as
         // separate entries (iOS main app vs keyboard extension).
         let outbound_peers: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
-        // Long-lived cache of every peer we've ever resolved via mDNS in
-        // this group, scrubbed only on `ServiceRemoved`. The reconciler
-        // loop scans this every few seconds and re-dials anything not
-        // currently in `outbound_peers` — without this we'd never recover
-        // from a TCP drop because mDNS rarely re-emits `ServiceResolved`
-        // for an unchanged service.
+        // Cache of peers resolved via mDNS / relay. Cleared on each suspend
+        // so resume starts clean; the reconciler re-fills from discovery.
         let known_peers: Arc<Mutex<HashMap<String, KnownPeer>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let reconcile_notify = Arc::new(Notify::new());
+        let port = Arc::new(AtomicU16::new(0));
 
-        // Accept loop: inbound connections from peers that found us first.
-        // Inbound peers don't have a known mDNS fullname (we didn't dial
-        // them), so we synthesize one from the connection's remote addr
-        // for the purpose of the peer registry. It's just a unique key.
-        {
-            let accept_key = key;
-            let device_id = device_id.clone();
-            let device_name = device_name.clone();
-            let inbound = inbound.clone();
-            let out_tx = out_tx.clone();
-            let peer_count = peer_count.clone();
-            let peers = peers.clone();
-            let blob_cache = blob_cache.clone();
-            let file_receive_dir = file_receive_dir.clone();
-            let file_inbound = file_inbound.clone();
-            let lan_active = lan_active.clone();
-            let lan_mode_notify = lan_mode_notify.clone();
-            tokio::spawn(async move {
-                loop {
-                    let (stream, addr) = match listener.accept().await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!(?e, "lan accept failed");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
-                        }
-                    };
-                    let device_id = device_id.clone();
-                    let device_name = device_name.clone();
-                    let inbound = inbound.clone();
-                    let out_rx = out_tx.subscribe();
-                    let peer_count = peer_count.clone();
-                    let peers = peers.clone();
-                    let blob_cache = blob_cache.clone();
-                    let file_receive_dir = file_receive_dir.clone();
-                    let file_inbound = file_inbound.clone();
-                    let lan_active = lan_active.clone();
-                    let lan_mode_notify = lan_mode_notify.clone();
-                    let registry_key = format!("inbound:{addr}");
-                    tokio::spawn(async move {
-                        let peer = PeerRunContext {
-                            key: accept_key,
-                            self_device_id: device_id,
-                            self_device_name: device_name,
-                            inbound,
-                            out_rx,
-                            expected_peer: None,
-                            peer_count,
-                            peers,
-                            blob_cache,
-                            registry_key,
-                            file_receive_dir,
-                            file_inbound,
-                            lan_active,
-                            lan_mode_notify,
-                        };
-                        if let Err(e) = run_peer(stream, addr, peer).await {
-                            tracing::debug!(?e, %addr, "lan peer (inbound) ended");
-                        }
-                    });
-                }
-            });
-        }
-
-        // Discover loop: feed `known_peers` from mDNS events. The actual
-        // dialing happens in the reconciler below — keeping discovery and
-        // (re)connection separate is what lets us recover from TCP drops
-        // even when mDNS doesn't re-emit `ServiceResolved`.
-        {
-            let device_id = device_id.clone();
-            let fingerprint = fingerprint.clone();
-            let known_peers = known_peers.clone();
-            let peer_addrs = peer_addrs.clone();
-            let reconcile_notify = reconcile_notify.clone();
-            tokio::spawn(async move {
-                let mut event_rx = event_rx;
-                while let Some(event) = event_rx.recv().await {
-                    match event {
-                        ServiceEvent::ServiceResolved(info) => {
-                            let props = info.get_properties();
-                            let peer_gid = props.get_property_val_str("gid").unwrap_or("");
-                            let peer_did = props.get_property_val_str("did").unwrap_or("");
-                            if peer_gid != fingerprint {
-                                continue;
-                            }
-                            if peer_did.is_empty() {
-                                continue;
-                            }
-                            let port = info.get_port();
-                            let local_networks = local_private_networks();
-                            // mDNS gives us a HashSet of addresses with
-                            // unstable iteration order. iOS in particular
-                            // publishes IPv6 link-local on awdl0/utun that
-                            // need %scope to dial. Filter & sort: drop
-                            // link-local v6, IPv4 first, global v6 second.
-                            let mut candidates: Vec<SocketAddr> = info
-                                .get_addresses()
-                                .iter()
-                                .copied()
-                                .filter(|a| !is_unroutable(a))
-                                .map(|a| SocketAddr::new(a, port))
-                                .collect();
-                            drop_local_interface_candidates(&mut candidates, &local_networks);
-                            sort_candidates_for_dial(&mut candidates, &local_networks);
-                            if candidates.is_empty() {
-                                continue;
-                            }
-                            let fullname = info.get_fullname().to_string();
-                            // Cache addresses on *both* sides regardless of
-                            // the control-link tiebreak below: the blob
-                            // fetcher dials whoever has the bytes, which can
-                            // be the side that never initiates the control
-                            // connection. Keyed by the mDNS instance
-                            // `fullname` (not `did`) so the same device's
-                            // multiple processes (iOS app + keyboard share a
-                            // did) stay distinct entries, and so a
-                            // `ServiceRemoved` — which only carries the
-                            // fullname — can purge the right one.
-                            if let Ok(mut a) = peer_addrs.lock() {
-                                a.insert(
-                                    fullname.clone(),
-                                    PeerAddrEntry {
-                                        device_id: peer_did.to_string(),
-                                        display_name: None,
-                                        candidates: candidates.clone(),
-                                    },
-                                );
-                            }
-                            // Lexicographic tiebreak: only the side with the
-                            // larger device_id initiates the *control* link.
-                            // Equal ids (same physical device — iOS main app
-                            // vs keyboard) also short-circuit here.
-                            if device_id.as_str() <= peer_did {
-                                continue;
-                            }
-                            let mut g = known_peers.lock().await;
-                            g.insert(
-                                fullname,
-                                KnownPeer {
-                                    peer_did: peer_did.to_string(),
-                                    candidates,
-                                },
-                            );
-                            reconcile_notify.notify_one();
-                        }
-                        ServiceEvent::ServiceRemoved(_, fullname) => {
-                            // mDNS TTL expired with no re-announcement —
-                            // peer is presumed gone. Stop reconnect retries
-                            // and drop its cached blob-fetch addresses so
-                            // `fetch_image` doesn't burn a dial timeout on a
-                            // stale instance before falling back to relay.
-                            known_peers.lock().await.remove(&fullname);
-                            if let Ok(mut a) = peer_addrs.lock() {
-                                a.remove(&fullname);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            });
-        }
-
-        // Reconciler: every RECONNECT_INTERVAL, dial any known peer that
-        // doesn't currently have an in-flight or live outbound session.
-        // This is what makes "I disconnected and now I'm back" work
-        // automatically — the peer task's disconnect cleanup removes the
-        // outbound_peers entry, and the next reconciler tick re-dials.
+        // Reconciler lives across suspend/resume. When inactive it parks
+        // solely on `lan_mode_notify` so the 5s interval cannot keep the
+        // process scheduled during screen-off standby.
         {
             let reconnect_key = key;
             let device_id_for_recon = device_id.clone();
@@ -896,6 +971,10 @@ impl LanNode {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 interval.tick().await; // burn the immediate first tick
                 loop {
+                    if !lan_active.load(Ordering::Relaxed) {
+                        wait_until_flag(&lan_active, true, &lan_mode_notify).await;
+                        continue;
+                    }
                     tokio::select! {
                         _ = interval.tick() => {}
                         _ = reconcile_notify.notified() => {}
@@ -909,9 +988,6 @@ impl LanNode {
                         g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
                     };
                     for (fullname, kp) in snapshot {
-                        // Reserve the slot atomically with the live-check
-                        // so two reconciler ticks (or a stale mDNS event
-                        // path) can't race into duplicate dials.
                         {
                             let mut p = outbound_peers.lock().await;
                             if p.contains_key(&fullname) {
@@ -962,12 +1038,112 @@ impl LanNode {
             });
         }
 
+        // Bring up the first transport generation synchronously when the
+        // host starts active so `port()` is valid for the first advertise.
+        let initial_transport = if lan_active.load(Ordering::Relaxed) {
+            Some(
+                start_transport(TransportStart {
+                    group_id: group_id.clone(),
+                    device_id: device_id.clone(),
+                    device_name: device_name.clone(),
+                    key,
+                    inbound: inbound.clone(),
+                    peer_count: peer_count.clone(),
+                    peers: peers.clone(),
+                    blob_cache: blob_cache.clone(),
+                    peer_addrs: peer_addrs.clone(),
+                    file_receive_dir: file_receive_dir.clone(),
+                    file_inbound: file_inbound.clone(),
+                    lan_active: lan_active.clone(),
+                    lan_mode_notify: lan_mode_notify.clone(),
+                    known_peers: known_peers.clone(),
+                    out_tx: out_tx.clone(),
+                    port: port.clone(),
+                    reconcile_notify: reconcile_notify.clone(),
+                })
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        // Lifecycle: drop transport on suspend (clears peer maps), rebuild
+        // on resume with a fresh listener port + mDNS registration.
+        {
+            let group_id = group_id.clone();
+            let device_id = device_id.clone();
+            let device_name = device_name.clone();
+            let inbound = inbound.clone();
+            let peer_count = peer_count.clone();
+            let peers = peers.clone();
+            let blob_cache = blob_cache.clone();
+            let peer_addrs = peer_addrs.clone();
+            let file_receive_dir = file_receive_dir.clone();
+            let file_inbound = file_inbound.clone();
+            let lan_active = lan_active.clone();
+            let lan_mode_notify = lan_mode_notify.clone();
+            let known_peers = known_peers.clone();
+            let outbound_peers = outbound_peers.clone();
+            let out_tx = out_tx.clone();
+            let port = port.clone();
+            let reconcile_notify = reconcile_notify.clone();
+            tokio::spawn(async move {
+                let mut transport = initial_transport;
+                loop {
+                    if transport.is_some() {
+                        wait_until_flag(&lan_active, false, &lan_mode_notify).await;
+                        tracing::info!("lan transport suspending");
+                        drop(transport.take());
+                        port.store(0, Ordering::Relaxed);
+                        known_peers.lock().await.clear();
+                        outbound_peers.lock().await.clear();
+                        if let Ok(mut a) = peer_addrs.lock() {
+                            a.clear();
+                        }
+                        // Peer sessions exit via the same lan_mode_notify
+                        // that woke us (set_lan_active already notified).
+                        continue;
+                    }
+
+                    wait_until_flag(&lan_active, true, &lan_mode_notify).await;
+                    match start_transport(TransportStart {
+                        group_id: group_id.clone(),
+                        device_id: device_id.clone(),
+                        device_name: device_name.clone(),
+                        key,
+                        inbound: inbound.clone(),
+                        peer_count: peer_count.clone(),
+                        peers: peers.clone(),
+                        blob_cache: blob_cache.clone(),
+                        peer_addrs: peer_addrs.clone(),
+                        file_receive_dir: file_receive_dir.clone(),
+                        file_inbound: file_inbound.clone(),
+                        lan_active: lan_active.clone(),
+                        lan_mode_notify: lan_mode_notify.clone(),
+                        known_peers: known_peers.clone(),
+                        out_tx: out_tx.clone(),
+                        port: port.clone(),
+                        reconcile_notify: reconcile_notify.clone(),
+                    })
+                    .await
+                    {
+                        Ok(t) => {
+                            tracing::info!(port = t.port, "lan transport resumed");
+                            transport = Some(t);
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, "lan transport resume failed; will retry");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(Self {
             out_tx,
             peer_count,
             peers,
-            _daemon: daemon,
-            _forwarder: forwarder,
             port,
             self_device_id: device_id,
             known_peers,
@@ -976,20 +1152,28 @@ impl LanNode {
         })
     }
 
-    /// Port the LAN TCP listener is bound to.
+    /// Port the LAN TCP listener is bound to (0 while suspended).
     pub fn port(&self) -> u16 {
-        self.port
+        self.port.load(Ordering::Relaxed)
     }
 
     /// This host's advertisable private candidates for `LanAdvertise`.
     pub fn advertise_candidates(&self) -> Vec<String> {
-        local_private_candidates(self.port)
+        let port = self.port();
+        if port == 0 {
+            return Vec::new();
+        }
+        local_private_candidates(port)
     }
 
     /// This host's advertisable private candidates with interface prefix
     /// metadata for relay-side subnet filtering.
     pub fn advertise_candidate_networks(&self) -> Vec<LanCandidate> {
-        local_private_candidate_networks(self.port)
+        let port = self.port();
+        if port == 0 {
+            return Vec::new();
+        }
+        local_private_candidate_networks(port)
     }
 
     /// Merge a relay-pushed peer snapshot into the same `known_peers` /
@@ -1381,8 +1565,12 @@ async fn run_peer(
             payload: payload.clone(),
         });
     }
-    if matches!(pending, Some(LanMessage::Ping)) && !lan_active.load(Ordering::Relaxed) {
-        write_frame(&mut writer, &key, &LanMessage::Ping).await?;
+    // Suspended hosts must not keep peer sessions (or echo Ping) — that is
+    // what kept radios warm during screen-off standby. Exit now if we
+    // became inactive during the handshake, and again on any later notify.
+    if !lan_active.load(Ordering::Relaxed) {
+        tracing::debug!(peer = %display_name, "lan inactive after handshake, closing");
+        return Ok(());
     }
 
     loop {
@@ -1402,11 +1590,10 @@ async fn run_peer(
                 write_frame(&mut writer, &key, &LanMessage::Ping).await?;
             }
             _ = lan_mode_notify.notified() => {
-                tracing::debug!(
-                    peer = %display_name,
-                    active = lan_active.load(Ordering::Relaxed),
-                    "lan active mode changed"
-                );
+                if !lan_active.load(Ordering::Relaxed) {
+                    tracing::debug!(peer = %display_name, "lan suspended, closing peer");
+                    return Ok(());
+                }
             }
             out = out_rx.recv(), if lan_active.load(Ordering::Relaxed) => {
                 match out {
@@ -1447,13 +1634,8 @@ async fn run_peer(
                         // Spurious second Hello — ignore.
                     }
                     Some(LanMessage::Ping) => {
-                        // Active peers send their own periodic Ping. In
-                        // inactive Android standby we stay passive, but echo
-                        // a Ping so a desktop probe can prove we're alive on
-                        // the LAN without re-enabling discovery/reconnects.
-                        if !lan_active.load(Ordering::Relaxed) {
-                            write_frame(&mut writer, &key, &LanMessage::Ping).await?;
-                        }
+                        // Active peers send their own periodic Ping; no
+                        // echo keep-alive when inactive (we exit on suspend).
                     }
                     Some(LanMessage::BlobRequest { .. })
                     | Some(LanMessage::BlobChunk { .. })
@@ -2566,16 +2748,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inactive_lan_peer_completes_handshake_and_answers_ping() {
+    async fn wait_until_flag_returns_when_satisfied_and_wakes_on_notify() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let notify = Arc::new(Notify::new());
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_until_flag(&flag, true, &notify),
+        )
+        .await
+        .expect("already-satisfied flag must return immediately");
+
+        flag.store(false, Ordering::Relaxed);
+        let waiter = tokio::spawn({
+            let flag = flag.clone();
+            let notify = notify.clone();
+            async move { wait_until_flag(&flag, true, &notify).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        flag.store(true, Ordering::Relaxed);
+        notify.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("parked waiter must wake on store + notify")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_lan_peer_exits_on_suspend_without_ping_echo() {
         let key = [19u8; KEY_LEN];
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let lan_active = Arc::new(AtomicBool::new(false));
+        let lan_active = Arc::new(AtomicBool::new(true));
         let lan_mode_notify = Arc::new(Notify::new());
+        let peer_count = Arc::new(AtomicUsize::new(0));
+        let (out_tx, _) = broadcast::channel::<OutgoingLan>(4);
 
         let server = tokio::spawn({
             let lan_active = lan_active.clone();
             let lan_mode_notify = lan_mode_notify.clone();
+            let peer_count = peer_count.clone();
+            let out_rx = out_tx.subscribe();
             async move {
                 let (stream, peer_addr) = listener.accept().await.unwrap();
                 let (clip_tx, _clip_rx) = mpsc::unbounded_channel::<IncomingLanClip>();
@@ -2585,9 +2798,9 @@ mod tests {
                     self_device_id: "android".into(),
                     self_device_name: "Android".into(),
                     inbound: clip_tx,
-                    out_rx: broadcast::channel::<OutgoingLan>(1).1,
-                    expected_peer: Some("desktop".into()),
-                    peer_count: Arc::new(AtomicUsize::new(0)),
+                    out_rx,
+                    expected_peer: None,
+                    peer_count,
                     peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     blob_cache: BlobCache::new(),
                     registry_key: "probe".into(),
@@ -2614,7 +2827,7 @@ mod tests {
         .await
         .unwrap();
 
-        let hello = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut reader, &key))
+        let hello = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut reader, &key))
             .await
             .unwrap()
             .unwrap()
@@ -2625,27 +2838,115 @@ mod tests {
         }
 
         let first_ping =
-            tokio::time::timeout(Duration::from_secs(1), read_frame(&mut reader, &key))
+            tokio::time::timeout(Duration::from_secs(2), read_frame(&mut reader, &key))
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
         assert!(matches!(first_ping, LanMessage::Ping));
 
+        // Complete classification so run_peer registers the session.
         write_frame(&mut writer, &key, &LanMessage::Ping)
             .await
             .unwrap();
-        let ping_reply =
-            tokio::time::timeout(Duration::from_secs(1), read_frame(&mut reader, &key))
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-        assert!(matches!(ping_reply, LanMessage::Ping));
 
-        drop(writer);
-        drop(reader);
-        server.await.unwrap();
+        // Give the peer task a moment to enter the main loop, then suspend.
+        // PeerSessionGuard bumps peer_count once classification finishes.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if peer_count.load(Ordering::Relaxed) > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer never registered");
+
+        lan_active.store(false, Ordering::Relaxed);
+        lan_mode_notify.notify_waiters();
+
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("peer did not exit on suspend")
+            .unwrap();
+        assert_eq!(peer_count.load(Ordering::Relaxed), 0);
+
+        // No echo keep-alive once the peer task is gone.
+        write_frame(&mut writer, &key, &LanMessage::Ping)
+            .await
+            .ok();
+        let after_suspend = tokio::time::timeout(
+            Duration::from_millis(300),
+            read_frame(&mut reader, &key),
+        )
+        .await;
+        match after_suspend {
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {}
+            Ok(Ok(Some(LanMessage::Ping))) => {
+                panic!("suspended peer must not echo Ping keep-alives")
+            }
+            Ok(Ok(Some(other))) => panic!("unexpected frame after suspend: {other:?}"),
+        }
+        drop(out_tx);
+    }
+
+    #[tokio::test]
+    async fn lan_node_suspend_clears_port_and_resume_rebinds() {
+        let key = [23u8; KEY_LEN];
+        let group = format!("suspend-group-{}", uuid::Uuid::new_v4());
+        let lan_active = Arc::new(AtomicBool::new(true));
+        let lan_mode_notify = Arc::new(Notify::new());
+        let (clip_tx, _clip_rx) = mpsc::unbounded_channel::<IncomingLanClip>();
+        let (file_tx, _file_rx) = mpsc::unbounded_channel::<ReceivedFile>();
+
+        let node = LanNode::spawn(LanNodeConfig {
+            group_id: group,
+            device_id: format!("did-{}", uuid::Uuid::new_v4()),
+            device_name: "SuspendTest".into(),
+            key,
+            inbound: clip_tx,
+            peer_count: Arc::new(AtomicUsize::new(0)),
+            peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            blob_cache: BlobCache::new(),
+            peer_addrs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            file_receive_dir: Arc::new(std::sync::Mutex::new(None)),
+            file_inbound: file_tx,
+            lan_active: lan_active.clone(),
+            lan_mode_notify: lan_mode_notify.clone(),
+        })
+        .await
+        .expect("spawn");
+
+        let port1 = node.port();
+        assert_ne!(port1, 0, "active node must bind a port");
+
+        lan_active.store(false, Ordering::Relaxed);
+        lan_mode_notify.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while node.port() != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("port did not clear on suspend");
+
+        lan_active.store(true, Ordering::Relaxed);
+        lan_mode_notify.notify_waiters();
+        let port2 = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let p = node.port();
+                if p != 0 {
+                    return p;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("port did not return on resume");
+        assert_ne!(port2, 0);
+        // Port may coincidentally match after rebind; either way transport is up.
+        let _ = port1;
     }
 
     /// Two nodes on localhost discover each other via mDNS and exchange

@@ -37,56 +37,93 @@ class ClipBridgeAccessibilityServicePolicyTest {
     }
 
     @Test
-    fun screenStateControlsClientReconnectIdleMode() {
+    fun screenStateControlsStandbyStateMachine() {
         assertTrue(
             "The accessibility service should observe screen on/off state.",
             serviceSource.contains("Intent.ACTION_SCREEN_OFF") &&
                 serviceSource.contains("Intent.ACTION_SCREEN_ON"),
         )
         assertTrue(
-            "Screen state should be forwarded to the Rust client reconnect policy.",
-            serviceSource.contains("setReconnectIdleMode("),
+            "Screen-off must enter standby; screen-on / present must leave standby.",
+            serviceSource.contains("enterStandby()") &&
+                serviceSource.contains("leaveStandby("),
         )
-    }
-
-    @Test
-    fun screenOffSuspendsLanTransport() {
         assertTrue(
-            "Screen-off standby should suspend Android LAN activity instead of leaving discovery/reconnect loops hot.",
-            serviceSource.contains("setLanActive(false)") &&
-                serviceSource.contains("releaseMulticastLock()"),
+            "SCREEN_OFF should call enterStandby.",
+            serviceSource.contains("Intent.ACTION_SCREEN_OFF -> enterStandby()"),
         )
     }
 
     @Test
-    fun transferEventsOpenTemporaryLanWindow() {
+    fun enterStandbyHardSuspendsRelayAndLan() {
+        val body = serviceSource.functionBody("private fun enterStandby()")
+
         assertTrue(
-            "Remote and local transfer activity should open a bounded LAN window instead of keeping LAN always-on.",
-            serviceSource.contains("activateLanTemporarily(") &&
-                serviceSource.contains("LAN_ACTIVE_WINDOW_MS"),
+            "Standby must hard-suspend the relay WebSocket via reconnect idle mode.",
+            body.contains("setReconnectIdleMode(true)"),
+        )
+        assertTrue(
+            "Standby must tear down LAN (core setLanActive(false) is real suspend after PR1).",
+            body.contains("setLanActive(false)") &&
+                body.contains("releaseMulticastLock()"),
         )
     }
 
     @Test
-    fun hostAppForegroundRequestsActiveReconnectWithoutChangingScreenOffStandby() {
+    fun leaveStandbyRestoresRelayLanAndRefreshes() {
+        val body = serviceSource.functionBody("private fun leaveStandby(reason: String, immediate: Boolean = false)")
+
+        assertTrue(
+            "Leaving standby should clear idle mode, activate LAN, refresh LAN, and fetch recent.",
+            body.contains("setReconnectIdleMode(false)") &&
+                body.contains("setLanActive(true)") &&
+                body.contains("refreshLanNow()") &&
+                body.contains("fetchRecent()"),
+        )
+        assertTrue(
+            "Leave-standby should be debounced to avoid lock/unlock reconnect storms.",
+            serviceSource.contains("LEAVE_STANDBY_DEBOUNCE_MS"),
+        )
+        assertTrue(
+            "Delayed standby transitions must run on the main dispatcher so they " +
+                "serialize with enterStandby/leaveStandby from broadcast callbacks.",
+            serviceSource.contains("scope.launch(Dispatchers.Main)"),
+        )
+    }
+
+    @Test
+    fun temporaryWakeWindowIsFullLeaveStandbyWithReentry() {
+        val body = serviceSource.functionBody("private fun activateLanTemporarily(reason: String)")
+
+        assertTrue(
+            "Wake window must be a full leaveStandby (LAN + relay) so publish can leave the device.",
+            body.contains("leaveStandby(") &&
+                body.contains("immediate = true"),
+        )
+        assertTrue(
+            "After the window, still-non-interactive devices re-enter standby.",
+            body.contains("LAN_ACTIVE_WINDOW_MS") &&
+                body.contains("enterStandby()"),
+        )
+        assertTrue(
+            "Remote clip handler must not open a wake window for every receive.",
+            serviceSource.contains("Deliberately no activateLanTemporarily"),
+        )
+    }
+
+    @Test
+    fun hostAppForegroundLeavesStandbyImmediately() {
         val resumeBody = mainActivitySource.functionBody("if (event == Lifecycle.Event.ON_RESUME)")
         val foregroundBody = serviceSource.functionBody("fun onHostAppForeground()")
-        val screenOffBody = serviceSource.functionBody("private fun setReconnectIdleMode(enabled: Boolean)")
 
         assertTrue(
             "MainActivity resume should notify the accessibility service that the host app is foreground.",
             resumeBody.contains("onHostAppForeground()"),
         )
         assertTrue(
-            "Foregrounding the host app should leave idle reconnect mode, activate LAN, refresh LAN now, and refresh recent clips.",
-            foregroundBody.contains("setReconnectIdleMode(false)") &&
-                foregroundBody.contains("setLanActive(true)") &&
-                foregroundBody.contains("refreshLanNow()") &&
-                foregroundBody.contains("fetchRecent()"),
-        )
-        assertTrue(
-            "Screen-off standby must still suspend LAN activity.",
-            screenOffBody.contains("setLanActive(false)"),
+            "Foregrounding the host app should leave standby immediately with full refresh.",
+            foregroundBody.contains("leaveStandby(") &&
+                foregroundBody.contains("immediate = true"),
         )
     }
 

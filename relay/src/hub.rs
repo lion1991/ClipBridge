@@ -13,7 +13,12 @@ use dashmap::DashMap;
 use tokio::sync::{broadcast, mpsc};
 
 const RECENT_CAP: usize = 3;
-const RECENT_TTL: Duration = Duration::from_secs(5 * 60);
+/// How long published clips stay available for `FetchRecent` catch-up after
+/// a peer reconnects. Extended from 5 minutes so devices that hard-suspend
+/// the relay WebSocket while screen-off (Android standby) can still recover
+/// the last few clips after multi-hour lock stretches. Ciphertext-only and
+/// count-bounded — memory cost stays tiny.
+const RECENT_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const BROADCAST_CAP: usize = 32;
 pub(crate) const MAX_LAN_CANDIDATES: usize = 32;
 
@@ -569,6 +574,38 @@ mod tests {
         assert!(!candidate_networks
             .iter()
             .any(|candidate| candidate.prefix_len > 128 && candidate.addr.starts_with('[')));
+    }
+
+    #[test]
+    fn recent_ttl_covers_multi_hour_screen_off_standby() {
+        // Android hard-suspends the relay WS while locked. Wake catch-up
+        // relies on this window still holding the last few clips.
+        assert!(
+            RECENT_TTL >= Duration::from_secs(12 * 60 * 60),
+            "RECENT_TTL must cover overnight screen-off standby, got {RECENT_TTL:?}"
+        );
+        assert_eq!(RECENT_CAP, 3);
+    }
+
+    #[test]
+    fn recent_cache_retains_last_n_clips_for_fetch() {
+        let hub = Hub::new();
+        for i in 0..5u64 {
+            hub.publish(
+                "g",
+                RecentClip {
+                    ciphertext: vec![i as u8],
+                    nonce: vec![0; 12],
+                    ts: i,
+                    sender_device_id: "A".into(),
+                },
+            );
+        }
+        let clips = hub.recent("g");
+        assert_eq!(clips.len(), RECENT_CAP);
+        assert_eq!(clips[0].ts, 2);
+        assert_eq!(clips[1].ts, 3);
+        assert_eq!(clips[2].ts, 4);
     }
 }
 

@@ -98,6 +98,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private var shizukuReadJob: Job? = null
     private var lanCountJob: Job? = null
     private var lanActiveJob: Job? = null
+    private var leaveStandbyDebounceJob: Job? = null
     @Volatile private var reconnectIdleMode: Boolean = false
     @Volatile private var lanActive: Boolean = true
 
@@ -141,9 +142,9 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         screenReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 when (intent?.action) {
-                    Intent.ACTION_SCREEN_OFF -> setReconnectIdleMode(true)
+                    Intent.ACTION_SCREEN_OFF -> enterStandby()
                     Intent.ACTION_SCREEN_ON,
-                    Intent.ACTION_USER_PRESENT -> setReconnectIdleMode(false)
+                    Intent.ACTION_USER_PRESENT -> leaveStandby(reason = intent.action ?: "screen on")
                 }
             }
         }
@@ -155,7 +156,11 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
                 addAction(Intent.ACTION_USER_PRESENT)
             },
         )
-        setReconnectIdleMode(isScreenOffForReconnect())
+        if (isScreenOffForStandby()) {
+            enterStandby()
+        } else {
+            leaveStandby(reason = "service connected")
+        }
     }
 
     private fun unregisterScreenStateReceiver() {
@@ -165,69 +170,104 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         screenReceiver = null
     }
 
-    private fun isScreenOffForReconnect(): Boolean {
+    private fun isScreenOffForStandby(): Boolean {
         val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return false
         return !pm.isInteractive
     }
 
-    private fun setReconnectIdleMode(enabled: Boolean) {
-        reconnectIdleMode = enabled
-        client?.setReconnectIdleMode(enabled)
-        if (enabled) {
-            setLanActive(false)
-        } else {
-            lanActiveJob?.cancel()
-            lanActiveJob = null
-            setLanActive(true)
+    /**
+     * STANDBY: hard-suspend relay WS + fully tear down LAN (mDNS, TCP
+     * listener, peer sessions). Accessibility service stays up.
+     */
+    private fun enterStandby() {
+        leaveStandbyDebounceJob?.cancel()
+        leaveStandbyDebounceJob = null
+        lanActiveJob?.cancel()
+        lanActiveJob = null
+        reconnectIdleMode = true
+        lanActive = false
+        client?.setReconnectIdleMode(true)
+        client?.setLanActive(false)
+        _lanFilePeers.value = emptyList()
+        _lanPeerNames.value = emptyList()
+        _lanPeerCount.value = 0
+        releaseMulticastLock()
+        Log.i(TAG, "entered standby (relay hard-suspend + LAN down)")
+    }
+
+    /**
+     * ACTIVE: reconnect relay, restore LAN, refresh advertise. Debounced so
+     * rapid lock/unlock thrash does not storm reconnects.
+     */
+    private fun leaveStandby(reason: String, immediate: Boolean = false) {
+        leaveStandbyDebounceJob?.cancel()
+        // Cancel any temporary wake re-entry timer; a real leave (unlock /
+        // foreground) must not fall back into standby after the window.
+        // Temporary wake itself re-arms this job after calling leaveStandby.
+        lanActiveJob?.cancel()
+        lanActiveJob = null
+        val run = {
+            reconnectIdleMode = false
+            lanActive = true
+            client?.setReconnectIdleMode(false)
+            client?.setLanActive(true)
+            if (client != null) acquireMulticastLock()
+            try {
+                // Ordering: LAN resume completes in core then refresh so we
+                // advertise the new port rather than a stale suspended one.
+                client?.refreshLanNow()
+                client?.fetchRecent()
+            } catch (t: Throwable) {
+                Log.w(TAG, "leaveStandby refresh failed: ${t.message}")
+            }
             pendingRemoteImage?.let {
                 pendingRemoteImage = null
                 Log.i(TAG, "screen on, fetching deferred remote image")
                 handleRemoteImage(it)
             }
+            Log.i(TAG, "left standby: $reason")
         }
-        Log.i(TAG, "reconnect idle mode: $enabled")
+        if (immediate) {
+            leaveStandbyDebounceJob = null
+            run()
+            return
+        }
+        // Main-confined: enterStandby runs on main (broadcast callbacks), and
+        // once past delay() the body is no longer cancellable — dispatching it
+        // anywhere else lets a concurrent lock interleave with it and end up
+        // re-activated (LAN + multicast held) while the screen is off.
+        leaveStandbyDebounceJob = scope.launch(Dispatchers.Main) {
+            delay(LEAVE_STANDBY_DEBOUNCE_MS)
+            leaveStandbyDebounceJob = null
+            run()
+        }
     }
 
-    private fun setLanActive(enabled: Boolean) {
-        lanActive = enabled
-        client?.setLanActive(enabled)
-        if (enabled) {
-            if (client != null) acquireMulticastLock()
-        } else {
-            lanActiveJob?.cancel()
-            lanActiveJob = null
-            _lanFilePeers.value = emptyList()
-            _lanPeerNames.value = emptyList()
-            _lanPeerCount.value = 0
-            releaseMulticastLock()
-        }
-        Log.i(TAG, "lan active: $enabled")
-    }
-
+    /**
+     * Temporary full wake while the screen is still off (local copy / file
+     * send). Opens both LAN and relay so publish/upload can leave the
+     * device, then re-enters standby if still non-interactive.
+     */
     private fun activateLanTemporarily(reason: String) {
-        setLanActive(true)
+        leaveStandby(reason = "wake window: $reason", immediate = true)
         lanActiveJob?.cancel()
-        if (!reconnectIdleMode) return
+        if (!isScreenOffForStandby()) return
 
-        lanActiveJob = scope.launch {
-            Log.i(TAG, "temporary LAN window opened: $reason")
+        // Main-confined for the same reason as the leave-standby debounce:
+        // the expiry enterStandby must serialize with an unlock's
+        // leaveStandby instead of interleaving from another thread.
+        lanActiveJob = scope.launch(Dispatchers.Main) {
+            Log.i(TAG, "temporary full-wake window opened: $reason")
             delay(LAN_ACTIVE_WINDOW_MS)
             lanActiveJob = null
-            if (reconnectIdleMode) {
-                setLanActive(false)
+            if (isScreenOffForStandby()) {
+                enterStandby()
             }
         }
     }
 
     fun onHostAppForeground() {
-        setReconnectIdleMode(false)
-        setLanActive(true)
-        try {
-            client?.refreshLanNow()
-            client?.fetchRecent()
-        } catch (t: Throwable) {
-            Log.w(TAG, "foreground refresh failed: ${t.message}")
-        }
+        leaveStandby(reason = "host app foreground", immediate = true)
     }
 
     private fun startLanCountPoller() {
@@ -338,6 +378,8 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         shizukuReadJob = null
         lanActiveJob?.cancel()
         lanActiveJob = null
+        leaveStandbyDebounceJob?.cancel()
+        leaveStandbyDebounceJob = null
         lanCountJob?.cancel()
         lanCountJob = null
         scope.cancel()
@@ -652,8 +694,18 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             null
         }
         client?.let { configureFileReceiving() }
+        // Apply current standby flags to the fresh client. Core overloads
+        // these to mean hard WS suspend + real LAN tear-down / resume.
         client?.setReconnectIdleMode(reconnectIdleMode)
-        setLanActive(lanActive)
+        client?.setLanActive(lanActive)
+        if (lanActive) {
+            acquireMulticastLock()
+        } else {
+            releaseMulticastLock()
+            _lanFilePeers.value = emptyList()
+            _lanPeerNames.value = emptyList()
+            _lanPeerCount.value = 0
+        }
     }
 
     private fun restartClient() {
@@ -966,6 +1018,8 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         // Short enough that an intentional re-copy of the same text still goes.
         private const val SOURCE_DEDUPE_MS = 3_000L
         private const val LAN_ACTIVE_WINDOW_MS = 60_000L
+        /** Debounce rapid SCREEN_ON / USER_PRESENT so lock thrash cannot storm reconnects. */
+        private const val LEAVE_STANDBY_DEBOUNCE_MS = 400L
         private const val LAN_COUNT_ACTIVE_INTERVAL_MS = 2_000L
         private const val LAN_COUNT_IDLE_INTERVAL_MS = 30_000L
 

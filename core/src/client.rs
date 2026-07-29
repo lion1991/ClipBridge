@@ -108,8 +108,6 @@ enum Cmd {
     Stop,
 }
 
-const IDLE_RECONNECT_INITIAL: Duration = Duration::from_secs(5);
-const IDLE_RECONNECT_MAX: Duration = Duration::from_secs(5 * 60);
 /// A session that survived at least this long counts as stable: its clean
 /// close reconnects immediately and resets the failure backoff. Anything
 /// shorter is treated as relay flapping. The in-session idle timeout is 60s,
@@ -283,9 +281,13 @@ impl Client {
             .map_err(|_| FfiError::Stopped)
     }
 
-    /// Tell the worker whether reconnects are happening while the host is in
-    /// a locked / screen-off idle state. Active hosts keep the original
-    /// immediate reconnect behavior; idle hosts back off normal reconnects.
+    /// Tell the worker whether the host is in a locked / screen-off standby
+    /// state. When `enabled` is true the active WebSocket is closed and the
+    /// outer reconnect loop **hard-suspends** until this is set false again
+    /// (no keep-alive pings, no reconnect attempts). Queued `SendClip` /
+    /// `FetchRecent` commands stay in the channel and flush on the next
+    /// session. Only Android currently calls this; other hosts keep the
+    /// default always-connected behavior.
     pub fn set_reconnect_idle_mode(&self, enabled: bool) {
         self.shared
             .reconnect_idle_mode
@@ -294,8 +296,10 @@ impl Client {
     }
 
     /// Tell the worker whether the host currently wants LAN discovery and
-    /// peer sessions active. Platforms that never call this keep the default
-    /// always-on LAN behavior.
+    /// peer sessions active. When false the LAN node tears down mDNS, the
+    /// TCP listener, and all peer sessions; when true it rebinds a fresh
+    /// port and rediscovers. Platforms that never call this keep the
+    /// default always-on LAN behavior.
     pub fn set_lan_active(&self, enabled: bool) {
         self.shared.lan_active.store(enabled, Ordering::Relaxed);
         self.shared.lan_mode_notify.notify_waiters();
@@ -625,9 +629,37 @@ async fn run(config: ClientRun) {
     }
 
     let mut backoff = Duration::from_secs(1);
-    let mut idle_reconnect_backoff =
-        IdleReconnectBackoff::new(IDLE_RECONNECT_INITIAL, IDLE_RECONNECT_MAX);
+    // Commands received while hard-suspended (except Stop) are held here and
+    // drained at the start of the next session so we can still observe Stop
+    // on cmd_rx without losing SendClip/FetchRecent.
+    let mut pending_cmds: VecDeque<Cmd> = VecDeque::new();
     loop {
+        // Hard suspend: do not dial the relay while screen-off standby is
+        // active. Wait for leave-standby (or Stop). Must select on cmd_rx so
+        // Client::stop() / Drop / restartClient cannot deadlock joining the
+        // worker thread.
+        if reconnect_idle_mode.load(Ordering::Relaxed) {
+            listener.on_state(ConnectionState::Disconnected);
+            tracing::info!("relay hard-suspended (reconnect idle mode)");
+            match wait_while_relay_suspended(
+                &mut cmd_rx,
+                &mut pending_cmds,
+                &reconnect_idle_mode,
+                &reconnect_mode_notify,
+            )
+            .await
+            {
+                SuspendWait::Stop => {
+                    listener.on_state(ConnectionState::Disconnected);
+                    return;
+                }
+                SuspendWait::Resume => {
+                    tracing::info!("relay leaving hard suspend; connecting");
+                    backoff = Duration::from_secs(1);
+                }
+            }
+        }
+
         listener.on_state(ConnectionState::Connecting);
         let session_started = tokio::time::Instant::now();
         match session(
@@ -641,8 +673,11 @@ async fn run(config: ClientRun) {
                 lan: lan.as_deref(),
                 dedup: &dedup,
                 lan_active: lan_active.as_ref(),
+                reconnect_idle_mode: reconnect_idle_mode.as_ref(),
+                reconnect_mode_notify: reconnect_mode_notify.as_ref(),
             },
             &mut cmd_rx,
+            &mut pending_cmds,
         )
         .await
         {
@@ -652,27 +687,14 @@ async fn run(config: ClientRun) {
             }
             Ok(SessionExit::Reconnect) => {
                 listener.on_state(ConnectionState::Disconnected);
+                // If idle mode flipped on mid-session, the next loop iteration
+                // hits the hard-suspend gate above. No reconnect while idle.
+                if reconnect_idle_mode.load(Ordering::Relaxed) {
+                    continue;
+                }
                 if session_started.elapsed() >= RECONNECT_STABLE_SESSION {
                     backoff = Duration::from_secs(1);
-                }
-                if let Some(delay) = reconnect_delay_for_mode(
-                    reconnect_idle_mode.load(Ordering::Relaxed),
-                    &mut idle_reconnect_backoff,
-                ) {
-                    tracing::info!(
-                        ?delay,
-                        "screen-off idle mode active; delaying websocket reconnect"
-                    );
-                    wait_for_idle_reconnect_delay(
-                        delay,
-                        &reconnect_idle_mode,
-                        &reconnect_mode_notify,
-                    )
-                    .await;
-                    if !reconnect_idle_mode.load(Ordering::Relaxed) {
-                        idle_reconnect_backoff.reset();
-                    }
-                } else if session_started.elapsed() < RECONNECT_STABLE_SESSION {
+                } else {
                     // A clean close this soon after connecting means the relay
                     // (or a proxy in front of it) is dropping us right after
                     // the handshake. Reconnecting instantly would hammer it
@@ -690,6 +712,9 @@ async fn run(config: ClientRun) {
                 listener.on_state(ConnectionState::Error {
                     message: e.to_string(),
                 });
+                if reconnect_idle_mode.load(Ordering::Relaxed) {
+                    continue;
+                }
                 if session_started.elapsed() >= RECONNECT_STABLE_SESSION {
                     backoff = Duration::from_secs(1);
                 }
@@ -705,64 +730,41 @@ enum SessionExit {
     Reconnect,
 }
 
-const LAN_ADVERTISE_REFRESH_EVERY: Duration = Duration::from_secs(5);
-
-struct IdleReconnectBackoff {
-    initial: Duration,
-    max: Duration,
-    next: Duration,
+enum SuspendWait {
+    Stop,
+    Resume,
 }
 
-impl IdleReconnectBackoff {
-    fn new(initial: Duration, max: Duration) -> Self {
-        Self {
-            initial,
-            max,
-            next: initial,
-        }
-    }
-
-    fn next_delay(&mut self) -> Duration {
-        let delay = self.next;
-        self.next = (self.next * 2).min(self.max);
-        delay
-    }
-
-    fn reset(&mut self) {
-        self.next = self.initial;
-    }
-}
-
-fn reconnect_delay_for_mode(
-    idle_mode: bool,
-    backoff: &mut IdleReconnectBackoff,
-) -> Option<Duration> {
-    if idle_mode {
-        Some(backoff.next_delay())
-    } else {
-        backoff.reset();
-        None
-    }
-}
-
-async fn wait_for_idle_reconnect_delay(
-    delay: Duration,
+/// Park the reconnect loop while `reconnect_idle_mode` is true. Drains
+/// non-Stop commands into `pending` so they flush on the next session, and
+/// returns promptly on `Cmd::Stop` so thread join cannot deadlock.
+async fn wait_while_relay_suspended(
+    cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    pending: &mut VecDeque<Cmd>,
     reconnect_idle_mode: &AtomicBool,
     reconnect_mode_notify: &Notify,
-) {
-    let sleep = tokio::time::sleep(delay);
-    tokio::pin!(sleep);
+) -> SuspendWait {
     loop {
+        if !reconnect_idle_mode.load(Ordering::Relaxed) {
+            return SuspendWait::Resume;
+        }
         tokio::select! {
-            _ = &mut sleep => break,
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    None | Some(Cmd::Stop) => return SuspendWait::Stop,
+                    Some(other) => pending.push_back(other),
+                }
+            }
             _ = reconnect_mode_notify.notified() => {
                 if !reconnect_idle_mode.load(Ordering::Relaxed) {
-                    break;
+                    return SuspendWait::Resume;
                 }
             }
         }
     }
 }
+
+const LAN_ADVERTISE_REFRESH_EVERY: Duration = Duration::from_secs(5);
 
 fn normalize_lan_candidate_networks(mut candidates: Vec<LanCandidate>) -> Vec<LanCandidate> {
     candidates.sort_by(|a, b| a.addr.cmp(&b.addr).then(a.prefix_len.cmp(&b.prefix_len)));
@@ -794,11 +796,14 @@ struct SessionCtx<'a> {
     lan: Option<&'a LanNode>,
     dedup: &'a Arc<Mutex<DedupCache>>,
     lan_active: &'a AtomicBool,
+    reconnect_idle_mode: &'a AtomicBool,
+    reconnect_mode_notify: &'a Notify,
 }
 
 async fn session(
     ctx: SessionCtx<'_>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    pending_cmds: &mut VecDeque<Cmd>,
 ) -> Result<SessionExit, Box<dyn std::error::Error + Send + Sync>> {
     let SessionCtx {
         relay_url,
@@ -810,6 +815,8 @@ async fn session(
         lan,
         dedup,
         lan_active,
+        reconnect_idle_mode,
+        reconnect_mode_notify,
     } = ctx;
 
     // Accept any of ws:// wss:// http:// https:// — the user often pastes the
@@ -882,7 +889,36 @@ async fn session(
     lan_advertise_interval.tick().await; // consume the immediate first tick
     let mut last_seen = tokio::time::Instant::now();
 
+    // Flush commands that arrived while the relay was hard-suspended.
+    while let Some(cmd) = pending_cmds.pop_front() {
+        match apply_session_cmd(
+            cmd,
+            &mut ws,
+            lan,
+            key,
+            group_id,
+            device_id,
+            device_name,
+            lan_active,
+            &mut lan_advertise_disabled,
+            &mut lan_advertise_error_pending,
+            &mut last_lan_advertise,
+        )
+        .await?
+        {
+            Some(exit) => return Ok(exit),
+            None => {}
+        }
+    }
+
     loop {
+        // Entering hard suspend mid-session must close the WS immediately.
+        if reconnect_idle_mode.load(Ordering::Relaxed) {
+            tracing::info!("reconnect idle mode on; closing websocket for hard suspend");
+            let _ = ws.close(None).await;
+            return Ok(SessionExit::Reconnect);
+        }
+
         let idle_deadline = last_seen + IDLE_TIMEOUT;
         tokio::select! {
             biased;
@@ -892,6 +928,13 @@ async fn session(
             }
             _ = ping_interval.tick() => {
                 ws.send(Message::Ping(Vec::new())).await?;
+            }
+            _ = reconnect_mode_notify.notified() => {
+                if reconnect_idle_mode.load(Ordering::Relaxed) {
+                    tracing::info!("reconnect idle mode on; closing websocket for hard suspend");
+                    let _ = ws.close(None).await;
+                    return Ok(SessionExit::Reconnect);
+                }
             }
             _ = lan_advertise_interval.tick(), if lan.is_some() && !lan_advertise_disabled && lan_active.load(Ordering::Relaxed) => {
                 if let Some(lan) = lan {
@@ -921,62 +964,23 @@ async fn session(
                 let Some(cmd) = cmd else {
                     return Ok(SessionExit::Stop);
                 };
-                match cmd {
-                    Cmd::Stop => {
-                        let _ = ws.close(None).await;
-                        return Ok(SessionExit::Stop);
-                    }
-                    Cmd::SendClip(payload) => {
-                        // Fire to LAN peers first — broadcast is non-blocking
-                        // and lets us at least reach co-LAN devices even if
-                        // the WS write below stalls.
-                        if let Some(lan) = lan {
-                            lan.broadcast(device_id.to_string(), payload.ts, payload.clone());
-                        }
-                        let plaintext = serde_json::to_vec(&payload)?;
-                        let (ciphertext, nonce) = encrypt(key, &plaintext)?;
-                        let msg = ClientMessage::Publish {
-                            group_id: group_id.to_string(),
-                            ciphertext,
-                            nonce: nonce.to_vec(),
-                            ts: payload.ts,
-                        };
-                        ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
-                    }
-                    Cmd::FetchRecent => {
-                        let msg = ClientMessage::FetchRecent {
-                            group_id: group_id.to_string(),
-                        };
-                        ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
-                    }
-                    Cmd::RefreshLan => {
-                        if let Some(lan) = lan.filter(|_| {
-                            !lan_advertise_disabled && lan_active.load(Ordering::Relaxed)
-                        }) {
-                            let candidate_networks =
-                                normalize_lan_candidate_networks(lan.advertise_candidate_networks());
-                            if lan_advertise_refresh_needed(
-                                last_lan_advertise.as_deref(),
-                                &candidate_networks,
-                                true,
-                            ) {
-                                let candidates: Vec<String> = candidate_networks
-                                    .iter()
-                                    .map(|c| c.addr.clone())
-                                    .collect();
-                                let adv = ClientMessage::LanAdvertise {
-                                    group_id: group_id.to_string(),
-                                    device_id: device_id.to_string(),
-                                    device_name: device_name.to_string(),
-                                    candidates,
-                                    candidate_networks: candidate_networks.clone(),
-                                };
-                                ws.send(Message::Text(serde_json::to_string(&adv)?)).await?;
-                                lan_advertise_error_pending = true;
-                                last_lan_advertise = Some(candidate_networks);
-                            }
-                        }
-                    }
+                match apply_session_cmd(
+                    cmd,
+                    &mut ws,
+                    lan,
+                    key,
+                    group_id,
+                    device_id,
+                    device_name,
+                    lan_active,
+                    &mut lan_advertise_disabled,
+                    &mut lan_advertise_error_pending,
+                    &mut last_lan_advertise,
+                )
+                .await?
+                {
+                    Some(exit) => return Ok(exit),
+                    None => {}
                 }
             }
             frame = ws.next() => {
@@ -1015,6 +1019,86 @@ async fn session(
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+type SessionIoError = Box<dyn std::error::Error + Send + Sync>;
+
+async fn apply_session_cmd<S>(
+    cmd: Cmd,
+    ws: &mut S,
+    lan: Option<&LanNode>,
+    key: &[u8; KEY_LEN],
+    group_id: &str,
+    device_id: &str,
+    device_name: &str,
+    lan_active: &AtomicBool,
+    lan_advertise_disabled: &mut bool,
+    lan_advertise_error_pending: &mut bool,
+    last_lan_advertise: &mut Option<Vec<LanCandidate>>,
+) -> Result<Option<SessionExit>, SessionIoError>
+where
+    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    match cmd {
+        Cmd::Stop => {
+            // Prefer a Close frame over SinkExt::close() so this works for both
+            // WebSocketStream and the generic Sink used in tests.
+            let _ = ws.send(Message::Close(None)).await;
+            Ok(Some(SessionExit::Stop))
+        }
+        Cmd::SendClip(payload) => {
+            // Fire to LAN peers first — broadcast is non-blocking and lets
+            // us at least reach co-LAN devices even if the WS write below
+            // stalls.
+            if let Some(lan) = lan {
+                lan.broadcast(device_id.to_string(), payload.ts, payload.clone());
+            }
+            let plaintext = serde_json::to_vec(&payload)?;
+            let (ciphertext, nonce) = encrypt(key, &plaintext)?;
+            let msg = ClientMessage::Publish {
+                group_id: group_id.to_string(),
+                ciphertext,
+                nonce: nonce.to_vec(),
+                ts: payload.ts,
+            };
+            ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+            Ok(None)
+        }
+        Cmd::FetchRecent => {
+            let msg = ClientMessage::FetchRecent {
+                group_id: group_id.to_string(),
+            };
+            ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+            Ok(None)
+        }
+        Cmd::RefreshLan => {
+            if let Some(lan) = lan.filter(|_| {
+                !*lan_advertise_disabled && lan_active.load(Ordering::Relaxed)
+            }) {
+                let candidate_networks =
+                    normalize_lan_candidate_networks(lan.advertise_candidate_networks());
+                if lan_advertise_refresh_needed(
+                    last_lan_advertise.as_deref(),
+                    &candidate_networks,
+                    true,
+                ) {
+                    let candidates: Vec<String> =
+                        candidate_networks.iter().map(|c| c.addr.clone()).collect();
+                    let adv = ClientMessage::LanAdvertise {
+                        group_id: group_id.to_string(),
+                        device_id: device_id.to_string(),
+                        device_name: device_name.to_string(),
+                        candidates,
+                        candidate_networks: candidate_networks.clone(),
+                    };
+                    ws.send(Message::Text(serde_json::to_string(&adv)?)).await?;
+                    *lan_advertise_error_pending = true;
+                    *last_lan_advertise = Some(candidate_networks);
+                }
+            }
+            Ok(None)
         }
     }
 }
@@ -1228,43 +1312,91 @@ mod tests {
         assert!(!lan_advertise_disabled);
     }
 
-    #[test]
-    fn idle_reconnect_backoff_grows_exponentially_until_cap() {
-        let mut backoff =
-            IdleReconnectBackoff::new(Duration::from_secs(5), Duration::from_secs(20));
+    #[tokio::test]
+    async fn hard_suspend_wait_resumes_when_idle_mode_clears() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Cmd>();
+        let mut pending = VecDeque::new();
+        let idle = Arc::new(AtomicBool::new(true));
+        let notify = Arc::new(Notify::new());
 
-        assert_eq!(
-            reconnect_delay_for_mode(true, &mut backoff),
-            Some(Duration::from_secs(5))
-        );
-        assert_eq!(
-            reconnect_delay_for_mode(true, &mut backoff),
-            Some(Duration::from_secs(10))
-        );
-        assert_eq!(
-            reconnect_delay_for_mode(true, &mut backoff),
-            Some(Duration::from_secs(20))
-        );
-        assert_eq!(
-            reconnect_delay_for_mode(true, &mut backoff),
-            Some(Duration::from_secs(20))
-        );
+        let wait = tokio::spawn({
+            let idle = idle.clone();
+            let notify = notify.clone();
+            async move {
+                wait_while_relay_suspended(&mut rx, &mut pending, &idle, &notify).await
+            }
+        });
+
+        // Hold suspended briefly, then leave idle mode.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        idle.store(false, Ordering::Relaxed);
+        notify.notify_waiters();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("suspend wait hung")
+            .unwrap();
+        assert!(matches!(result, SuspendWait::Resume));
+        drop(tx);
     }
 
-    #[test]
-    fn active_reconnect_keeps_existing_immediate_behavior_and_resets_idle_backoff() {
-        let mut backoff =
-            IdleReconnectBackoff::new(Duration::from_secs(5), Duration::from_secs(20));
+    #[tokio::test]
+    async fn hard_suspend_wait_stops_promptly_on_cmd_stop() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Cmd>();
+        let mut pending = VecDeque::new();
+        let idle = AtomicBool::new(true);
+        let notify = Notify::new();
 
-        assert_eq!(
-            reconnect_delay_for_mode(true, &mut backoff),
-            Some(Duration::from_secs(5))
-        );
-        assert_eq!(reconnect_delay_for_mode(false, &mut backoff), None);
-        assert_eq!(
-            reconnect_delay_for_mode(true, &mut backoff),
-            Some(Duration::from_secs(5))
-        );
+        let wait = tokio::spawn(async move {
+            wait_while_relay_suspended(&mut rx, &mut pending, &idle, &notify).await
+        });
+
+        tx.send(Cmd::Stop).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("stop under suspend must not deadlock")
+            .unwrap();
+        assert!(matches!(result, SuspendWait::Stop));
+    }
+
+    #[tokio::test]
+    async fn hard_suspend_queues_send_clip_until_resume() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Cmd>();
+        let mut pending = VecDeque::new();
+        let idle = Arc::new(AtomicBool::new(true));
+        let notify = Arc::new(Notify::new());
+
+        let wait = tokio::spawn({
+            let idle = idle.clone();
+            let notify = notify.clone();
+            async move {
+                let result =
+                    wait_while_relay_suspended(&mut rx, &mut pending, &idle, &notify).await;
+                (result, pending)
+            }
+        });
+
+        tx.send(Cmd::FetchRecent).unwrap();
+        tx.send(Cmd::SendClip(ClipPayload {
+            kind: ClipKind::Text,
+            content: "queued".into(),
+            device_name: "t".into(),
+            ts: 1,
+            image: None,
+        }))
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        idle.store(false, Ordering::Relaxed);
+        notify.notify_waiters();
+
+        let (result, pending) = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("suspend wait hung")
+            .unwrap();
+        assert!(matches!(result, SuspendWait::Resume));
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(pending[0], Cmd::FetchRecent));
+        assert!(matches!(pending[1], Cmd::SendClip(_)));
     }
 
     #[test]
