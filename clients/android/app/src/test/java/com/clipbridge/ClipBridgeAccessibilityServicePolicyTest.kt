@@ -12,6 +12,24 @@ class ClipBridgeAccessibilityServicePolicyTest {
     private val mainActivitySource: String
         get() = File("src/main/java/com/clipbridge/MainActivity.kt")
             .readText()
+    private val shizukuSource: String
+        get() = File("src/main/java/com/clipbridge/ShizukuBridge.kt")
+            .readText()
+    private val clipboardUserServiceSource: String
+        get() = File("src/main/java/com/clipbridge/ClipboardUserService.kt")
+            .takeIf(File::isFile)
+            ?.readText()
+            .orEmpty()
+    private val clipboardUserServiceAidl: String
+        get() = File("src/main/aidl/com/clipbridge/IClipboardUserService.aidl")
+            .takeIf(File::isFile)
+            ?.readText()
+            .orEmpty()
+    private val clipboardTextListenerAidl: String
+        get() = File("src/main/aidl/com/clipbridge/IClipboardTextListener.aidl")
+            .takeIf(File::isFile)
+            ?.readText()
+            .orEmpty()
 
     @Test
     fun serviceConnectionDoesNotStartShizukuPolling() {
@@ -142,12 +160,154 @@ class ClipBridgeAccessibilityServicePolicyTest {
         assertTrue(
             "When Shizuku is ready, a copy toast should read the real system clipboard instead of publishing a cached UI selection.",
             body.contains("ShizukuBridge.State.READY") &&
-                body.contains("triggerShizukuClipboardRead(\"copy toast\")"),
+                body.contains("triggerShizukuClipboardRead(") &&
+                body.contains("reason = \"copy toast\""),
         )
         assertTrue(
             "The Shizuku read must happen before the accessibility selection fallback can publish.",
-            body.indexOf("triggerShizukuClipboardRead(\"copy toast\")") <
+            body.indexOf("triggerShizukuClipboardRead(") <
                 body.indexOf("publish(sel)"),
+        )
+    }
+
+    @Test
+    fun clipboardListenerFallsBackToShizukuWhenBackgroundReadIsDenied() {
+        val body = serviceSource.functionBody("private fun handleLocalClipboardChange()")
+        val shizukuBody = serviceSource.functionBody("private fun triggerShizukuClipboardRead")
+
+        assertTrue(
+            "A background clipboard notification must fall back to Shizuku when ClipboardManager cannot return the clip.",
+            body.contains("triggerShizukuClipboardRead(") &&
+                body.contains("\"clipboard listener\""),
+        )
+        assertTrue(
+            "An active Samsung event monitor must suppress the duplicate standard read that can clear permission-bearing SemClipData.",
+            body.contains("ShizukuBridge.isClipboardMonitorActive()") &&
+                body.indexOf("ShizukuBridge.isClipboardMonitorActive()") <
+                body.indexOf("triggerShizukuClipboardRead("),
+        )
+        assertTrue(
+            "If privileged clipboard access also fails, the listener must retain a recent Accessibility selection fallback.",
+            body.contains("fallbackText = recentSelectionForClipboardFallback()") &&
+                shizukuBody.contains("publishClipboardFallback("),
+        )
+        assertFalse(
+            "A Shizuku read must not suppress the same text forever; publish() already provides time-bounded echo and source deduplication.",
+            shizukuBody.contains("text != lastShizukuText"),
+        )
+    }
+
+    @Test
+    fun rootShizukuClipboardReadUsesShellIdentityUserService() {
+        val body = shizukuSource.functionBody("suspend fun readPrimaryClip(): Clip?")
+
+        assertTrue(
+            "Root-mode Shizuku must use a short-lived service that drops to shell UID instead of giving up on the real clipboard.",
+            body.contains("Shizuku.getUid()") &&
+                body.contains("SHIZUKU_SHELL_UID") &&
+                body.contains("readPrimaryClipThroughShellUserService()"),
+        )
+    }
+
+    @Test
+    fun rootClipboardUserServiceDropsIdentityAndCanBeDestroyed() {
+        assertTrue(
+            "The root UserService must drop both gid and uid to shell before reading ClipboardService.",
+            clipboardUserServiceSource.contains("Os.setgid(SHELL_UID)") &&
+                clipboardUserServiceSource.contains("Os.setuid(SHELL_UID)") &&
+                clipboardUserServiceSource.indexOf("Os.setgid(SHELL_UID)") <
+                clipboardUserServiceSource.indexOf("Os.setuid(SHELL_UID)"),
+        )
+        assertTrue(
+            "A nested Binder call must clear the app caller identity so ClipboardService observes the service's shell UID.",
+            clipboardUserServiceSource.contains("Binder.clearCallingIdentity()") &&
+                clipboardUserServiceSource.contains("com.android.shell"),
+        )
+        assertTrue(
+            "The UserService must implement Shizuku's reserved destroy transaction and exit after an on-demand read.",
+            clipboardUserServiceAidl.contains("void destroy() = 16777114") &&
+                clipboardUserServiceSource.contains("override fun destroy()") &&
+            clipboardUserServiceSource.contains("exitProcess(0)"),
+        )
+    }
+
+    @Test
+    fun samsungClipboardMonitorHandlesPayloadAndNullEventsAndStopsInStandby() {
+        val enterStandby = serviceSource.functionBody("private fun enterStandby()")
+        val leaveStandby =
+            serviceSource.functionBody(
+                "private fun leaveStandby(reason: String, immediate: Boolean = false)",
+            )
+
+        assertTrue(
+            "Samsung clipboard monitoring must exist only while the screen is active.",
+            leaveStandby.contains("startClipboardMonitor(") &&
+                enterStandby.contains("stopClipboardMonitor()"),
+        )
+        assertTrue(
+            "The Samsung listener must extract SemClipData when Samsung supplies an event payload.",
+            clipboardUserServiceSource.contains("addClipboardEventListener") &&
+                clipboardUserServiceSource.contains("onClipboardEvent") &&
+                clipboardUserServiceSource.contains("extractSamsungText("),
+        )
+        assertTrue(
+            "One UI can send a null SemClipData event, so the root monitor should first read as Android's system identity, which owns READ_CLIPBOARD_IN_BACKGROUND.",
+            clipboardUserServiceSource.contains("readPrimaryClipAsSystem()") &&
+                clipboardUserServiceSource.contains("withEffectiveUid(SYSTEM_UID)") &&
+                clipboardUserServiceSource.contains("packageName = SYSTEM_PACKAGE") &&
+                clipboardUserServiceSource.contains("Os.seteuid(uid)") &&
+                clipboardUserServiceSource.contains("Binder.clearCallingIdentity()") &&
+                clipboardUserServiceSource.contains("Os.seteuid(ROOT_UID)"),
+        )
+        assertTrue(
+            "Samsung can clear the framework clipboard before dispatching its event; the event worker must then read the newly persisted HoneyBoard row with bounded retries.",
+            clipboardUserServiceSource.contains("readRecentHoneyboardText(") &&
+                clipboardUserServiceSource.contains("ClipItem.db") &&
+                clipboardUserServiceSource.contains("SQLiteDatabase.OPEN_READONLY") &&
+                clipboardUserServiceSource.contains("Executors.newSingleThreadExecutor") &&
+                clipboardUserServiceSource.contains("HONEYBOARD_QUERY_ATTEMPTS") &&
+                clipboardUserServiceSource.contains("Thread.sleep(HONEYBOARD_QUERY_RETRY_MS)"),
+        )
+        assertFalse(
+            "The HoneyBoard fallback must remain event-driven and bounded, never an always-on poller.",
+            clipboardUserServiceSource.contains("while (true)") ||
+                clipboardUserServiceSource.contains("while (isActive)"),
+        )
+        assertFalse(
+            "System identity removes the focus race; accessibility and AIDL must not maintain a stale foreground-package identity.",
+            clipboardUserServiceSource.contains("readPrimaryClipAsForegroundSource") ||
+                clipboardUserServiceSource.contains("resolvePackageUid") ||
+                serviceSource.contains("updateClipboardSource(") ||
+                shizukuSource.contains("updateClipboardSource(") ||
+                clipboardUserServiceAidl.contains("updateClipboardSource("),
+        )
+        assertFalse(
+            "The Samsung fallback must not use getPrimarySemClip, which re-reads as shell and can clear permission-bearing clips.",
+            clipboardUserServiceSource.contains("getPrimarySemClip"),
+        )
+        assertTrue(
+            "The UserService must chunk clipboard text across AIDL so long Samsung clips stay below Binder's transaction limit.",
+            clipboardUserServiceAidl.contains("startClipboardMonitor") &&
+                clipboardTextListenerAidl.contains("onClipboardTextChunk") &&
+                clipboardTextListenerAidl.contains("long transferId") &&
+                clipboardTextListenerAidl.contains("int chunkIndex") &&
+                clipboardTextListenerAidl.contains("int chunkCount") &&
+                clipboardUserServiceSource.contains("AIDL_TEXT_CHUNK_CHARS") &&
+                clipboardUserServiceSource.contains("onClipboardTextChunk(") &&
+                shizukuSource.contains("ClipboardTextAssembler") &&
+                shizukuSource.contains(".daemon(false)"),
+        )
+        assertFalse(
+            "The UserService must not send the complete clipboard as one Binder String transaction.",
+            clipboardTextListenerAidl.contains("onClipboardText(String text)") ||
+                clipboardUserServiceAidl.contains("String readPrimaryClipText()"),
+        )
+        assertTrue(
+            "The one-shot root clipboard read must use the same chunk listener instead of returning one large String.",
+            clipboardUserServiceAidl.contains(
+                "boolean readPrimaryClipText(IClipboardTextListener listener)",
+            ) &&
+                shizukuSource.contains("ClipboardTextAssembler()"),
         )
     }
 }

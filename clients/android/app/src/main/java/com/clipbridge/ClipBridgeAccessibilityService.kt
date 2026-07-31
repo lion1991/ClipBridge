@@ -41,20 +41,25 @@ import java.io.File
 import java.util.UUID
 
 /**
- * Two paths to picking up clipboard changes on Android 10+, where background
+ * Three paths to picking up clipboard changes on Android 10+, where background
  * `ClipboardManager.getPrimaryClip()` is blocked:
  *
- *   - **On-demand Shizuku read (preferred)**: after a copy toast or remote
- *     write, ask the IClipboard system service through Shizuku's shell-uid
- *     binder for the current primary clip. This catches system clipboard
- *     state without keeping an always-on polling loop alive in standby.
+ *   - **Samsung event monitor**: while the screen is interactive on a rooted
+ *     Samsung device, consume SemClipData when supplied by semclipboard. When
+ *     One UI sends only a change notification, synchronously read as the
+ *     Android system identity before Samsung clears permission-bearing clips.
+ *   - **On-demand Shizuku read (preferred)**: when the clipboard listener's
+ *     background read is denied, after a copy toast, or after a remote write,
+ *     ask the IClipboard system service through Shizuku's shell-uid binder for
+ *     the current primary clip. This catches system clipboard state without
+ *     keeping an always-on polling loop alive in standby.
  *   - **Accessibility events (fallback)**: cache the latest text selection and
  *     publish it when a "copied" toast fires. Works without Shizuku but misses
  *     copies that don't go through the long-press toolbar.
  *
- * Both paths funnel into `publish()`, which suppresses echoes of remote
+ * All paths funnel into `publish()`, which suppresses echoes of remote
  * writes (within `ECHO_WINDOW_MS`) and collapses near-simultaneous fires
- * from the two sources (within `SOURCE_DEDUPE_MS`), so they coexist.
+ * from the sources (within `SOURCE_DEDUPE_MS`), so they coexist.
  */
 class ClipBridgeAccessibilityService : AccessibilityService() {
 
@@ -65,6 +70,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private var screenReceiver: BroadcastReceiver? = null
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var shizukuStateListener: ShizukuBridge.StateListener? = null
     // Held only while Android LAN mode is active. Screen-off standby releases
     // it; transfer activity opens a short LAN window so mDNS/TCP LAN paths can
     // wake briefly without keeping Wi-Fi multicast hot all night.
@@ -91,12 +97,9 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     // grow it unbounded; entries beyond capacity get LRU-evicted.
     private val recentImageHashes = LinkedHashSet<String>()
     private val recentImageHashesCap = 32
-    // Last values observed via an on-demand Shizuku read. These prevent a
-    // remote write that we just mirrored to the system clipboard from being
-    // reprocessed as a fresh local copy if several callbacks fire around
-    // the same time. Shizuku reads are remote-triggered only; there is no
-    // always-on clipboard polling loop.
-    private var lastShizukuText: String? = null
+    // Last image URI observed via an on-demand Shizuku read. Text deduplication
+    // stays time-bounded in publish(), so intentionally copying the same text
+    // later is never suppressed forever.
     private var lastPolledImageUri: String? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -140,6 +143,13 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         ShizukuBridge.register()
         registerNetworkStateCallback()
         registerScreenStateReceiver()
+        shizukuStateListener = ShizukuBridge.StateListener { state ->
+            if (state == ShizukuBridge.State.READY && !isScreenOffForStandby()) {
+                startClipboardMonitor()
+            } else {
+                ShizukuBridge.stopClipboardMonitor()
+            }
+        }.also(ShizukuBridge::addStateListener)
         startLanCountPoller()
         startClient()
     }
@@ -280,6 +290,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         lanActive = false
         client?.setReconnectIdleMode(true)
         client?.setLanActive(false)
+        ShizukuBridge.stopClipboardMonitor()
         _lanFilePeers.value = emptyList()
         _lanPeerNames.value = emptyList()
         _lanPeerCount.value = 0
@@ -302,6 +313,11 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             reconnectIdleMode = false
             client?.setReconnectIdleMode(false)
             applyLanTransportPolicy(reason = reason, refresh = true)
+            if (isScreenOffForStandby()) {
+                ShizukuBridge.stopClipboardMonitor()
+            } else {
+                startClipboardMonitor()
+            }
             try {
                 client?.fetchRecent()
             } catch (t: Throwable) {
@@ -327,6 +343,15 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
             delay(LEAVE_STANDBY_DEBOUNCE_MS)
             leaveStandbyDebounceJob = null
             run()
+        }
+    }
+
+    private fun startClipboardMonitor() {
+        ShizukuBridge.startClipboardMonitor { text ->
+            scope.launch(Dispatchers.Main) {
+                Log.i(TAG, "Samsung clipboard event (${text.length} chars)")
+                publish(text)
+            }
         }
     }
 
@@ -409,19 +434,22 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun triggerShizukuClipboardRead(reason: String) {
+    private fun triggerShizukuClipboardRead(
+        reason: String,
+        fallbackText: String? = null,
+    ) {
         if (shizukuReadJob?.isActive == true) return
         shizukuReadJob = scope.launch {
             val state = ShizukuBridge.state()
             if (state != ShizukuBridge.State.READY) {
                 Log.d(TAG, "skip Shizuku clipboard read ($reason): state=$state")
+                publishClipboardFallback(reason, fallbackText)
                 return@launch
             }
             when (val clip = ShizukuBridge.readPrimaryClip()) {
                 is ShizukuBridge.Clip.Text -> {
                     val text = clip.value
-                    if (text.isNotEmpty() && text != lastShizukuText) {
-                        lastShizukuText = text
+                    if (text.isNotEmpty()) {
                         withContext(Dispatchers.Main) {
                             Log.i(TAG, "Shizuku read text after $reason: ${text.length} chars")
                             publish(text)
@@ -442,8 +470,19 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
                         }
                     }
                 }
-                null -> { /* Shizuku not ready, read failed, or clipboard empty. */ }
+                null -> publishClipboardFallback(reason, fallbackText)
             }
+        }
+    }
+
+    private suspend fun publishClipboardFallback(reason: String, text: String?) {
+        if (text.isNullOrEmpty()) {
+            Log.w(TAG, "clipboard unavailable after $reason; no recent text selection")
+            return
+        }
+        withContext(Dispatchers.Main) {
+            Log.i(TAG, "publishing recent selection after $reason: ${text.length} chars")
+            publish(text)
         }
     }
 
@@ -470,6 +509,9 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         lanCountJob?.cancel()
         lanCountJob = null
         unregisterNetworkStateCallback()
+        shizukuStateListener?.let(ShizukuBridge::removeStateListener)
+        shizukuStateListener = null
+        ShizukuBridge.stopClipboardMonitor()
         scope.cancel()
         ShizukuBridge.unregister()
         clipListener?.let { clipboard?.removePrimaryClipChangedListener(it) }
@@ -526,23 +568,31 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         Log.d(TAG, "remember selection ($source, ${trimmed.length} chars)")
     }
 
+    private fun recentSelectionForClipboardFallback(): String? {
+        val selection = lastSelection ?: return null
+        val ageMillis = System.currentTimeMillis() - lastSelectionAt
+        if (ageMillis > SELECTION_FRESH_MS) {
+            Log.w(TAG, "selection too old (${ageMillis}ms), ignoring")
+            return null
+        }
+        return selection
+    }
+
     private fun maybeHandleCopyToast(event: AccessibilityEvent) {
         val text = event.text?.joinToString(" ") ?: return
         if (!looksLikeCopyToast(text)) return
 
         if (ShizukuBridge.state() == ShizukuBridge.State.READY) {
-            triggerShizukuClipboardRead("copy toast")
+            triggerShizukuClipboardRead(
+                reason = "copy toast",
+                fallbackText = recentSelectionForClipboardFallback(),
+            )
             return
         }
 
-        val sel = lastSelection
+        val sel = recentSelectionForClipboardFallback()
         if (sel.isNullOrEmpty()) {
             Log.w(TAG, "copy toast '$text' but no recent selection cached")
-            return
-        }
-        // Ignore stale selections (e.g. user copied something an hour ago).
-        if (System.currentTimeMillis() - lastSelectionAt > 30_000) {
-            Log.w(TAG, "selection too old (${System.currentTimeMillis() - lastSelectionAt}ms), ignoring")
             return
         }
         Log.i(TAG, "copy detected via toast='$text', publishing ${sel.length} chars")
@@ -564,7 +614,30 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
 
     private fun handleLocalClipboardChange() {
         val cb = clipboard ?: return
-        val cd = cb.primaryClip ?: return
+        val cd = try {
+            cb.primaryClip
+        } catch (t: Throwable) {
+            Log.w(TAG, "direct clipboard read failed; falling back to Shizuku", t)
+            null
+        }
+        if (cd == null) {
+            // Android 10+ returns null for background apps even though the
+            // listener itself still fires. Samsung's clipboard overlay does
+            // not reliably emit an accessibility copy-toast event, so waiting
+            // for that separate fallback silently loses Android-origin clips.
+            if (ShizukuBridge.isClipboardMonitorActive()) {
+                // Samsung's SemClipData event carries the text directly.
+                // Re-reading its permission-bearing framework ClipData can
+                // fail URI grants and make ClipboardService clear the clip.
+                Log.d(TAG, "Samsung clipboard monitor active; skip duplicate standard read")
+                return
+            }
+            triggerShizukuClipboardRead(
+                reason = "clipboard listener",
+                fallbackText = recentSelectionForClipboardFallback(),
+            )
+            return
+        }
         if (cd.itemCount == 0) return
 
         // Image first: if the description advertises any image/* mime, take
@@ -1105,6 +1178,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         private const val ECHO_WINDOW_MS = 10_000L
         // Short enough that an intentional re-copy of the same text still goes.
         private const val SOURCE_DEDUPE_MS = 3_000L
+        private const val SELECTION_FRESH_MS = 30_000L
         private const val LAN_ACTIVE_WINDOW_MS = 60_000L
         /** Debounce rapid SCREEN_ON / USER_PRESENT so lock thrash cannot storm reconnects. */
         private const val LEAVE_STANDBY_DEBOUNCE_MS = 400L
