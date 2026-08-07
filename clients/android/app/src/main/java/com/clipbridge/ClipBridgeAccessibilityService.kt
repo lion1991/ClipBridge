@@ -107,9 +107,13 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
     private var lanCountJob: Job? = null
     private var lanActiveJob: Job? = null
     private var leaveStandbyDebounceJob: Job? = null
+    private var foregroundReconnectJob: Job? = null
     @Volatile private var reconnectIdleMode: Boolean = false
     @Volatile private var lanActive: Boolean = true
     @Volatile private var hasLanNetwork: Boolean = false
+    // True between the host activity's ON_RESUME and ON_PAUSE. Gates the
+    // foreground reconnect watchdog so it never runs while the user is away.
+    @Volatile private var hostAppForeground: Boolean = false
 
     // Latest remote image clip received while the screen was off. Fetched
     // on screen-on; cleared whenever a newer clip (remote text or a local
@@ -206,6 +210,7 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 refreshLanNetworkAvailability("default network available")
+                requestRelayReconnect("default network available")
             }
 
             override fun onCapabilitiesChanged(
@@ -378,8 +383,115 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         }
     }
 
+    /**
+     * The app came to the foreground. Android grants no dependable background
+     * lifetime, so arriving here disconnected is the normal case rather than an
+     * error worth showing the user: leave standby, then actively re-establish
+     * the link instead of waiting out whatever backoff the core is in.
+     */
     fun onHostAppForeground() {
+        hostAppForeground = true
         leaveStandby(reason = "host app foreground", immediate = true)
+        ensureConnected("host app foreground")
+        startForegroundReconnectWatchdog()
+    }
+
+    /** The app went away; stop the watchdog so it can't poll from the background. */
+    fun onHostAppBackground() {
+        hostAppForeground = false
+        foregroundReconnectJob?.cancel()
+        foregroundReconnectJob = null
+    }
+
+    /** User tapped the status pill. Same path as a foreground transition. */
+    fun requestManualReconnect() {
+        leaveStandby(reason = "manual reconnect", immediate = true)
+        ensureConnected("manual reconnect")
+    }
+
+    /**
+     * Bring the transport back up, whatever state it's in:
+     *
+     *   - No client at all (never paired when the service started, or the
+     *     constructor threw) — build one now. Nothing else retries this, so
+     *     without it a single early failure leaves the app dead until the
+     *     pairing config changes or the service rebinds.
+     *   - Client present — [Client.reconnectNow] cancels a pending reconnect
+     *     backoff, and probes the socket if the session merely *looks* alive.
+     *
+     * Main-confined, like the standby transitions, so it serializes with
+     * [startClient] / [restartClient] instead of racing them for `client`.
+     */
+    private fun ensureConnected(reason: String) {
+        scope.launch(Dispatchers.Main) {
+            val existing = client
+            if (existing == null) {
+                Log.i(TAG, "no client at $reason; starting one")
+                startClient()
+                return@launch
+            }
+            Log.i(TAG, "requesting reconnect: $reason")
+            existing.reconnectNow()
+        }
+    }
+
+    /**
+     * While the app is foregrounded and still not connected, keep asking. The
+     * core's own backoff climbs to 30s, which is a long time to stare at a
+     * "reconnecting" pill; nudging it puts the retry period back under this
+     * interval. Backs off as attempts fail so a genuinely dead network doesn't
+     * turn a long foreground session into a dial loop, and stops entirely the
+     * moment the app is backgrounded.
+     */
+    private fun startForegroundReconnectWatchdog() {
+        foregroundReconnectJob?.cancel()
+        foregroundReconnectJob = scope.launch(Dispatchers.Main) {
+            var interval = FOREGROUND_RECONNECT_MIN_MS
+            while (isActive && hostAppForeground) {
+                delay(interval)
+                val action = foregroundReconnectAction(
+                    hostAppForeground = hostAppForeground,
+                    reconnectIdleMode = reconnectIdleMode,
+                    hasClient = client != null,
+                    isConnected = _stateFlow.value == UiConnState.Connected,
+                )
+                when (action) {
+                    ForegroundReconnectAction.NONE -> {}
+                    ForegroundReconnectAction.START_CLIENT -> {
+                        Log.i(TAG, "foreground with no client; starting")
+                        startClient()
+                    }
+                    ForegroundReconnectAction.RECONNECT_NOW -> {
+                        Log.i(TAG, "foreground but ${_stateFlow.value}; retrying connect")
+                        client?.reconnectNow()
+                    }
+                }
+                interval = nextForegroundReconnectDelayMs(
+                    currentMs = interval,
+                    retried = action != ForegroundReconnectAction.NONE,
+                    minMs = FOREGROUND_RECONNECT_MIN_MS,
+                    maxMs = FOREGROUND_RECONNECT_MAX_MS,
+                )
+            }
+        }
+    }
+
+    /**
+     * Nudge the relay session after a transport change. A default-network
+     * switch (Wi-Fi ⇄ cellular) leaves the old socket open but dead, so
+     * without this it takes the core's 60s idle timeout plus a backoff to
+     * notice. Skipped in standby — waking the radio for a screen-off network
+     * blip is exactly the traffic the standby work was meant to remove.
+     */
+    private fun requestRelayReconnect(reason: String) {
+        if (reconnectIdleMode) return
+        // Main-confined for the same reason as refreshLanNetworkAvailability:
+        // ConnectivityManager callbacks arrive on their own thread, and every
+        // write to `client` happens on main.
+        scope.launch(Dispatchers.Main) {
+            client?.reconnectNow()
+            Log.i(TAG, "relay reconnect requested: $reason")
+        }
     }
 
     private fun startLanCountPoller() {
@@ -506,6 +618,9 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         lanActiveJob = null
         leaveStandbyDebounceJob?.cancel()
         leaveStandbyDebounceJob = null
+        foregroundReconnectJob?.cancel()
+        foregroundReconnectJob = null
+        hostAppForeground = false
         lanCountJob?.cancel()
         lanCountJob = null
         unregisterNetworkStateCallback()
@@ -1184,6 +1299,9 @@ class ClipBridgeAccessibilityService : AccessibilityService() {
         private const val LEAVE_STANDBY_DEBOUNCE_MS = 400L
         private const val LAN_COUNT_ACTIVE_INTERVAL_MS = 2_000L
         private const val LAN_COUNT_IDLE_INTERVAL_MS = 30_000L
+        /** Foreground reconnect watchdog: first retry gap, and its ceiling. */
+        private const val FOREGROUND_RECONNECT_MIN_MS = 5_000L
+        private const val FOREGROUND_RECONNECT_MAX_MS = 30_000L
 
         // In-process state for the UI to observe. AS and Activity share the
         // same process (no android:process attribute on either component) so

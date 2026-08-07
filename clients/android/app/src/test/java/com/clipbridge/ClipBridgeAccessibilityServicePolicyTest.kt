@@ -130,7 +130,7 @@ class ClipBridgeAccessibilityServicePolicyTest {
 
     @Test
     fun hostAppForegroundLeavesStandbyImmediately() {
-        val resumeBody = mainActivitySource.functionBody("if (event == Lifecycle.Event.ON_RESUME)")
+        val resumeBody = mainActivitySource.functionBody("Lifecycle.Event.ON_RESUME ->")
         val foregroundBody = serviceSource.functionBody("fun onHostAppForeground()")
 
         assertTrue(
@@ -141,6 +141,67 @@ class ClipBridgeAccessibilityServicePolicyTest {
             "Foregrounding the host app should leave standby immediately with full refresh.",
             foregroundBody.contains("leaveStandby(") &&
                 foregroundBody.contains("immediate = true"),
+        )
+    }
+
+    @Test
+    fun hostAppForegroundActivelyReconnectsInsteadOfReportingAnError() {
+        val foregroundBody = serviceSource.functionBody("fun onHostAppForeground()")
+        val ensureBody = serviceSource.functionBody("private fun ensureConnected(reason: String)")
+
+        assertTrue(
+            "Android grants no dependable background lifetime, so foregrounding must " +
+                "actively re-establish the link and keep watching, not just leave standby.",
+            foregroundBody.contains("ensureConnected(") &&
+                foregroundBody.contains("startForegroundReconnectWatchdog()"),
+        )
+        assertTrue(
+            "A client that never started (unpaired at connect, or a throwing constructor) " +
+                "is only ever retried here — nothing else rebuilds it.",
+            ensureBody.contains("startClient()"),
+        )
+        assertTrue(
+            "An existing client must be told to redial now rather than waiting out its backoff.",
+            ensureBody.contains("reconnectNow()"),
+        )
+    }
+
+    @Test
+    fun foregroundReconnectWatchdogStopsWhenTheAppLeaves() {
+        val watchdog =
+            serviceSource.functionBody("private fun startForegroundReconnectWatchdog()")
+        val backgroundBody = serviceSource.functionBody("fun onHostAppBackground()")
+        val pauseBody = mainActivitySource.functionBody("Lifecycle.Event.ON_PAUSE ->")
+
+        assertTrue(
+            "The watchdog must be gated on the foreground flag so it never polls in the background.",
+            watchdog.contains("hostAppForeground"),
+        )
+        assertTrue(
+            "Retries must back off so a dead network can't turn a long foreground session into a dial loop.",
+            watchdog.contains("nextForegroundReconnectDelayMs("),
+        )
+        assertTrue(
+            "ON_PAUSE must cancel the watchdog.",
+            pauseBody.contains("onHostAppBackground()") &&
+                backgroundBody.contains("foregroundReconnectJob?.cancel()"),
+        )
+    }
+
+    @Test
+    fun networkSwitchNudgesTheRelayButNotDuringStandby() {
+        val body = serviceSource.functionBody("private fun requestRelayReconnect(reason: String)")
+
+        assertTrue(
+            "A default-network switch leaves the old socket open but dead; nudge the core " +
+                "instead of waiting out its idle timeout.",
+            serviceSource.contains("requestRelayReconnect(\"default network available\")") &&
+                body.contains("reconnectNow()"),
+        )
+        assertTrue(
+            "Waking the radio for a screen-off network blip is exactly the background " +
+                "traffic standby exists to remove.",
+            body.contains("if (reconnectIdleMode) return"),
         )
     }
 

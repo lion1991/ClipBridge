@@ -220,13 +220,21 @@ private fun PairingScreen(
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                asEnabled = isAccessibilityEnabled(context)
-                batteryOptDisabled = isBatteryOptimizationDisabled(context)
-                shizukuState = ShizukuBridge.state()
-                imageReadGranted = isImageReadGranted(context)
-                autoEnableAttemptToken += 1
-                ClipBridgeAccessibilityService.activeService()?.onHostAppForeground()
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    asEnabled = isAccessibilityEnabled(context)
+                    batteryOptDisabled = isBatteryOptimizationDisabled(context)
+                    shizukuState = ShizukuBridge.state()
+                    imageReadGranted = isImageReadGranted(context)
+                    autoEnableAttemptToken += 1
+                    ClipBridgeAccessibilityService.activeService()?.onHostAppForeground()
+                }
+                // Paired with ON_RESUME so the service's foreground reconnect
+                // watchdog stops as soon as the user leaves.
+                Lifecycle.Event.ON_PAUSE -> {
+                    ClipBridgeAccessibilityService.activeService()?.onHostAppBackground()
+                }
+                else -> {}
             }
         }
         lifecycle.addObserver(observer)
@@ -973,16 +981,32 @@ private fun ConnectionPill(
         !asEnabled -> Pill("无障碍未启用", Icons.Filled.Warning, cs.errorContainer, cs.onErrorContainer)
         !paired -> Pill("未配对", Icons.Filled.LinkOff, cs.surfaceVariant, cs.onSurfaceVariant)
         else -> when (state) {
-            UiConnState.Idle -> Pill("等待启动", Icons.Filled.RadioButtonUnchecked, cs.surfaceVariant, cs.onSurfaceVariant)
+            UiConnState.Idle -> Pill("等待启动 · 点按重连", Icons.Filled.RadioButtonUnchecked, cs.surfaceVariant, cs.onSurfaceVariant)
             UiConnState.Connecting -> Pill("连接中…", Icons.Filled.Sync, cs.tertiaryContainer, cs.onTertiaryContainer)
             UiConnState.Connected -> Pill("已连接 · 同步中$transportSuffix", Icons.Filled.CheckCircle, cs.primaryContainer, cs.onPrimaryContainer)
             UiConnState.Disconnected -> Pill("已断开,正在重连", Icons.Filled.CloudOff, cs.surfaceVariant, cs.onSurfaceVariant)
-            is UiConnState.Error -> Pill("连接出错:${state.message}", Icons.Filled.Error, cs.errorContainer, cs.onErrorContainer)
+            // Not an error state as far as the user is concerned: the service
+            // is already retrying, and opening the app has just kicked it. Say
+            // that, and keep the cause as secondary detail.
+            is UiConnState.Error -> Pill("正在重连…(${state.message})", Icons.Filled.Sync, cs.tertiaryContainer, cs.onTertiaryContainer)
         }
     }
 
+    // Anything short of "connected" is worth a manual retry — the automatic
+    // one may be mid-backoff and the user is right here, asking now.
+    val canRetry = paired && asEnabled && state != UiConnState.Connected
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                if (canRetry) {
+                    Modifier.clickable {
+                        ClipBridgeAccessibilityService.activeService()?.requestManualReconnect()
+                    }
+                } else {
+                    Modifier
+                }
+            ),
         shape = RoundedCornerShape(14.dp),
         color = pill.container,
         contentColor = pill.content,

@@ -153,6 +153,10 @@ struct Shared {
     received_files: Arc<Mutex<VecDeque<ReceivedFileRecord>>>,
     reconnect_idle_mode: Arc<AtomicBool>,
     reconnect_mode_notify: Arc<Notify>,
+    /// Set by `reconnect_now()`. Cuts a pending reconnect backoff short and,
+    /// mid-session, arms the short liveness probe below.
+    reconnect_requested: Arc<AtomicBool>,
+    reconnect_wake: Arc<Notify>,
     lan_active: Arc<AtomicBool>,
     lan_mode_notify: Arc<Notify>,
 }
@@ -198,6 +202,8 @@ impl Client {
         let received_files = Arc::new(Mutex::new(VecDeque::new()));
         let reconnect_idle_mode = Arc::new(AtomicBool::new(false));
         let reconnect_mode_notify = Arc::new(Notify::new());
+        let reconnect_requested = Arc::new(AtomicBool::new(false));
+        let reconnect_wake = Arc::new(Notify::new());
         let lan_active = Arc::new(AtomicBool::new(true));
         let lan_mode_notify = Arc::new(Notify::new());
         let shared = Arc::new(Shared {
@@ -214,6 +220,8 @@ impl Client {
             received_files: received_files.clone(),
             reconnect_idle_mode: reconnect_idle_mode.clone(),
             reconnect_mode_notify: reconnect_mode_notify.clone(),
+            reconnect_requested: reconnect_requested.clone(),
+            reconnect_wake: reconnect_wake.clone(),
             lan_active: lan_active.clone(),
             lan_mode_notify: lan_mode_notify.clone(),
         });
@@ -244,6 +252,8 @@ impl Client {
                     received_files,
                     reconnect_idle_mode,
                     reconnect_mode_notify,
+                    reconnect_requested,
+                    reconnect_wake,
                     lan_active,
                     lan_mode_notify,
                 }));
@@ -293,6 +303,28 @@ impl Client {
             .reconnect_idle_mode
             .store(enabled, Ordering::Relaxed);
         self.shared.reconnect_mode_notify.notify_waiters();
+    }
+
+    /// Ask the worker to get back on the relay *now* rather than on its own
+    /// schedule. Two things happen, depending on where the worker is:
+    ///
+    ///   - Sleeping out a reconnect backoff (up to 30s after repeated
+    ///     failures): the sleep is cut short and the backoff reset, so a dial
+    ///     starts immediately instead of leaving the host showing a stale
+    ///     error for half a minute.
+    ///   - Inside a live session: a ping goes out and the idle deadline is
+    ///     pulled in to `LIVENESS_PROBE_TIMEOUT`. A socket that died silently
+    ///     (network switch, NAT rebind — TCP still "open", nothing flows)
+    ///     is then detected in seconds instead of the full 60s idle timeout.
+    ///
+    /// A no-op while hard-suspended: `set_reconnect_idle_mode(false)` is what
+    /// resumes from standby, and hosts call that first. Cheap and idempotent —
+    /// safe to call on every foreground transition and network change.
+    pub fn reconnect_now(&self) {
+        self.shared
+            .reconnect_requested
+            .store(true, Ordering::Relaxed);
+        self.shared.reconnect_wake.notify_waiters();
     }
 
     /// Tell the worker whether the host currently wants LAN discovery and
@@ -532,6 +564,8 @@ struct ClientRun {
     received_files: Arc<Mutex<VecDeque<ReceivedFileRecord>>>,
     reconnect_idle_mode: Arc<AtomicBool>,
     reconnect_mode_notify: Arc<Notify>,
+    reconnect_requested: Arc<AtomicBool>,
+    reconnect_wake: Arc<Notify>,
     lan_active: Arc<AtomicBool>,
     lan_mode_notify: Arc<Notify>,
 }
@@ -553,6 +587,8 @@ async fn run(config: ClientRun) {
         received_files,
         reconnect_idle_mode,
         reconnect_mode_notify,
+        reconnect_requested,
+        reconnect_wake,
         lan_active,
         lan_mode_notify,
     } = config;
@@ -675,6 +711,8 @@ async fn run(config: ClientRun) {
                 lan_active: lan_active.as_ref(),
                 reconnect_idle_mode: reconnect_idle_mode.as_ref(),
                 reconnect_mode_notify: reconnect_mode_notify.as_ref(),
+                reconnect_requested: reconnect_requested.as_ref(),
+                reconnect_wake: reconnect_wake.as_ref(),
             },
             &mut cmd_rx,
             &mut pending_cmds,
@@ -703,8 +741,11 @@ async fn run(config: ClientRun) {
                         ?backoff,
                         "session closed shortly after connect; backing off"
                     );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    if wait_backoff(backoff, &reconnect_requested, &reconnect_wake).await {
+                        backoff = Duration::from_secs(1);
+                    } else {
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                    }
                 }
             }
             Err(e) => {
@@ -718,8 +759,11 @@ async fn run(config: ClientRun) {
                 if session_started.elapsed() >= RECONNECT_STABLE_SESSION {
                     backoff = Duration::from_secs(1);
                 }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                if wait_backoff(backoff, &reconnect_requested, &reconnect_wake).await {
+                    backoff = Duration::from_secs(1);
+                } else {
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
             }
         }
     }
@@ -764,6 +808,37 @@ async fn wait_while_relay_suspended(
     }
 }
 
+const PING_EVERY: Duration = Duration::from_secs(30);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a `reconnect_now()` liveness probe waits for the relay to say
+/// anything back before we give up on the socket and redial. Well under
+/// `IDLE_TIMEOUT` — the whole point is not making a foregrounded app wait out
+/// the full idle window to discover its socket is dead.
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Cap on the WS dial (TCP + TLS + HTTP upgrade).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Sleep out a reconnect backoff, but cut it short as soon as the host calls
+/// `reconnect_now()`. Returns true when it was cut short, which the caller
+/// treats as "the situation changed, start over from the minimum backoff"
+/// rather than continuing to double a delay the user is actively waiting on.
+///
+/// The request is carried by an `AtomicBool` and not by the `Notify` alone:
+/// `notify_waiters()` only reaches tasks already parked, so a request that
+/// lands while we're mid-dial must still be visible on the next entry here.
+async fn wait_backoff(delay: Duration, requested: &AtomicBool, wake: &Notify) -> bool {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if requested.swap(false, Ordering::Relaxed) {
+            return true;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return false,
+            _ = wake.notified() => {}
+        }
+    }
+}
+
 const LAN_ADVERTISE_REFRESH_EVERY: Duration = Duration::from_secs(5);
 
 fn normalize_lan_candidate_networks(mut candidates: Vec<LanCandidate>) -> Vec<LanCandidate> {
@@ -798,6 +873,8 @@ struct SessionCtx<'a> {
     lan_active: &'a AtomicBool,
     reconnect_idle_mode: &'a AtomicBool,
     reconnect_mode_notify: &'a Notify,
+    reconnect_requested: &'a AtomicBool,
+    reconnect_wake: &'a Notify,
 }
 
 async fn session(
@@ -817,6 +894,8 @@ async fn session(
         lan_active,
         reconnect_idle_mode,
         reconnect_mode_notify,
+        reconnect_requested,
+        reconnect_wake,
     } = ctx;
 
     // Accept any of ws:// wss:// http:// https:// — the user often pastes the
@@ -829,7 +908,18 @@ async fn session(
     };
     let url = format!("{normalized}/ws");
     tracing::info!(%url, "connecting");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
+    // Bound the dial explicitly. A captive portal or a half-dead mobile link
+    // can leave the TCP/TLS handshake hanging for minutes on the OS timeout,
+    // during which the host sits on "connecting" and `reconnect_now()` has
+    // nothing to shorten. Failing fast puts us back in the reconnect loop,
+    // which is interruptible.
+    let (mut ws, _) =
+        match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(&url)).await {
+            Ok(connected) => connected?,
+            Err(_) => {
+                return Err(format!("connect to relay timed out after {CONNECT_TIMEOUT:?}").into())
+            }
+        };
     let mut lan_advertise_error_pending = false;
     let mut lan_advertise_disabled = false;
     let mut last_lan_advertise: Option<Vec<LanCandidate>> = None;
@@ -879,8 +969,6 @@ async fn session(
     // Heartbeat: ping every 30s, force-reconnect if no inbound frame for 60s.
     // The latter catches NAT idle timeouts and silent network switches (Wi-Fi
     // ↔ cellular) where TCP stays "open" but never delivers data again.
-    const PING_EVERY: Duration = Duration::from_secs(30);
-    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
     let mut ping_interval = tokio::time::interval(PING_EVERY);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ping_interval.tick().await; // consume the immediate first tick
@@ -888,6 +976,9 @@ async fn session(
     lan_advertise_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     lan_advertise_interval.tick().await; // consume the immediate first tick
     let mut last_seen = tokio::time::Instant::now();
+    // Set while a `reconnect_now()` ping is outstanding; any inbound frame
+    // (the pong included) clears it. See LIVENESS_PROBE_TIMEOUT.
+    let mut probe_deadline: Option<tokio::time::Instant> = None;
 
     // Flush commands that arrived while the relay was hard-suspended.
     while let Some(cmd) = pending_cmds.pop_front() {
@@ -920,10 +1011,15 @@ async fn session(
         }
 
         let idle_deadline = last_seen + IDLE_TIMEOUT;
+        let deadline = probe_deadline.map_or(idle_deadline, |probe| probe.min(idle_deadline));
         tokio::select! {
             biased;
-            _ = tokio::time::sleep_until(idle_deadline) => {
-                tracing::warn!("idle for {IDLE_TIMEOUT:?}, reconnecting");
+            _ = tokio::time::sleep_until(deadline) => {
+                if probe_deadline.is_some_and(|probe| probe <= idle_deadline) {
+                    tracing::warn!("liveness probe unanswered in {LIVENESS_PROBE_TIMEOUT:?}, reconnecting");
+                } else {
+                    tracing::warn!("idle for {IDLE_TIMEOUT:?}, reconnecting");
+                }
                 return Ok(SessionExit::Reconnect);
             }
             _ = ping_interval.tick() => {
@@ -934,6 +1030,20 @@ async fn session(
                     tracing::info!("reconnect idle mode on; closing websocket for hard suspend");
                     let _ = ws.close(None).await;
                     return Ok(SessionExit::Reconnect);
+                }
+            }
+            _ = reconnect_wake.notified() => {
+                // The host foregrounded or switched networks. The socket looks
+                // fine from here either way, so ask the relay to prove it: ping
+                // and hold it to the short probe deadline instead of the 60s
+                // idle window. Consume the request so the outer loop doesn't
+                // also treat it as a pending backoff skip.
+                reconnect_requested.store(false, Ordering::Relaxed);
+                if probe_deadline.is_none() {
+                    tracing::info!("reconnect requested mid-session; probing link liveness");
+                    ws.send(Message::Ping(Vec::new())).await?;
+                    probe_deadline =
+                        Some(tokio::time::Instant::now() + LIVENESS_PROBE_TIMEOUT);
                 }
             }
             _ = lan_advertise_interval.tick(), if lan.is_some() && !lan_advertise_disabled && lan_active.load(Ordering::Relaxed) => {
@@ -985,6 +1095,9 @@ async fn session(
             }
             frame = ws.next() => {
                 last_seen = tokio::time::Instant::now();
+                // Anything inbound — the probe's pong included — proves the
+                // link is alive, so the probe deadline has served its purpose.
+                probe_deadline = None;
                 let Some(frame) = frame else {
                     return Ok(SessionExit::Reconnect);
                 };
@@ -1399,6 +1512,70 @@ mod tests {
         assert!(matches!(pending[1], Cmd::SendClip(_)));
     }
 
+    #[tokio::test]
+    async fn wait_backoff_runs_the_full_delay_when_nobody_asks() {
+        let requested = AtomicBool::new(false);
+        let wake = Notify::new();
+
+        let started = Instant::now();
+        let cut_short = wait_backoff(Duration::from_millis(120), &requested, &wake).await;
+
+        assert!(!cut_short);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn wait_backoff_is_cut_short_by_reconnect_now() {
+        // The foreground case: a 30s backoff is pending and the user opens the
+        // app. The sleep must end immediately, not on its own schedule.
+        let requested = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(Notify::new());
+
+        let waiting = tokio::spawn({
+            let requested = requested.clone();
+            let wake = wake.clone();
+            async move { wait_backoff(Duration::from_secs(30), &requested, &wake).await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        requested.store(true, Ordering::Relaxed);
+        wake.notify_waiters();
+
+        let cut_short = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("reconnect_now must not wait out the backoff")
+            .unwrap();
+        assert!(cut_short);
+        // Consumed, so the *next* backoff is not skipped as well.
+        assert!(!requested.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn wait_backoff_honours_a_request_that_landed_before_the_sleep() {
+        // `notify_waiters()` only reaches parked tasks, so a request raised
+        // while the worker was mid-dial has to survive on the flag alone.
+        let requested = AtomicBool::new(true);
+        let wake = Notify::new();
+
+        let started = Instant::now();
+        let cut_short = wait_backoff(Duration::from_secs(30), &requested, &wake).await;
+
+        assert!(cut_short);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn client_reconnect_now_raises_the_request_flag() {
+        let client = client_for_file_tests(
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        );
+
+        assert!(!client.shared.reconnect_requested.load(Ordering::Relaxed));
+        client.reconnect_now();
+        assert!(client.shared.reconnect_requested.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn client_lan_active_mode_can_be_toggled_by_platform() {
         let client = client_for_file_tests(
@@ -1432,6 +1609,8 @@ mod tests {
                 received_files: Arc::new(Mutex::new(VecDeque::new())),
                 reconnect_idle_mode: Arc::new(AtomicBool::new(false)),
                 reconnect_mode_notify: Arc::new(Notify::new()),
+                reconnect_requested: Arc::new(AtomicBool::new(false)),
+                reconnect_wake: Arc::new(Notify::new()),
                 lan_active: Arc::new(AtomicBool::new(true)),
                 lan_mode_notify: Arc::new(Notify::new()),
             }),
