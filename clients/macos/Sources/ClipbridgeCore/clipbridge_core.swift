@@ -352,7 +352,7 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
-// Initial value and increment amount for handles.
+// Initial value and increment amount for handles. 
 // These ensure that SWIFT handles always have the lowest bit set
 fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
 fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
@@ -541,26 +541,31 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 public protocol ClientProtocol: AnyObject, Sendable {
-
+    
     /**
      * Download the ciphertext for `meta` from the relay and decrypt it
      * with the group key. Blocking; safe to call from a background thread.
      */
     func fetchImage(meta: ImageMeta) throws  -> Data
-
-    func fetchRecent() throws
-
+    
+    func fetchRecent() throws 
+    
     /**
      * Number of LAN peers currently in a fully-handshaked session. The
      * UI polls this every couple of seconds to render a transport badge
      * ("LAN: 2 / 仅中继"). 0 means LAN is up but no one's discovered us
      * yet, *or* the LAN transport failed to start (multicast blocked,
      * permission denied) and we're relay-only.
+     * Whether the background worker is still running. A host watchdog uses
+     * this to tell "still retrying" apart from "nobody home": the latter
+     * only recovers by building a new `Client`.
      */
+    func isRunning()  -> Bool
+    
     func lanPeerCount()  -> UInt32
-
+    
     func lanPeerRecords()  -> [LanPeerRecord]
-
+    
     /**
      * Snapshot of currently-connected peers' device names, one entry per
      * logical peer (deduped on device_id so a reconnect transient or an
@@ -571,50 +576,75 @@ public protocol ClientProtocol: AnyObject, Sendable {
      * Android shows ["Mac", "iPhone"], the missing edge is Mac↔iPhone.
      */
     func lanPeers()  -> [String]
-
+    
+    /**
+     * Ask the worker to get back on the relay *now* rather than on its own
+     * schedule. Two things happen, depending on where the worker is:
+     *
+     * - Sleeping out a reconnect backoff (up to 30s after repeated
+     * failures): the sleep is cut short and the backoff reset, so a dial
+     * starts immediately instead of leaving the host showing a stale
+     * error for half a minute.
+     * - Inside a live session: a ping goes out and the idle deadline is
+     * pulled in to `LIVENESS_PROBE_TIMEOUT`. A socket that died silently
+     * (network switch, NAT rebind — TCP still "open", nothing flows)
+     * is then detected in seconds instead of the full 60s idle timeout.
+     *
+     * A no-op while hard-suspended: `set_reconnect_idle_mode(false)` is what
+     * resumes from standby, and hosts call that first. Cheap and idempotent —
+     * safe to call on every foreground transition and network change.
+     */
+    func reconnectNow() 
+    
     /**
      * Ask the active session to immediately re-advertise LAN candidates and
      * wake the LAN reconciler instead of waiting for the periodic timers.
      * Platforms that do not call this keep the existing timer-driven LAN
      * behavior.
      */
-    func refreshLanNow() throws
-
-    func sendClip(payload: ClipPayload) throws
-
+    func refreshLanNow() throws 
+    
+    func sendClip(payload: ClipPayload) throws 
+    
     func sendFileToPeer(targetDeviceId: String, sourcePath: String, mimeType: String?) throws  -> SentFile
-
+    
     /**
      * Encrypt `image_bytes`, upload the ciphertext to the relay's blob
      * endpoint, then queue a `Publish` carrying the resulting `ImageMeta`.
      * Blocks the calling thread for the duration of the HTTP upload —
      * hosts should call this from a background thread / coroutine.
      */
-    func sendImage(imageBytes: Data, mimeType: String, width: UInt32, height: UInt32, deviceName: String, ts: UInt64) throws
-
-    func setFileReceiveDir(dir: String)
-
+    func sendImage(imageBytes: Data, mimeType: String, width: UInt32, height: UInt32, deviceName: String, ts: UInt64) throws 
+    
+    func setFileReceiveDir(dir: String) 
+    
     /**
      * Tell the worker whether the host currently wants LAN discovery and
-     * peer sessions active. Platforms that never call this keep the default
-     * always-on LAN behavior.
+     * peer sessions active. When false the LAN node tears down mDNS, the
+     * TCP listener, and all peer sessions; when true it rebinds a fresh
+     * port and rediscovers. Platforms that never call this keep the
+     * default always-on LAN behavior.
      */
-    func setLanActive(enabled: Bool)
-
+    func setLanActive(enabled: Bool) 
+    
     /**
-     * Tell the worker whether reconnects are happening while the host is in
-     * a locked / screen-off idle state. Active hosts keep the original
-     * immediate reconnect behavior; idle hosts back off normal reconnects.
+     * Tell the worker whether the host is in a locked / screen-off standby
+     * state. When `enabled` is true the active WebSocket is closed and the
+     * outer reconnect loop **hard-suspends** until this is set false again
+     * (no keep-alive pings, no reconnect attempts). Queued `SendClip` /
+     * `FetchRecent` commands stay in the channel and flush on the next
+     * session. Only Android currently calls this; other hosts keep the
+     * default always-connected behavior.
      */
-    func setReconnectIdleMode(enabled: Bool)
-
+    func setReconnectIdleMode(enabled: Bool) 
+    
     /**
      * Signal the worker thread to disconnect and wait for it to finish.
      */
-    func stop()
-
+    func stop() 
+    
     func takeReceivedFiles()  -> [ReceivedFileRecord]
-
+    
 }
 open class Client: ClientProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -689,9 +719,9 @@ public convenience init(relayUrl: String, groupId: String, key: Data, deviceId: 
         try! rustCall { uniffi_clipbridge_core_fn_free_client(handle, $0) }
     }
 
+    
 
-
-
+    
     /**
      * Download the ciphertext for `meta` from the relay and decrypt it
      * with the group key. Blocking; safe to call from a background thread.
@@ -704,21 +734,32 @@ open func fetchImage(meta: ImageMeta)throws  -> Data  {
     )
 })
 }
-
+    
 open func fetchRecent()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_clipbridge_core_fn_method_client_fetch_recent(
             self.uniffiCloneHandle(),$0
     )
 }
 }
-
+    
     /**
      * Number of LAN peers currently in a fully-handshaked session. The
      * UI polls this every couple of seconds to render a transport badge
      * ("LAN: 2 / 仅中继"). 0 means LAN is up but no one's discovered us
      * yet, *or* the LAN transport failed to start (multicast blocked,
      * permission denied) and we're relay-only.
+     * Whether the background worker is still running. A host watchdog uses
+     * this to tell "still retrying" apart from "nobody home": the latter
+     * only recovers by building a new `Client`.
      */
+open func isRunning() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_clipbridge_core_fn_method_client_is_running(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
 open func lanPeerCount() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_clipbridge_core_fn_method_client_lan_peer_count(
@@ -726,7 +767,7 @@ open func lanPeerCount() -> UInt32  {
     )
 })
 }
-
+    
 open func lanPeerRecords() -> [LanPeerRecord]  {
     return try!  FfiConverterSequenceTypeLanPeerRecord.lift(try! rustCall() {
     uniffi_clipbridge_core_fn_method_client_lan_peer_records(
@@ -734,7 +775,7 @@ open func lanPeerRecords() -> [LanPeerRecord]  {
     )
 })
 }
-
+    
     /**
      * Snapshot of currently-connected peers' device names, one entry per
      * logical peer (deduped on device_id so a reconnect transient or an
@@ -751,7 +792,31 @@ open func lanPeers() -> [String]  {
     )
 })
 }
-
+    
+    /**
+     * Ask the worker to get back on the relay *now* rather than on its own
+     * schedule. Two things happen, depending on where the worker is:
+     *
+     * - Sleeping out a reconnect backoff (up to 30s after repeated
+     * failures): the sleep is cut short and the backoff reset, so a dial
+     * starts immediately instead of leaving the host showing a stale
+     * error for half a minute.
+     * - Inside a live session: a ping goes out and the idle deadline is
+     * pulled in to `LIVENESS_PROBE_TIMEOUT`. A socket that died silently
+     * (network switch, NAT rebind — TCP still "open", nothing flows)
+     * is then detected in seconds instead of the full 60s idle timeout.
+     *
+     * A no-op while hard-suspended: `set_reconnect_idle_mode(false)` is what
+     * resumes from standby, and hosts call that first. Cheap and idempotent —
+     * safe to call on every foreground transition and network change.
+     */
+open func reconnectNow()  {try! rustCall() {
+    uniffi_clipbridge_core_fn_method_client_reconnect_now(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
     /**
      * Ask the active session to immediately re-advertise LAN candidates and
      * wake the LAN reconciler instead of waiting for the periodic timers.
@@ -764,7 +829,7 @@ open func refreshLanNow()throws   {try rustCallWithError(FfiConverterTypeFfiErro
     )
 }
 }
-
+    
 open func sendClip(payload: ClipPayload)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_clipbridge_core_fn_method_client_send_clip(
             self.uniffiCloneHandle(),
@@ -772,7 +837,7 @@ open func sendClip(payload: ClipPayload)throws   {try rustCallWithError(FfiConve
     )
 }
 }
-
+    
 open func sendFileToPeer(targetDeviceId: String, sourcePath: String, mimeType: String?)throws  -> SentFile  {
     return try  FfiConverterTypeSentFile_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_clipbridge_core_fn_method_client_send_file_to_peer(
@@ -783,7 +848,7 @@ open func sendFileToPeer(targetDeviceId: String, sourcePath: String, mimeType: S
     )
 })
 }
-
+    
     /**
      * Encrypt `image_bytes`, upload the ciphertext to the relay's blob
      * endpoint, then queue a `Publish` carrying the resulting `ImageMeta`.
@@ -802,7 +867,7 @@ open func sendImage(imageBytes: Data, mimeType: String, width: UInt32, height: U
     )
 }
 }
-
+    
 open func setFileReceiveDir(dir: String)  {try! rustCall() {
     uniffi_clipbridge_core_fn_method_client_set_file_receive_dir(
             self.uniffiCloneHandle(),
@@ -810,11 +875,13 @@ open func setFileReceiveDir(dir: String)  {try! rustCall() {
     )
 }
 }
-
+    
     /**
      * Tell the worker whether the host currently wants LAN discovery and
-     * peer sessions active. Platforms that never call this keep the default
-     * always-on LAN behavior.
+     * peer sessions active. When false the LAN node tears down mDNS, the
+     * TCP listener, and all peer sessions; when true it rebinds a fresh
+     * port and rediscovers. Platforms that never call this keep the
+     * default always-on LAN behavior.
      */
 open func setLanActive(enabled: Bool)  {try! rustCall() {
     uniffi_clipbridge_core_fn_method_client_set_lan_active(
@@ -823,11 +890,15 @@ open func setLanActive(enabled: Bool)  {try! rustCall() {
     )
 }
 }
-
+    
     /**
-     * Tell the worker whether reconnects are happening while the host is in
-     * a locked / screen-off idle state. Active hosts keep the original
-     * immediate reconnect behavior; idle hosts back off normal reconnects.
+     * Tell the worker whether the host is in a locked / screen-off standby
+     * state. When `enabled` is true the active WebSocket is closed and the
+     * outer reconnect loop **hard-suspends** until this is set false again
+     * (no keep-alive pings, no reconnect attempts). Queued `SendClip` /
+     * `FetchRecent` commands stay in the channel and flush on the next
+     * session. Only Android currently calls this; other hosts keep the
+     * default always-connected behavior.
      */
 open func setReconnectIdleMode(enabled: Bool)  {try! rustCall() {
     uniffi_clipbridge_core_fn_method_client_set_reconnect_idle_mode(
@@ -836,7 +907,7 @@ open func setReconnectIdleMode(enabled: Bool)  {try! rustCall() {
     )
 }
 }
-
+    
     /**
      * Signal the worker thread to disconnect and wait for it to finish.
      */
@@ -846,7 +917,7 @@ open func stop()  {try! rustCall() {
     )
 }
 }
-
+    
 open func takeReceivedFiles() -> [ReceivedFileRecord]  {
     return try!  FfiConverterSequenceTypeReceivedFileRecord.lift(try! rustCall() {
     uniffi_clipbridge_core_fn_method_client_take_received_files(
@@ -854,9 +925,9 @@ open func takeReceivedFiles() -> [ReceivedFileRecord]  {
     )
 })
 }
+    
 
-
-
+    
 }
 
 
@@ -910,11 +981,11 @@ public func FfiConverterTypeClient_lower(_ value: Client) -> UInt64 {
  * that the host app implements; Rust calls into them on the worker thread.
  */
 public protocol ClipListener: AnyObject, Sendable {
-
-    func onClip(payload: ClipPayload)
-
-    func onState(state: ConnectionState)
-
+    
+    func onClip(payload: ClipPayload) 
+    
+    func onState(state: ConnectionState) 
+    
 }
 /**
  * Foreign-implementable callback. UniFFI generates Swift/Kotlin protocols
@@ -970,9 +1041,9 @@ open class ClipListenerImpl: ClipListener, @unchecked Sendable {
         try! rustCall { uniffi_clipbridge_core_fn_free_cliplistener(handle, $0) }
     }
 
+    
 
-
-
+    
 open func onClip(payload: ClipPayload)  {try! rustCall() {
     uniffi_clipbridge_core_fn_method_cliplistener_on_clip(
             self.uniffiCloneHandle(),
@@ -980,7 +1051,7 @@ open func onClip(payload: ClipPayload)  {try! rustCall() {
     )
 }
 }
-
+    
 open func onState(state: ConnectionState)  {try! rustCall() {
     uniffi_clipbridge_core_fn_method_cliplistener_on_state(
             self.uniffiCloneHandle(),
@@ -988,9 +1059,9 @@ open func onState(state: ConnectionState)  {try! rustCall() {
     )
 }
 }
+    
 
-
-
+    
 }
 
 
@@ -1033,7 +1104,7 @@ fileprivate struct UniffiCallbackInterfaceClipListener {
                 )
             }
 
-
+            
             let writeReturn = { () }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
@@ -1057,7 +1128,7 @@ fileprivate struct UniffiCallbackInterfaceClipListener {
                 )
             }
 
-
+            
             let writeReturn = { () }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
@@ -1163,11 +1234,11 @@ public struct ClipPayload: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(kind: ClipKind,
+    public init(kind: ClipKind, 
         /**
          * Text content. For non-text kinds this is empty (kept non-optional so
          * the FFI surface stays stable for existing Swift/Kotlin call sites).
-         */content: String, deviceName: String, ts: UInt64,
+         */content: String, deviceName: String, ts: UInt64, 
         /**
          * Present iff `kind == Image`. Carries the metadata needed to fetch
          * and verify the encrypted blob from the relay's blob endpoint.
@@ -1179,9 +1250,9 @@ public struct ClipPayload: Equatable, Hashable {
         self.image = image
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -1195,10 +1266,10 @@ public struct FfiConverterTypeClipPayload: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ClipPayload {
         return
             try ClipPayload(
-                kind: FfiConverterTypeClipKind.read(from: &buf),
-                content: FfiConverterString.read(from: &buf),
-                deviceName: FfiConverterString.read(from: &buf),
-                ts: FfiConverterUInt64.read(from: &buf),
+                kind: FfiConverterTypeClipKind.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf), 
+                deviceName: FfiConverterString.read(from: &buf), 
+                ts: FfiConverterUInt64.read(from: &buf), 
                 image: FfiConverterOptionTypeImageMeta.read(from: &buf)
         )
     }
@@ -1257,15 +1328,15 @@ public struct ImageMeta: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(mimeType: String, width: UInt32, height: UInt32,
+    public init(mimeType: String, width: UInt32, height: UInt32, 
         /**
          * Plaintext byte length. Lets the receiver render a placeholder /
          * progress bar before the blob arrives.
-         */sizeBytes: UInt64,
+         */sizeBytes: UInt64, 
         /**
          * Hex-encoded SHA-256 of the *ciphertext* stored in the blob endpoint.
          * Doubles as the blob URL key and a local-cache lookup key.
-         */sha256Hex: String,
+         */sha256Hex: String, 
         /**
          * Random 12-byte nonce used to encrypt the blob, base64-encoded.
          * Required by ChaCha20-Poly1305 — must be unique per encryption.
@@ -1278,9 +1349,9 @@ public struct ImageMeta: Equatable, Hashable {
         self.nonceB64 = nonceB64
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -1294,11 +1365,11 @@ public struct FfiConverterTypeImageMeta: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImageMeta {
         return
             try ImageMeta(
-                mimeType: FfiConverterString.read(from: &buf),
-                width: FfiConverterUInt32.read(from: &buf),
-                height: FfiConverterUInt32.read(from: &buf),
-                sizeBytes: FfiConverterUInt64.read(from: &buf),
-                sha256Hex: FfiConverterString.read(from: &buf),
+                mimeType: FfiConverterString.read(from: &buf), 
+                width: FfiConverterUInt32.read(from: &buf), 
+                height: FfiConverterUInt32.read(from: &buf), 
+                sizeBytes: FfiConverterUInt64.read(from: &buf), 
+                sha256Hex: FfiConverterString.read(from: &buf), 
                 nonceB64: FfiConverterString.read(from: &buf)
         )
     }
@@ -1345,9 +1416,9 @@ public struct LanPeerRecord: Equatable, Hashable {
         self.candidateCount = candidateCount
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -1361,8 +1432,8 @@ public struct FfiConverterTypeLanPeerRecord: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LanPeerRecord {
         return
             try LanPeerRecord(
-                deviceId: FfiConverterString.read(from: &buf),
-                displayName: FfiConverterString.read(from: &buf),
+                deviceId: FfiConverterString.read(from: &buf), 
+                displayName: FfiConverterString.read(from: &buf), 
                 candidateCount: FfiConverterUInt32.read(from: &buf)
         )
     }
@@ -1407,9 +1478,9 @@ public struct ReceivedFileRecord: Equatable, Hashable {
         self.sha256Hex = sha256Hex
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -1423,10 +1494,10 @@ public struct FfiConverterTypeReceivedFileRecord: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceivedFileRecord {
         return
             try ReceivedFileRecord(
-                transferId: FfiConverterString.read(from: &buf),
-                fileName: FfiConverterString.read(from: &buf),
-                path: FfiConverterString.read(from: &buf),
-                sizeBytes: FfiConverterUInt64.read(from: &buf),
+                transferId: FfiConverterString.read(from: &buf), 
+                fileName: FfiConverterString.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf), 
+                sizeBytes: FfiConverterUInt64.read(from: &buf), 
                 sha256Hex: FfiConverterString.read(from: &buf)
         )
     }
@@ -1471,9 +1542,9 @@ public struct SentFile: Equatable, Hashable {
         self.sha256Hex = sha256Hex
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -1487,9 +1558,9 @@ public struct FfiConverterTypeSentFile: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SentFile {
         return
             try SentFile(
-                transferId: FfiConverterString.read(from: &buf),
-                fileName: FfiConverterString.read(from: &buf),
-                bytesSent: FfiConverterUInt64.read(from: &buf),
+                transferId: FfiConverterString.read(from: &buf), 
+                fileName: FfiConverterString.read(from: &buf), 
+                bytesSent: FfiConverterUInt64.read(from: &buf), 
                 sha256Hex: FfiConverterString.read(from: &buf)
         )
     }
@@ -1521,7 +1592,7 @@ public func FfiConverterTypeSentFile_lower(_ value: SentFile) -> RustBuffer {
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum ClipKind: Equatable, Hashable {
-
+    
     case text
     case image
 
@@ -1544,26 +1615,26 @@ public struct FfiConverterTypeClipKind: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ClipKind {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-
+        
         case 1: return .text
-
+        
         case 2: return .image
-
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: ClipKind, into buf: inout [UInt8]) {
         switch value {
-
-
+        
+        
         case .text:
             writeInt(&buf, Int32(1))
-
-
+        
+        
         case .image:
             writeInt(&buf, Int32(2))
-
+        
         }
     }
 }
@@ -1588,7 +1659,7 @@ public func FfiConverterTypeClipKind_lower(_ value: ClipKind) -> RustBuffer {
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum ConnectionState: Equatable, Hashable {
-
+    
     case connecting
     case connected
     case disconnected
@@ -1614,40 +1685,40 @@ public struct FfiConverterTypeConnectionState: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConnectionState {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-
+        
         case 1: return .connecting
-
+        
         case 2: return .connected
-
+        
         case 3: return .disconnected
-
+        
         case 4: return .error(message: try FfiConverterString.read(from: &buf)
         )
-
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: ConnectionState, into buf: inout [UInt8]) {
         switch value {
-
-
+        
+        
         case .connecting:
             writeInt(&buf, Int32(1))
-
-
+        
+        
         case .connected:
             writeInt(&buf, Int32(2))
-
-
+        
+        
         case .disconnected:
             writeInt(&buf, Int32(3))
-
-
+        
+        
         case let .error(message):
             writeInt(&buf, Int32(4))
             FfiConverterString.write(message, into: &buf)
-
+            
         }
     }
 }
@@ -1678,8 +1749,8 @@ public func FfiConverterTypeConnectionState_lower(_ value: ConnectionState) -> R
  */
 public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
-
-
+    
+    
     case Stopped
     case InvalidKey(got: UInt32
     )
@@ -1692,15 +1763,15 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
     case Internal(reason: String
     )
 
+    
 
+    
 
-
-
-
+    
     public var errorDescription: String? {
         String(reflecting: self)
     }
-
+    
 }
 
 #if compiler(>=6)
@@ -1717,9 +1788,9 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
+        
 
-
-
+        
         case 1: return .Stopped
         case 2: return .InvalidKey(
             got: try FfiConverterUInt32.read(from: &buf)
@@ -1743,41 +1814,41 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
     public static func write(_ value: FfiError, into buf: inout [UInt8]) {
         switch value {
 
+        
 
-
-
-
+        
+        
         case .Stopped:
             writeInt(&buf, Int32(1))
-
-
+        
+        
         case let .InvalidKey(got):
             writeInt(&buf, Int32(2))
             FfiConverterUInt32.write(got, into: &buf)
-
-
+            
+        
         case .BlobNotFound:
             writeInt(&buf, Int32(3))
-
-
+        
+        
         case .BlobTooLarge:
             writeInt(&buf, Int32(4))
-
-
+        
+        
         case let .NoLanPeer(deviceId):
             writeInt(&buf, Int32(5))
             FfiConverterString.write(deviceId, into: &buf)
-
-
+            
+        
         case let .FileTransfer(reason):
             writeInt(&buf, Int32(6))
             FfiConverterString.write(reason, into: &buf)
-
-
+            
+        
         case let .Internal(reason):
             writeInt(&buf, Int32(7))
             FfiConverterString.write(reason, into: &buf)
-
+            
         }
     }
 }
@@ -1941,13 +2012,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_clipbridge_core_checksum_method_client_fetch_recent() != 60169) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_clipbridge_core_checksum_method_client_lan_peer_count() != 51217) {
+    if (uniffi_clipbridge_core_checksum_method_client_is_running() != 39638) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_clipbridge_core_checksum_method_client_lan_peer_count() != 42295) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_client_lan_peer_records() != 58913) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_client_lan_peers() != 17374) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_clipbridge_core_checksum_method_client_reconnect_now() != 781) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_client_refresh_lan_now() != 10042) {
@@ -1965,10 +2042,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_clipbridge_core_checksum_method_client_set_file_receive_dir() != 63587) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_clipbridge_core_checksum_method_client_set_lan_active() != 35601) {
+    if (uniffi_clipbridge_core_checksum_method_client_set_lan_active() != 20522) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_clipbridge_core_checksum_method_client_set_reconnect_idle_mode() != 25599) {
+    if (uniffi_clipbridge_core_checksum_method_client_set_reconnect_idle_mode() != 2065) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_clipbridge_core_checksum_method_client_stop() != 44720) {

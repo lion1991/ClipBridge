@@ -1,6 +1,7 @@
 import AppKit
 import ClipbridgeCore
 import CryptoKit
+import Network
 import UniformTypeIdentifiers
 
 /// Owns the Rust `Client`, the pasteboard polling timer, and the bridge between
@@ -167,6 +168,31 @@ final class BridgeCoordinator: ObservableObject {
     private var lastConnectionStatus: BridgeStatus = .disconnected
     private var transientErrorToken: UInt64 = 0
 
+    /// When `lastConnectionStatus` was last written. The core reports on
+    /// every dial attempt, so a long silence here while disconnected means
+    /// its worker is gone rather than merely unlucky. See `watchdogTick`.
+    private var lastStatusAt: Date = .distantPast
+
+    private var isConnected: Bool {
+        if case .connected = lastConnectionStatus { return true }
+        return false
+    }
+
+    /// Connection watchdog. The core runs its own reconnect loop, but nothing
+    /// above it ever noticed when there was no loop to run: a throwing
+    /// constructor left the menu bar reporting a connection attempt that
+    /// nobody was making, and a worker that died took the status with it.
+    private var watchdogTimer: Timer?
+    private var watchdogDelay: TimeInterval = ReconnectTuning.minDelay
+
+    /// Sleep/wake + network-path observers. A socket that died while the Mac
+    /// was asleep, or when Wi-Fi changed, looks alive to us until the core's
+    /// 60s idle timer catches it; these cut that to seconds.
+    private var wakeObserver: NSObjectProtocol?
+    private var pathMonitor: NWPathMonitor?
+    private var sawInitialPath = false
+    private let pathQueue = DispatchQueue(label: "com.clipbridge.path")
+
     /// "Don't touch the pasteboard until this date" — set after every
     /// outbound send AND every inbound write. Apple's Universal Clipboard
     /// re-delivers the same content to this device's pasteboard within
@@ -216,9 +242,39 @@ final class BridgeCoordinator: ObservableObject {
     }
 
     func start() {
+        observeWake()
+        observeNetworkPath()
+        startClient()
+        scheduleWatchdog(after: watchdogDelay)
+    }
+
+    func stop() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+        }
+        wakeObserver = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        client?.stop()
+        client = nil
+        listener = nil
+    }
+
+    /// Bring up the core client. Failure is *not* terminal: the watchdog
+    /// retries, because the reasons this throws (relay URL rejected by the
+    /// HTTP client, thread spawn refused) are exactly the kind that clear on
+    /// their own. Returns whether a client is now running.
+    @discardableResult
+    private func startClient() -> Bool {
         guard let key = config.keyData else {
-            onStateChange(.error("密钥无效"))
-            return
+            // Nothing to retry here — this needs re-pairing, not patience.
+            Log.connection.error("pairing key failed to decode; not starting a client")
+            report(.error("密钥无效"))
+            return false
         }
         let listener = Listener(coordinator: self)
         self.listener = listener
@@ -232,19 +288,127 @@ final class BridgeCoordinator: ObservableObject {
                 listener: listener
             )
         } catch {
-            onStateChange(.error("客户端错误:\(error)"))
-            return
+            self.listener = nil
+            Log.connection.error("client constructor threw: \(String(describing: error))")
+            report(.error("客户端错误:\(error)"))
+            return false
         }
+        Log.connection.notice("core client started")
+        // Start the staleness clock at creation: the core owes us a state
+        // within one dial cycle of now.
+        lastStatusAt = Date()
         configureFileReceiving()
         startPolling()
+        return true
     }
 
-    func stop() {
-        pollTimer?.invalidate()
-        pollTimer = nil
-        client?.stop()
+    /// Replace a core client that has stopped reporting. `Client.stop()`
+    /// joins the worker thread, and a wedged worker is precisely the case
+    /// here, so the teardown runs off the main thread — a hung join must not
+    /// take the menu bar down with it.
+    private func restartClient() {
+        let doomed = client
         client = nil
         listener = nil
+        pollTimer?.invalidate()
+        pollTimer = nil
+        DispatchQueue.global(qos: .utility).async { doomed?.stop() }
+        startClient()
+    }
+
+    /// Report a status the core did not produce (it isn't running, so it
+    /// can't). Recorded like a core state so the watchdog and the transient
+    /// error revert both see the real situation.
+    private func report(_ status: BridgeStatus) {
+        lastConnectionStatus = status
+        lastStatusAt = Date()
+        onStateChange(status)
+    }
+
+    // MARK: - Connection watchdog
+
+    private func scheduleWatchdog(after delay: TimeInterval) {
+        watchdogTimer?.invalidate()
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            self?.watchdogTick()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchdogTimer = timer
+    }
+
+    private func watchdogTick() {
+        let action = reconnectAction(
+            hasClient: client != nil,
+            workerAlive: client?.isRunning() ?? false,
+            isConnected: isConnected,
+            sinceLastState: Date().timeIntervalSince(lastStatusAt)
+        )
+        var retried = true
+        switch action {
+        case .none:
+            retried = false
+        case .startClient:
+            Log.connection.notice("watchdog: no core client, starting one")
+            startClient()
+        case .reconnectNow:
+            Log.connection.notice("watchdog: not connected, asking core to redial now")
+            client?.reconnectNow()
+        case .restartClient:
+            Log.connection.error("watchdog: core worker gone while disconnected, replacing client")
+            restartClient()
+        }
+        watchdogDelay = nextWatchdogDelay(current: watchdogDelay, retried: retried)
+        scheduleWatchdog(after: watchdogDelay)
+    }
+
+    /// Manual "reconnect now" for the menu item, and the shared path for wake
+    /// and network changes.
+    func reconnectNow(reason: String) {
+        Log.connection.notice("reconnect requested (\(reason, privacy: .public))")
+        if client == nil {
+            startClient()
+        } else {
+            // `reconnectNow` cuts a pending backoff short and, mid-session,
+            // pings with an 8s deadline instead of the 60s idle window —
+            // which is what a socket that died during sleep needs.
+            client?.reconnectNow()
+            try? client?.refreshLanNow()
+        }
+        watchdogDelay = ReconnectTuning.minDelay
+        scheduleWatchdog(after: watchdogDelay)
+    }
+
+    private func observeWake() {
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.reconnectNow(reason: "system wake")
+        }
+    }
+
+    private func observeNetworkPath() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let satisfied = path.status == .satisfied
+            DispatchQueue.main.async { self?.handleNetworkPath(satisfied: satisfied) }
+        }
+        monitor.start(queue: pathQueue)
+        pathMonitor = monitor
+    }
+
+    private func handleNetworkPath(satisfied: Bool) {
+        // The monitor reports the current path once right after start; that
+        // is the state we already booted into, not a change to react to.
+        guard sawInitialPath else {
+            sawInitialPath = true
+            Log.connection.notice("network path at start (satisfied: \(satisfied, privacy: .public))")
+            return
+        }
+        Log.connection.notice("network path changed (satisfied: \(satisfied, privacy: .public))")
+        guard satisfied else { return } // nothing to dial into yet
+        reconnectNow(reason: "network change")
     }
 
     private func startPolling() {
@@ -266,7 +430,10 @@ final class BridgeCoordinator: ObservableObject {
             )
             client?.setFileReceiveDir(dir: folder.path)
         } catch {
-            onStateChange(.error("文件接收目录不可用:\(error.localizedDescription)"))
+            // A bad receive folder says nothing about the transport. Show it
+            // and let it fall back to the real connection state, instead of
+            // parking a stale status on the menu that nothing will replace.
+            showTransientError("文件接收目录不可用:\(error.localizedDescription)")
         }
     }
 
@@ -645,9 +812,24 @@ final class BridgeCoordinator: ObservableObject {
         case .disconnected: .disconnected
         case .error(let message): .error(message)
         }
+        Log.connection.notice("core state: \(Self.label(for: mapped), privacy: .public)")
         DispatchQueue.main.async {
             self.lastConnectionStatus = mapped
+            self.lastStatusAt = Date()
+            if case .connected = mapped {
+                self.watchdogDelay = ReconnectTuning.minDelay
+            }
             self.onStateChange(mapped)
+        }
+    }
+
+    private static func label(for status: BridgeStatus) -> String {
+        switch status {
+        case .notPaired: return "not-paired"
+        case .connecting: return "connecting"
+        case .connected: return "connected"
+        case .disconnected: return "disconnected"
+        case .error(let message): return "error: \(message)"
         }
     }
 

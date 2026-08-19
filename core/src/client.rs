@@ -125,6 +125,10 @@ pub struct Client {
 }
 
 struct Shared {
+    /// False once the worker thread has exited — cleanly, or by unwinding.
+    /// The host polls this so a dead worker is a fact it can act on instead
+    /// of something it has to infer from silence.
+    worker_alive: Arc<AtomicBool>,
     key: [u8; KEY_LEN],
     group_id: String,
     device_id: String,
@@ -206,7 +210,9 @@ impl Client {
         let reconnect_wake = Arc::new(Notify::new());
         let lan_active = Arc::new(AtomicBool::new(true));
         let lan_mode_notify = Arc::new(Notify::new());
+        let worker_alive = Arc::new(AtomicBool::new(true));
         let shared = Arc::new(Shared {
+            worker_alive: worker_alive.clone(),
             key: key_arr,
             group_id: group_id.clone(),
             device_id: device_id.clone(),
@@ -229,34 +235,51 @@ impl Client {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
         let worker_relay = relay_url.clone();
         let worker_group = group_id.clone();
+        // The host only ever learns about the transport through `on_state`.
+        // If this thread unwinds, nothing else will ever call the listener
+        // again and the UI keeps showing whatever the last state was —
+        // "connecting" forever, with no client left to connect. Catch the
+        // panic and report it so the host can restart us.
+        let panic_listener = listener.clone();
         let thread = std::thread::Builder::new()
             .name("clipbridge-client".into())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("build runtime");
-                rt.block_on(run(ClientRun {
-                    relay_url: worker_relay,
-                    group_id: worker_group,
-                    key: key_arr,
-                    device_id,
-                    device_name,
-                    listener,
-                    cmd_rx,
-                    lan_peers,
-                    lan_peer_names,
-                    blob_cache,
-                    peer_addrs,
-                    file_receive_dir,
-                    received_files,
-                    reconnect_idle_mode,
-                    reconnect_mode_notify,
-                    reconnect_requested,
-                    reconnect_wake,
-                    lan_active,
-                    lan_mode_notify,
-                }));
+                let worker = std::panic::AssertUnwindSafe(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build runtime");
+                    rt.block_on(run(ClientRun {
+                        relay_url: worker_relay,
+                        group_id: worker_group,
+                        key: key_arr,
+                        device_id,
+                        device_name,
+                        listener,
+                        cmd_rx,
+                        lan_peers,
+                        lan_peer_names,
+                        blob_cache,
+                        peer_addrs,
+                        file_receive_dir,
+                        received_files,
+                        reconnect_idle_mode,
+                        reconnect_mode_notify,
+                        reconnect_requested,
+                        reconnect_wake,
+                        lan_active,
+                        lan_mode_notify,
+                    }));
+                });
+                let outcome = std::panic::catch_unwind(worker);
+                worker_alive.store(false, Ordering::Relaxed);
+                if let Err(payload) = outcome {
+                    let message = panic_message(payload.as_ref());
+                    tracing::error!(%message, "client worker thread panicked");
+                    panic_listener.on_state(ConnectionState::Error {
+                        message: format!("client worker crashed: {message}"),
+                    });
+                }
             })
             .map_err(|e| FfiError::Internal {
                 reason: format!("spawn thread: {e}"),
@@ -457,6 +480,13 @@ impl Client {
     /// ("LAN: 2 / 仅中继"). 0 means LAN is up but no one's discovered us
     /// yet, *or* the LAN transport failed to start (multicast blocked,
     /// permission denied) and we're relay-only.
+    /// Whether the background worker is still running. A host watchdog uses
+    /// this to tell "still retrying" apart from "nobody home": the latter
+    /// only recovers by building a new `Client`.
+    pub fn is_running(&self) -> bool {
+        self.shared.worker_alive.load(Ordering::Relaxed)
+    }
+
     pub fn lan_peer_count(&self) -> u32 {
         self.shared.lan_peers.load(Ordering::Relaxed) as u32
     }
@@ -537,6 +567,20 @@ impl Client {
             let _ = t.join();
         }
     }
+}
+
+/// Best-effort human text out of a caught panic payload. `panic!` with a
+/// literal yields `&str`, `format!`-style yields `String`; anything else
+/// (a custom payload type) has no printable form, so we say so rather than
+/// dropping the report.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "unknown panic".to_string()
 }
 
 impl Drop for Client {
@@ -656,7 +700,11 @@ async fn run(config: ClientRun) {
                 if c.sender_device_id == self_id {
                     continue;
                 }
-                if !dedup.lock().unwrap().insert(&c.sender_device_id, c.ts) {
+                if !dedup
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(&c.sender_device_id, c.ts)
+                {
                     continue;
                 }
                 listener.on_clip(c.payload);
@@ -1236,7 +1284,11 @@ fn handle_server(
             if sender_device_id == device_id {
                 return; // shouldn't happen, but be defensive
             }
-            if !dedup.lock().unwrap().insert(&sender_device_id, ts) {
+            if !dedup
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(&sender_device_id, ts)
+            {
                 return; // LAN beat the relay (or vice versa)
             }
             if let Ok(plain) = decrypt(key, &nonce, &ciphertext) {
@@ -1254,7 +1306,11 @@ fn handle_server(
                 if c.sender_device_id == device_id {
                     continue;
                 }
-                if !dedup.lock().unwrap().insert(&c.sender_device_id, c.ts) {
+                if !dedup
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(&c.sender_device_id, c.ts)
+                {
                     continue;
                 }
                 if let Ok(plain) = decrypt(key, &c.nonce, &c.ciphertext) {
@@ -1564,6 +1620,77 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    /// A listener that blows up the first time it is called, then records
+    /// everything after. Stands in for any panic on the worker thread.
+    #[derive(Default)]
+    struct PanicOnFirstStateListener {
+        panicked: AtomicBool,
+        states: Mutex<Vec<String>>,
+    }
+
+    impl ClipListener for PanicOnFirstStateListener {
+        fn on_clip(&self, _payload: ClipPayload) {}
+
+        fn on_state(&self, state: ConnectionState) {
+            if !self.panicked.swap(true, Ordering::Relaxed) {
+                panic!("listener blew up");
+            }
+            let label = match state {
+                ConnectionState::Connecting => "connecting".to_string(),
+                ConnectionState::Connected => "connected".to_string(),
+                ConnectionState::Disconnected => "disconnected".to_string(),
+                ConnectionState::Error { message } => format!("error:{message}"),
+            };
+            self.states.lock().unwrap().push(label);
+        }
+    }
+
+    /// A panicking worker used to die silently, leaving the host showing
+    /// whatever state it saw last (in practice "connecting", forever) with
+    /// nothing left to drive it. The panic must come back as a state.
+    /// Prints a panic backtrace on the worker thread — that is the point.
+    #[test]
+    fn panic_message_reads_both_payload_shapes() {
+        let literal: Box<dyn std::any::Any + Send> = Box::new("boom");
+        let formatted: Box<dyn std::any::Any + Send> = Box::new("boom 2".to_string());
+        let opaque: Box<dyn std::any::Any + Send> = Box::new(7u8);
+        assert_eq!(panic_message(literal.as_ref()), "boom");
+        assert_eq!(panic_message(formatted.as_ref()), "boom 2");
+        assert_eq!(panic_message(opaque.as_ref()), "unknown panic");
+    }
+
+    #[test]
+    fn worker_panic_is_reported_as_an_error_state() {
+        let capture = Arc::new(PanicOnFirstStateListener::default());
+        let listener: Arc<dyn ClipListener> = capture.clone();
+        // Port 1 never answers; the panic lands on the first state emission,
+        // before the dial, so the test never waits on the network.
+        let client = Client::new(
+            "ws://127.0.0.1:1".into(),
+            "group".into(),
+            vec![7u8; KEY_LEN],
+            "device".into(),
+            "Device".into(),
+            listener,
+        )
+        .expect("client");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reported = loop {
+            if let Some(first) = capture.states.lock().unwrap().first().cloned() {
+                break first;
+            }
+            assert!(Instant::now() < deadline, "worker panic was never reported");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            reported.starts_with("error:client worker crashed"),
+            "unexpected state: {reported}"
+        );
+        assert!(!client.is_running(), "a crashed worker must not read as running");
+        client.stop();
+    }
+
     #[test]
     fn client_reconnect_now_raises_the_request_flag() {
         let client = client_for_file_tests(
@@ -1596,6 +1723,7 @@ mod tests {
             cmd_tx,
             thread: Mutex::new(None),
             shared: Arc::new(Shared {
+                worker_alive: Arc::new(AtomicBool::new(true)),
                 key: [31u8; KEY_LEN],
                 group_id: "group".into(),
                 device_id: "source".into(),

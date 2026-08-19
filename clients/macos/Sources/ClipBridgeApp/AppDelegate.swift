@@ -31,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // via mDNS, "仅中继" otherwise. Refreshed by `transportTimer`.
         menu.addItem(NSMenuItem(title: "传输:仅中继", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(makeItem("立即重连", #selector(reconnectNow), key: "r"))
         menu.addItem(makeItem("传输…", #selector(showImageTransfer), key: "i"))
         menu.addItem(makeItem("打开配对窗口…", #selector(showPairing), key: "p"))
         menu.addItem(makeItem("重置配对", #selector(resetPairing), key: ""))
@@ -206,12 +207,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startCoordinator(with config: PairingConfig) {
         coordinator?.stop()
+        // Seed the label *before* start(): a client that fails to construct
+        // reports its error synchronously from in there, and setting
+        // "连接中…" afterwards would bury it behind a connection attempt that
+        // nothing is making.
+        applyStatus(.connecting)
         let coord = BridgeCoordinator(config: config) { [weak self] status in
             self?.applyStatus(status)
         }
-        coord.start()
         coordinator = coord
-        applyStatus(.connecting)
+        coord.start()
+    }
+
+    /// Manual escape hatch. The watchdog gets there on its own within a few
+    /// seconds, but a user staring at a stale status shouldn't have to reach
+    /// for 重置配对 (which throws the pairing away) to prod it.
+    @objc private func reconnectNow() {
+        guard let coordinator else {
+            showPairing()
+            return
+        }
+        coordinator.reconnectNow(reason: "menu")
     }
 
     private func applyStatus(_ status: BridgeStatus) {
